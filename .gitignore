@@ -1,0 +1,35 @@
+# Secrets and local environment
+.env
+.env.*
+API/.env
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Runtime/user data
+data/
+history.json
+_self_restart.log
+*.log
+
+# Generated and uploaded media
+assets/input/
+assets/output/
+output/
+
+# Bundled/local Python runtime and caches
+python/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local editor/OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
