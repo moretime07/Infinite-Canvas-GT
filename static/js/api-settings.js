@@ -264,6 +264,18 @@ function isProviderTemporarilyHidden(item){
 function visibleProviders(){
     return (providers || []).filter(item => !isProviderTemporarilyHidden(item));
 }
+function isOpenRouterProvider(item){
+    const baseUrl = String(item?.base_url || '').trim().toLowerCase();
+    const name = String(item?.name || '').trim().toLowerCase();
+    return /(^|:\/\/)([^/]+\.)?openrouter\.ai(?:[/:]|$)/.test(baseUrl) || name === 'openrouter';
+}
+function defaultProviderId(){
+    const sorted = sortedProviders();
+    const enabled = sorted.filter(item => item.enabled !== false);
+    const primary = enabled.find(item => item.primary);
+    const openRouter = enabled.find(isOpenRouterProvider);
+    return (primary || openRouter || enabled[0] || sorted[0])?.id || '';
+}
 function isFixedProvider(itemOrId){
     const id = typeof itemOrId === 'string' ? itemOrId : itemOrId?.id;
     // 即梦 CLI 不再是固定平台：可删除、可排序，未添加则不存在。
@@ -3184,9 +3196,10 @@ async function loadProviders(){
     try {
         const data = await fetch('/api/providers').then(r => r.json());
         providers = data.providers || [];
-        selectedId = sortedProviders()[0]?.id || '';
+        selectedId = defaultProviderId();
+        recommendInlineOpen = false;
+        syncRecommendView();
         renderEditor();
-        openRecommendApi();
         setStatus('');
     } catch(err) {
         setStatus(tr('api.loadFailed'));

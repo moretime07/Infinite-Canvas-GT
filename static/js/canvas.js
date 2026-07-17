@@ -3125,6 +3125,7 @@ function openOutputNodeMenu(nodeId, clientX, clientY){
         <button class="menu-btn" data-output-copy="${escapeAttr(nodeId)}" ${imageCount ? '' : 'disabled'}><i data-lucide="copy-plus" class="w-4 h-4"></i><span>${tr('canvas.outputCopyToInputGroup')}</span></button>
         <div class="menu-divider"></div>
         <div class="menu-section-title">${tr('canvas.outputFileActions')}</div>
+        <button class="menu-btn" data-output-export-local="${escapeAttr(nodeId)}" ${node.images?.length ? '' : 'disabled'}><i data-lucide="folder-output" class="w-4 h-4"></i><span>导出到本机文件夹</span></button>
         <button class="menu-btn" data-output-download="${escapeAttr(nodeId)}" ${downloadableCount ? '' : 'disabled'}><i data-lucide="download" class="w-4 h-4"></i><span>${tr('canvas.outputDownloadAllImages')}</span></button>
     `;
     const menuWidth = 260;
@@ -3144,6 +3145,14 @@ function openOutputNodeMenu(nodeId, clientX, clientY){
         copyOutputNodeToInputGroup(nodeId);
         closeImageNodeMenu();
     };
+    const exportLocalBtn = imageNodeMenu.querySelector('[data-output-export-local]');
+    if(exportLocalBtn){
+        exportLocalBtn.onclick = e => {
+            e.stopPropagation();
+            exportOutputNodeMedia(nodeId, {manual:true});
+            closeImageNodeMenu();
+        };
+    }
     const downloadBtn = imageNodeMenu.querySelector('[data-output-download]');
     if(downloadBtn){
         downloadBtn.onclick = e => {
@@ -3158,6 +3167,144 @@ function closeImageNodeMenu(){
     imageNodeMenu.classList.remove('open');
     imageNodeMenu.classList.remove('output-node-menu');
     imageNodeMenu.innerHTML = '';
+}
+const OUTPUT_EXPORT_DEFAULTS = Object.freeze({
+    autoExport: true,
+    imageExportFolder: 'D:\\桌面\\1\\全能画布图片输出',
+    videoExportFolder: 'D:\\桌面\\1\\全能画布视频输出',
+    imageExportFormat: 'jpg',
+    videoExportFormat: 'mp4',
+    exportNameTemplate: '{canvas}_{node}_{date}_{index}',
+    exportedOutputUrls: []
+});
+const outputExportRequests = new Set();
+function ensureOutputExportSettings(node){
+    if(!node || node.type !== 'output') return node;
+    Object.entries(OUTPUT_EXPORT_DEFAULTS).forEach(([key, value]) => {
+        if(node[key] === undefined || node[key] === null || node[key] === ''){
+            node[key] = Array.isArray(value) ? [...value] : value;
+        }
+    });
+    node.autoExport = node.autoExport !== false;
+    node.exportedOutputUrls = Array.isArray(node.exportedOutputUrls) ? node.exportedOutputUrls : [];
+    return node;
+}
+function outputExportMediaItems(items=[]){
+    return (items || []).map(item => {
+        const url = outputUrlValue(item);
+        const kind = mediaKindForOutputItem(item);
+        if(!url || isMissingAssetUrl(url) || !['image', 'video'].includes(kind)) return null;
+        return {url, kind, name:outputImageName(url) || `${kind}-output`};
+    }).filter(Boolean);
+}
+function setOutputExportStatus(node, message='', state=''){
+    if(!node) return;
+    node.exportStatus = message;
+    node.exportStatusType = state;
+    const status = nodesEl?.querySelector?.(`.node[data-id="${CSS.escape(node.id)}"] [data-output-export-status]`);
+    if(status){
+        status.textContent = message;
+        status.dataset.state = state;
+    }
+}
+function renderOutputExportControls(node){
+    ensureOutputExportSettings(node);
+    const hasMedia = outputExportMediaItems(node.images).length > 0;
+    const expanded = !!node.exportSettingsOpen;
+    const status = node.exportStatus || '';
+    return `
+        <section class="output-export" aria-label="输出导出设置">
+            <div class="output-export-topline">
+                <label class="setting-check ${node.autoExport ? 'active' : ''}" title="新生成的图片和视频将自动保存到设置的本机文件夹">
+                    <input type="checkbox" data-output-export-auto ${node.autoExport ? 'checked' : ''}>
+                    <span class="check-dot"></span><span>自动导出</span>
+                </label>
+                <div class="output-export-actions">
+                    <button class="tool-btn output-export-icon" type="button" data-output-export-toggle title="导出设置" aria-label="导出设置"><i data-lucide="sliders-horizontal"></i></button>
+                    <button class="tool-btn output-export-now" type="button" data-output-export-now title="导出当前媒体" ${hasMedia ? '' : 'disabled'}><i data-lucide="folder-output"></i><span>导出</span></button>
+                </div>
+            </div>
+            <div class="output-export-status" data-output-export-status data-state="${escapeAttr(node.exportStatusType || '')}">${escapeHtml(status)}</div>
+            <div class="output-export-fields" ${expanded ? '' : 'hidden'}>
+                <label><span>图片目录</span><input type="text" data-output-export-field="imageExportFolder" value="${escapeAttr(node.imageExportFolder)}"></label>
+                <label><span>视频目录</span><input type="text" data-output-export-field="videoExportFolder" value="${escapeAttr(node.videoExportFolder)}"></label>
+                <label><span>图片格式</span><select data-output-export-field="imageExportFormat"><option value="jpg" ${node.imageExportFormat === 'jpg' ? 'selected' : ''}>JPG</option><option value="png" ${node.imageExportFormat === 'png' ? 'selected' : ''}>PNG</option><option value="webp" ${node.imageExportFormat === 'webp' ? 'selected' : ''}>WebP</option></select></label>
+                <label><span>视频格式</span><select data-output-export-field="videoExportFormat"><option value="mp4" ${node.videoExportFormat === 'mp4' ? 'selected' : ''}>MP4</option><option value="webm" ${node.videoExportFormat === 'webm' ? 'selected' : ''}>WebM</option><option value="mov" ${node.videoExportFormat === 'mov' ? 'selected' : ''}>MOV</option></select></label>
+                <label class="output-export-template"><span>命名</span><input type="text" data-output-export-field="exportNameTemplate" value="${escapeAttr(node.exportNameTemplate)}" title="可用：{canvas} {node} {date} {index} {type}"></label>
+            </div>
+        </section>`;
+}
+function bindOutputExportControls(body, node){
+    const autoInput = body.querySelector('[data-output-export-auto]');
+    if(autoInput){
+        autoInput.onchange = () => {
+            node.autoExport = autoInput.checked;
+            autoInput.closest('.setting-check')?.classList.toggle('active', node.autoExport);
+            scheduleSave();
+        };
+    }
+    body.querySelector('[data-output-export-toggle]')?.addEventListener('click', () => {
+        node.exportSettingsOpen = !node.exportSettingsOpen;
+        render();
+        scheduleSave();
+    });
+    body.querySelectorAll('[data-output-export-field]').forEach(input => {
+        input.addEventListener('change', () => {
+            node[input.dataset.outputExportField] = input.value.trim();
+            scheduleSave();
+        });
+    });
+    body.querySelector('[data-output-export-now]')?.addEventListener('click', () => {
+        exportOutputNodeMedia(node.id, {manual:true});
+    });
+}
+async function exportOutputNodeMedia(nodeId, options={}){
+    const node = nodes.find(item => item.id === nodeId);
+    if(!node || node.type !== 'output' || outputExportRequests.has(nodeId)) return null;
+    ensureOutputExportSettings(node);
+    const requested = outputExportMediaItems(options.items || node.images);
+    const exported = new Set(node.exportedOutputUrls);
+    const items = options.manual ? requested : requested.filter(item => !exported.has(item.url));
+    if(!items.length){
+        if(options.manual) setOutputExportStatus(node, '没有可导出的图片或视频', 'idle');
+        return null;
+    }
+    outputExportRequests.add(nodeId);
+    setOutputExportStatus(node, '正在导出到本机文件夹...', 'loading');
+    try {
+        const response = await fetch('/api/canvas-output-export', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+                canvas_title: canvas?.title || 'canvas',
+                node_id: node.id,
+                name_template: node.exportNameTemplate,
+                image_folder: node.imageExportFolder,
+                video_folder: node.videoExportFolder,
+                image_format: node.imageExportFormat,
+                video_format: node.videoExportFormat,
+                items
+            })
+        });
+        const result = await response.json().catch(() => ({}));
+        if(!response.ok) throw new Error(result.detail || '导出失败');
+        const completedUrls = (result.exported || []).map(item => item.url).filter(Boolean);
+        node.exportedOutputUrls = [...new Set([...node.exportedOutputUrls, ...completedUrls])];
+        const skipped = result.skipped?.length || 0;
+        setOutputExportStatus(node, `已导出 ${completedUrls.length} 项${skipped ? `，跳过 ${skipped} 项` : ''}`, skipped ? 'warning' : 'success');
+        scheduleSave();
+        return result;
+    } catch(error) {
+        setOutputExportStatus(node, `导出失败：${error.message || error}`, 'error');
+        return null;
+    } finally {
+        outputExportRequests.delete(nodeId);
+    }
+}
+function scheduleOutputNodeAutoExport(node, items){
+    ensureOutputExportSettings(node);
+    if(!node?.autoExport || !outputExportMediaItems(items).length) return;
+    window.setTimeout(() => exportOutputNodeMedia(node.id, {items}), 0);
 }
 function outputImageUrls(node){
     return (node?.images || []).filter(item => mediaKindForOutputItem(item) === 'image').map(outputUrlValue).filter(Boolean);
@@ -5796,14 +5943,16 @@ function renderNode(node){
     if(node.type === 'comfy') body.appendChild(renderComfyBody(node));
     if(node.type === 'ltxDirector') body.appendChild(renderLTXDirectorBody(node));
     if(node.type === 'output') {
+        ensureOutputExportSettings(node);
         const pendingHtml = (node._pending || []).map(p =>
             renderPendingOutput(p)
         ).join('');
-        body.innerHTML = renderOutputGrid(node, pendingHtml);
+        body.innerHTML = `${renderOutputGrid(node, pendingHtml)}${renderOutputExportControls(node)}`;
         body.onwheel = e => {
             e.stopPropagation();
         };
         body.querySelectorAll('.output-img-wrap').forEach(wrap => bindOutputWrap(wrap, node));
+        bindOutputExportControls(body, node);
     }
     el.appendChild(body);
     el.querySelectorAll('button, select, textarea, input').forEach(control => {
@@ -8082,19 +8231,40 @@ function renderVideoBody(node){
     const inputSources = generatorSources(node);
     const ordered = orderedSources(node, inputSources);
     const mediaInputs = ordered.filter(src => src.refs?.some(ref => ['image','video','audio'].includes(mediaKindForRef(ref))));
+    const mediaInputsByKind = {
+        image:mediaInputs.filter(src => src.refs?.some(ref => mediaKindForRef(ref) === 'image')),
+        video:mediaInputs.filter(src => src.refs?.some(ref => mediaKindForRef(ref) === 'video')),
+        audio:mediaInputs.filter(src => src.refs?.some(ref => mediaKindForRef(ref) === 'audio')),
+    };
     const promptInputs = ordered.filter(src => src.prompt && !src.refs?.length);
     sanitizeVideoNodeProviderModel(node);
     node.model = node.model || 'veo3-fast';
     wrap.innerHTML = `
         <div class="prompt-list mb-3"></div>
-        <div class="video-input-head">
-            <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Media</div>
-            <div class="video-input-actions">
-                <button type="button" class="tool-btn" data-video-manual-url title="手动输入视频 URL"><i data-lucide="link" class="w-4 h-4"></i><span>输入网址</span></button>
-                <button type="button" class="tool-btn" data-video-temp-sh ${node.tempShUploading ? 'disabled' : ''} title="上传当前输入视频到云端直链"><i data-lucide="upload-cloud" class="w-4 h-4"></i><span>${node.tempShUploading ? '上传中...' : '上传云端'}</span></button>
+        ${mediaInputsByKind.image.length ? `
+        <div class="video-ref-section" data-video-ref-section="image">
+            <div class="video-input-head">
+                <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest">图片参考</div>
             </div>
+            <div class="input-list video-img-list video-image-list"></div>
+        </div>` : ''}
+        <div class="video-ref-section" data-video-ref-section="video">
+            <div class="video-input-head">
+                <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest">视频参考</div>
+                <div class="video-input-actions">
+                    <button type="button" class="tool-btn" data-video-manual-url title="手动输入视频 URL"><i data-lucide="link" class="w-4 h-4"></i><span>输入网址</span></button>
+                    <button type="button" class="tool-btn" data-video-temp-sh ${node.tempShUploading ? 'disabled' : ''} title="上传当前输入视频到云端直链"><i data-lucide="upload-cloud" class="w-4 h-4"></i><span>${node.tempShUploading ? '上传中...' : '上传云端'}</span></button>
+                </div>
+            </div>
+            <div class="input-list video-img-list video-reference-list"></div>
         </div>
-        <div class="input-list video-img-list"></div>
+        ${mediaInputsByKind.audio.length ? `
+        <div class="video-ref-section" data-video-ref-section="audio">
+            <div class="video-input-head">
+                <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest">音频参考</div>
+            </div>
+            <div class="input-list video-img-list video-audio-list"></div>
+        </div>` : ''}
         <div class="gen-settings">
             <div class="gen-settings-row">
                 <select class="select-lite video-provider" style="flex:1">${videoProviderOptions(node.apiProvider)}</select>
@@ -8206,8 +8376,9 @@ function renderVideoBody(node){
             }
         };
     });
-    const list = wrap.querySelector('.video-img-list');
-    renderVideoImageInputs(list, node, mediaInputs);
+    renderVideoImageInputs(wrap.querySelector('.video-image-list'), node, mediaInputsByKind.image, tr('canvas.groupEmpty'));
+    renderVideoImageInputs(wrap.querySelector('.video-reference-list'), node, mediaInputsByKind.video, '可连接视频节点，或输入/上传一个视频 URL 作为参考');
+    renderVideoImageInputs(wrap.querySelector('.video-audio-list'), node, mediaInputsByKind.audio, tr('canvas.groupEmpty'));
     renderPromptPreview(wrap.querySelector('.prompt-list'), promptInputs);
     wrap.querySelector('.gen-btn').onclick = e => { e.stopPropagation(); runCanvasGenerate(node.id); };
     bindCascadeButtons(wrap, node.id);
@@ -8245,9 +8416,9 @@ function renderImageInputList(list, node, imageInputs, emptyText=null){
     });
     refreshIcons();
 }
-function renderVideoImageInputs(list, node, imageInputs){
+function renderVideoImageInputs(list, node, imageInputs, emptyText=null){
     if(!list) return;
-    list.innerHTML = imageInputs.length ? '' : `<div class="text-[11px] text-gray-300 py-2">${tr('canvas.groupEmpty')}</div>`;
+    list.innerHTML = imageInputs.length ? '' : `<div class="text-[11px] text-gray-300 py-2">${escapeHtml(emptyText || tr('canvas.groupEmpty'))}</div>`;
     imageInputs.forEach((src, i) => {
         const item = document.createElement('div');
         item.className = 'input-item video-input-item';
@@ -9522,6 +9693,7 @@ function outputForNode(node, dx=460){
         nodes.push(out);
         connections.push({id:uid('c'), from:node.id, to:out.id});
     }
+    ensureOutputExportSettings(out);
     return out;
 }
 function outputNodesForSource(nodeId){
@@ -9725,6 +9897,12 @@ function refreshGeneratorInputViews(){
         const imageInputs = sources
             .map(src => ({...src, refs:imageRefsOnly(src.refs || [])}))
             .filter(src => src.refs?.length);
+        const mediaInputs = sources.filter(src => src.refs?.some(ref => ['image','video','audio'].includes(mediaKindForRef(ref))));
+        const videoMediaInputs = {
+            image:mediaInputs.filter(src => src.refs?.some(ref => mediaKindForRef(ref) === 'image')),
+            video:mediaInputs.filter(src => src.refs?.some(ref => mediaKindForRef(ref) === 'video')),
+            audio:mediaInputs.filter(src => src.refs?.some(ref => mediaKindForRef(ref) === 'audio')),
+        };
         renderPromptPreview(el.querySelector('.prompt-list'), sources.filter(src => src.prompt && !src.refs?.length));
         if(gen.type === 'generator') renderImageInputList(el.querySelector('.input-list'), gen, imageInputs);
         if(gen.type === 'msgen') renderImageInputList(el.querySelector('.ms-img-list'), gen, imageInputs);
@@ -9733,7 +9911,11 @@ function refreshGeneratorInputViews(){
             ltxSyncConnectedImagesToTimeline(gen);
             renderComfyImages(el.querySelector('.input-list'), gen, imageInputs);
         }
-        if(gen.type === 'video') renderVideoImageInputs(el.querySelector('.video-img-list'), gen, imageInputs);
+        if(gen.type === 'video'){
+            renderVideoImageInputs(el.querySelector('.video-image-list'), gen, videoMediaInputs.image, tr('canvas.groupEmpty'));
+            renderVideoImageInputs(el.querySelector('.video-reference-list'), gen, videoMediaInputs.video, '可连接视频节点，或输入/上传一个视频 URL 作为参考');
+            renderVideoImageInputs(el.querySelector('.video-audio-list'), gen, videoMediaInputs.audio, tr('canvas.groupEmpty'));
+        }
         if(gen.type === 'rh'){
             const media = rhMediaSources(gen);
             renderRhPromptFields(el.querySelector('.rh-prompt-list'), gen, rhActiveFields(gen));
@@ -11901,6 +12083,7 @@ function appendOutputImages(out, images, compareRef, metas=[], layout=null){
             out.imageComparisons[url] = {url:compareRef.url, name:compareRef.name || 'input image'};
         });
     }
+    scheduleOutputNodeAutoExport(out, list);
 }
 function outputCompareUrlFor(url, out){
     const source = out?.imageComparisons?.[url];

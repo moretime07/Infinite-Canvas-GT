@@ -19,6 +19,7 @@ assets/output/
 output/
 
 # Bundled/local Python runtime and caches
+.venv/
 python/
 __pycache__/
 *.py[cod]
@@ -26,6 +27,11 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.playwright-cli/
+test-results/
+.coverage
+coverage.xml
+htmlcov/
 
 # Local editor/OS files
 .DS_Store

@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+requests
+httpx
+pillow
+python-multipart

@@ -2583,6 +2583,21 @@ class CanvasAssetDownloadRequest(BaseModel):
     items: List[Dict[str, Any]] = []
     filename: str = "canvas-output-images.zip"
 
+class CanvasOutputExportItem(BaseModel):
+    url: str = ""
+    kind: str = ""
+    name: str = ""
+
+class CanvasOutputExportRequest(BaseModel):
+    canvas_title: str = "canvas"
+    node_id: str = "output"
+    name_template: str = "{canvas}_{node}_{date}_{index}"
+    image_folder: str = r"D:\桌面\1\全能画布图片输出"
+    video_folder: str = r"D:\桌面\1\全能画布视频输出"
+    image_format: str = "jpg"
+    video_format: str = "mp4"
+    items: List[CanvasOutputExportItem] = Field(default_factory=list)
+
 class CanvasWorkflowExportRequest(BaseModel):
     nodes: List[Dict[str, Any]] = []
     connections: List[Dict[str, Any]] = []
@@ -3753,8 +3768,13 @@ def extract_image(data):
 def extract_task_id(data):
     if data.get("task_id"):
         return str(data["task_id"])
-    if data.get("id") and str(data.get("id", "")).startswith("task"):
+    if data.get("id") and str(data.get("id", "")).startswith(("task", "job")):
         return str(data["id"])
+    polling_url = str(data.get("polling_url") or data.get("pollingUrl") or "").strip()
+    if polling_url:
+        tail = polling_url.rstrip("/").rsplit("/", 1)[-1]
+        if tail:
+            return tail
     nested = data.get("data")
     if isinstance(nested, list) and nested:
         first = nested[0]
@@ -3846,6 +3866,48 @@ def is_agnes_provider(provider, model=""):
     base_url = str((provider or {}).get("base_url") or "").lower()
     model_id = str(model or "").strip().lower()
     return "apihub.agnes-ai.com" in base_url or model_id.startswith("agnes-video-")
+
+def is_openrouter_base_url(base_url: str) -> bool:
+    try:
+        host = urllib.parse.urlparse(str(base_url or "").strip()).netloc.lower()
+    except Exception:
+        host = ""
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
+
+def is_openrouter_provider(provider) -> bool:
+    return is_openrouter_base_url((provider or {}).get("base_url") or "")
+
+def openrouter_api_root(base_url: str) -> str:
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    if base.endswith("/api/v1"):
+        return base
+    if base.endswith("/api"):
+        return f"{base}/v1"
+    parsed = urllib.parse.urlparse(base)
+    if is_openrouter_base_url(base) and parsed.path.rstrip("/") in {"", "/api"}:
+        return f"{parsed.scheme or 'https'}://{parsed.netloc}/api/v1"
+    return base
+
+def remote_media_request_headers(url: str) -> Dict[str, str]:
+    """Return credentials only for media URLs owned by a configured OpenRouter provider."""
+    parsed = urllib.parse.urlparse(str(url or "").strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return {}
+    remote_host = parsed.netloc.lower()
+    remote_path = parsed.path.rstrip("/")
+    for provider in load_api_providers():
+        if not is_openrouter_provider(provider):
+            continue
+        api_root = urllib.parse.urlparse(openrouter_api_root(provider.get("base_url") or ""))
+        api_path = api_root.path.rstrip("/")
+        if api_root.netloc.lower() != remote_host or not remote_path.startswith(f"{api_path}/videos/"):
+            continue
+        api_key = provider_env_key_value(provider.get("id") or "")
+        if api_key:
+            return {"Authorization": bearer_auth_value(api_key)}
+    return {}
 
 # ---- 数字人/真人认证：平台无关分发 ----
 # 认证是一个跨平台功能。每个平台用不同的资产 API 实现，但对外是统一入口。
@@ -4848,6 +4910,227 @@ def local_media_file_by_basename(name: str):
         if os.path.commonpath([root_abs, path]) == root_abs and os.path.isfile(path):
             return path
     return None
+
+CANVAS_OUTPUT_IMAGE_FORMATS = {"jpg", "png", "webp"}
+CANVAS_OUTPUT_VIDEO_FORMATS = {"mp4", "webm", "mov"}
+CANVAS_OUTPUT_VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".m4v", ".avi", ".mkv", ".flv"}
+
+def canvas_output_export_kind(item: CanvasOutputExportItem) -> str:
+    kind = str(item.kind or "").strip().lower()
+    if kind in ("image", "video"):
+        return kind
+    url_path = urllib.parse.urlsplit(str(item.url or "")).path
+    extension = os.path.splitext(url_path)[1].lower()
+    return "video" if extension in CANVAS_OUTPUT_VIDEO_EXTENSIONS else "image"
+
+def normalized_canvas_output_export_format(kind: str, value: str) -> str:
+    value = str(value or "").strip().lower().lstrip(".")
+    allowed = CANVAS_OUTPUT_VIDEO_FORMATS if kind == "video" else CANVAS_OUTPUT_IMAGE_FORMATS
+    default = "mp4" if kind == "video" else "jpg"
+    return value if value in allowed else default
+
+def canvas_output_export_folder(value: str, kind: str) -> str:
+    folder = str(value or "").strip().strip('"').strip("'")
+    if not folder:
+        raise HTTPException(status_code=400, detail=f"{('视频' if kind == 'video' else '图片')}输出文件夹不能为空")
+    if not os.path.isabs(folder):
+        raise HTTPException(status_code=400, detail="输出文件夹必须是本机绝对路径")
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"无法创建输出文件夹：{exc}") from exc
+    return os.path.abspath(folder)
+
+def canvas_output_export_basename(payload: CanvasOutputExportRequest, kind: str, index: int) -> str:
+    def clean_token(value: str, fallback: str) -> str:
+        return os.path.splitext(sanitize_export_filename(str(value or ""), fallback))[0] or fallback
+
+    replacements = {
+        "{canvas}": clean_token(payload.canvas_title, "canvas"),
+        "{node}": clean_token(payload.node_id, "output"),
+        "{date}": time.strftime("%Y%m%d-%H%M%S"),
+        "{index}": str(index),
+        "{type}": kind,
+    }
+    name = str(payload.name_template or "").strip() or "{canvas}_{node}_{date}_{index}"
+    for token, value in replacements.items():
+        name = name.replace(token, value)
+    name = re.sub(r"[{}]+", "", name)
+    return os.path.splitext(sanitize_export_filename(name, "canvas-output"))[0] or "canvas-output"
+
+def unique_canvas_output_export_path(folder: str, basename: str, extension: str) -> str:
+    candidate = os.path.join(folder, f"{basename}.{extension}")
+    sequence = 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(folder, f"{basename}_{sequence}.{extension}")
+        sequence += 1
+    return candidate
+
+def materialize_canvas_output_export_source(url: str, kind: str) -> Tuple[str, Optional[str]]:
+    text = str(url or "").strip()
+    local_path = output_file_from_url(text)
+    if not local_path:
+        local_path = local_media_file_by_basename(filename_from_media_url(text, ""))
+    if local_path and os.path.isfile(local_path):
+        return local_path, None
+
+    parsed = urllib.parse.urlparse(text)
+    suffix = os.path.splitext(urllib.parse.urlsplit(text).path)[1] or (".mp4" if kind == "video" else ".jpg")
+    fd, temp_path = tempfile.mkstemp(prefix="canvas_output_export_", suffix=suffix)
+    os.close(fd)
+    try:
+        if text.startswith("data:"):
+            header, separator, raw = text.partition(",")
+            if not separator:
+                raise HTTPException(status_code=400, detail="无效的数据地址")
+            content = base64.b64decode(raw) if ";base64" in header.lower() else urllib.parse.unquote_to_bytes(raw)
+            with open(temp_path, "wb") as handle:
+                handle.write(content)
+        elif parsed.scheme in ("http", "https") and parsed.netloc:
+            request_headers = {
+                "User-Agent": "ComfyUI-API-Modelscope/1.0",
+                **remote_media_request_headers(text),
+            }
+            with requests.get(
+                text,
+                stream=True,
+                timeout=(10, 300),
+                headers=request_headers,
+            ) as response:
+                response.raise_for_status()
+                content_length = int(response.headers.get("content-length") or 0)
+                if content_length > 10 * 1024 * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail="远程文件超过 10GB，无法导出")
+                with open(temp_path, "wb") as handle:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            handle.write(chunk)
+        else:
+            raise HTTPException(status_code=400, detail="无效的媒体地址")
+        if not os.path.isfile(temp_path) or os.path.getsize(temp_path) <= 0:
+            raise HTTPException(status_code=400, detail="媒体文件为空")
+        return temp_path, temp_path
+    except HTTPException:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
+    except requests.RequestException as exc:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise HTTPException(status_code=502, detail=f"远程媒体下载失败：{exc}") from exc
+    except Exception as exc:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail=f"无法准备媒体文件：{exc}") from exc
+
+def export_canvas_output_image(source_path: str, destination_path: str, output_format: str):
+    with Image.open(source_path) as source:
+        image = ImageOps.exif_transpose(source)
+        if output_format == "jpg":
+            if image_has_alpha(image):
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, "white")
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                image = background
+            else:
+                image = image.convert("RGB")
+            image.save(destination_path, format="JPEG", quality=95)
+        elif output_format == "png":
+            image.save(destination_path, format="PNG")
+        else:
+            image.convert("RGBA" if image_has_alpha(image) else "RGB").save(
+                destination_path,
+                format="WEBP",
+                quality=95,
+                method=4,
+            )
+
+def export_canvas_output_video(source_path: str, destination_path: str, output_format: str):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(status_code=500, detail="未找到 ffmpeg，无法转换视频")
+    codec_args = {
+        "mp4": ["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart"],
+        "mov": ["-c:v", "libx264", "-c:a", "aac"],
+        "webm": ["-c:v", "libvpx-vp9", "-c:a", "libopus"],
+    }[output_format]
+    command = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-i", source_path,
+        "-map", "0:v:0", "-map", "0:a?",
+        *codec_args,
+        destination_path,
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=1800)
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=504, detail="视频转换超时") from exc
+    if result.returncode != 0 or not os.path.isfile(destination_path) or os.path.getsize(destination_path) <= 0:
+        message = (result.stderr or "ffmpeg 视频转换失败").strip()[:500]
+        raise HTTPException(status_code=415, detail=f"视频转换失败：{message}")
+
+def export_canvas_output_items(payload: CanvasOutputExportRequest) -> Dict[str, Any]:
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="没有可导出的媒体")
+    exported = []
+    skipped = []
+    for index, item in enumerate(payload.items[:200], start=1):
+        kind = canvas_output_export_kind(item)
+        source_path = None
+        temporary_path = None
+        destination_path = None
+        try:
+            output_format = normalized_canvas_output_export_format(
+                kind,
+                payload.video_format if kind == "video" else payload.image_format,
+            )
+            folder = canvas_output_export_folder(
+                payload.video_folder if kind == "video" else payload.image_folder,
+                kind,
+            )
+            basename = canvas_output_export_basename(payload, kind, index)
+            destination_path = unique_canvas_output_export_path(folder, basename, output_format)
+            source_path, temporary_path = materialize_canvas_output_export_source(item.url, kind)
+            if kind == "video":
+                export_canvas_output_video(source_path, destination_path, output_format)
+            else:
+                export_canvas_output_image(source_path, destination_path, output_format)
+            exported.append({
+                "url": item.url,
+                "kind": kind,
+                "name": os.path.basename(destination_path),
+                "path": destination_path,
+            })
+        except HTTPException as exc:
+            if destination_path and os.path.exists(destination_path):
+                try:
+                    os.remove(destination_path)
+                except OSError:
+                    pass
+            skipped.append({"url": item.url, "reason": str(exc.detail)})
+        except Exception as exc:
+            if destination_path and os.path.exists(destination_path):
+                try:
+                    os.remove(destination_path)
+                except OSError:
+                    pass
+            skipped.append({"url": item.url, "reason": str(exc)[:300]})
+        finally:
+            if temporary_path:
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    pass
+    if not exported:
+        detail = skipped[0]["reason"] if skipped else "没有可导出的媒体"
+        raise HTTPException(status_code=400, detail=f"导出失败：{detail}")
+    return {"exported": exported, "skipped": skipped}
 
 def filename_from_media_url(url: str, fallback: str = "download.bin") -> str:
     path = urllib.parse.urlsplit(str(url or "")).path
@@ -8573,6 +8856,43 @@ async def generate_runninghub_video(payload, provider):
         local_urls = [await save_remote_video_to_output(url, prefix="rh_video_") for url in urls]
         return {"videos": local_urls, "task_id": task_id, "raw": result}
 
+async def generate_openrouter_provider_image(prompt, size, quality, model, reference_images=None, provider=None):
+    provider = provider or {}
+    api_root = openrouter_api_root(provider.get("base_url") or "")
+    if not api_root:
+        raise HTTPException(status_code=400, detail="OpenRouter 未配置 Base URL")
+    body = {
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+    }
+    if size:
+        body["size"] = size
+    normalized_quality = str(quality or "").strip().lower()
+    if normalized_quality in {"low", "medium", "high"}:
+        body["quality"] = normalized_quality
+    input_references = []
+    for ref in (reference_images or [])[:ONLINE_IMAGE_REFERENCE_MAX]:
+        image_url = reference_to_data_url(ref, max_size=1536)
+        if image_url:
+            input_references.append({
+                "type": "image_url",
+                "image_url": {"url": image_url},
+            })
+    if input_references:
+        body["input_references"] = input_references
+    timeout = httpx.Timeout(connect=20.0, read=1800.0, write=120.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            f"{api_root}/images",
+            headers=api_headers(provider=provider, model=model),
+            json=body,
+        )
+        response.raise_for_status()
+        raw = response.json()
+        return extract_image(raw), raw
+
+
 async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly"):
     provider = get_api_provider(provider_id)
     if provider["id"] == "modelscope":
@@ -8581,6 +8901,8 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
         return await generate_jimeng_provider_image(prompt, size, model, reference_images, provider)
     if is_runninghub_provider(provider):
         return await generate_runninghub_provider_image(prompt, size, model, reference_images, provider)
+    if is_openrouter_provider(provider):
+        return await generate_openrouter_provider_image(prompt, size, quality, model, reference_images, provider)
     if effective_protocol(provider, model) == "gemini":
         return await generate_gemini_provider_image(prompt, size, model, reference_images, provider)
     if is_volcengine_provider(provider):
@@ -8978,6 +9300,11 @@ def view_image(filename: str, type: str = "input", subfolder: str = ""):
                 return FileResponse(local_path, media_type=content_type_for_path(local_path))
     raise HTTPException(status_code=404, detail="Image not found on any available backend")
 
+@app.post("/api/canvas-output-export")
+async def canvas_output_export(request: Request, payload: CanvasOutputExportRequest):
+    ensure_same_origin_request(request)
+    return await asyncio.to_thread(export_canvas_output_items, payload)
+
 @app.get("/api/download-output")
 def download_output(request: Request, url: str, name: str = "", inline: bool = False):
     path = output_file_from_url(url)
@@ -8992,6 +9319,7 @@ def download_output(request: Request, url: str, name: str = "", inline: bool = F
         raise HTTPException(status_code=400, detail="无效的下载地址")
     try:
         upstream_headers = {"User-Agent": "ComfyUI-API-Modelscope/1.0"}
+        upstream_headers.update(remote_media_request_headers(url))
         range_header = request.headers.get("range")
         if range_header:
             upstream_headers["Range"] = range_header
@@ -10558,6 +10886,36 @@ def parse_upstream_models(raw, protocol="openai"):
         grouped[classify_upstream_model(mid)].append(mid)
     return grouped, ids
 
+def parse_model_ids(raw, protocol="openai"):
+    grouped, ids = parse_upstream_models(raw, protocol)
+    return ids
+
+async def merge_openrouter_video_models(client, base_url: str, api_key: str, grouped: Dict[str, List[str]], ids: List[str]):
+    if not is_openrouter_base_url(base_url):
+        return grouped, ids, None
+    root = openrouter_api_root(base_url)
+    if not root:
+        return grouped, ids, None
+    url = f"{root}/videos/models"
+    if client is not None and not getattr(client, "is_closed", False):
+        response = await client.get(url, headers=upstream_model_headers(api_key, "openai"))
+    else:
+        async with httpx.AsyncClient(timeout=30) as fresh_client:
+            response = await fresh_client.get(url, headers=upstream_model_headers(api_key, "openai"))
+    if response.status_code >= 400:
+        response.raise_for_status()
+    if looks_like_html_response(response.text):
+        raise HTTPException(status_code=400, detail="OpenRouter /videos/models 返回网页 HTML，请检查请求地址是否为 API Base URL")
+    raw = response.json() if response.text else {}
+    video_ids = parse_model_ids(raw, "openai")
+    if not video_ids:
+        return grouped, ids, raw
+    merged = {key: sorted(set(value or [])) for key, value in (grouped or {}).items()}
+    merged.setdefault("image", [])
+    merged.setdefault("chat", [])
+    merged["video"] = sorted(set(merged.get("video") or []) | set(video_ids))
+    return merged, sorted(set(ids or []) | set(video_ids)), raw
+
 def apply_agnes_model_defaults(base_url, grouped, ids):
     if "apihub.agnes-ai.com" not in str(base_url or "").strip().lower():
         return grouped, ids
@@ -10640,6 +10998,7 @@ async def test_provider_connection(payload: TestConnectionPayload):
             data = resp.json() if resp.text else {}
             grouped, ids = parse_upstream_models(data, protocol)
             grouped, ids = apply_agnes_model_defaults(base_url, grouped, ids)
+            grouped, ids, openrouter_video_raw = await merge_openrouter_video_models(client, base_url, api_key, grouped, ids)
             if protocol == "volcengine" and not ids:
                 detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
                 if detected:
@@ -10653,6 +11012,7 @@ async def test_provider_connection(payload: TestConnectionPayload):
                 "video_models": grouped["video"],
                 "all": ids,
                 "image_request_mode": detect_image_request_mode(base_url, ids) or normalize_image_request_mode(getattr(payload, "image_request_mode", "")),
+                "raw": {"models": data, "openrouter_video_models": openrouter_video_raw} if openrouter_video_raw is not None else data,
             }
     except httpx.HTTPError as e:
         if protocol == "volcengine":
@@ -10893,6 +11253,7 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
         raise HTTPException(status_code=502, detail=f"请求上游模型列表失败：{e}")
     grouped, ids = parse_upstream_models(raw, protocol)
     grouped, ids = apply_agnes_model_defaults(base_url, grouped, ids)
+    grouped, ids, openrouter_video_raw = await merge_openrouter_video_models(client, base_url, api_key, grouped, ids)
     if protocol == "volcengine" and not ids:
         payload = volcengine_default_model_payload(raw=raw)
         return {
@@ -10911,6 +11272,7 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
         "video_models": grouped["video"],
         "all": ids,
         "image_request_mode": detect_image_request_mode(base_url, ids) or normalize_image_request_mode(image_request_mode),
+        "raw": {"models": raw, "openrouter_video_models": openrouter_video_raw} if openrouter_video_raw is not None else raw,
     }
 
 @app.post("/api/providers/fetch-models")
@@ -11251,6 +11613,7 @@ VIDEO_URL_KEYS = (
     "output", "output_url", "outputUrl", "download_url", "downloadUrl",
     "video", "src", "uri", "preview_url", "previewUrl", "path",
     "last_frame_url", "lastFrameUrl", "remixed_from_video_id",
+    "unsigned_urls", "unsignedUrls", "signed_urls", "signedUrls", "content_url", "contentUrl",
 )
 
 def _collect_video_url(value, urls):
@@ -11317,6 +11680,8 @@ def video_output_urls(raw):
 
 def video_api_root(provider):
     base_url = (provider.get("base_url") or AI_BASE_URL).rstrip("/")
+    if is_openrouter_provider(provider):
+        return openrouter_api_root(base_url)
     if is_volcengine_provider(provider):
         if base_url.endswith("/api/v3"):
             base_url = base_url[: -len("/api/v3")]
@@ -11330,6 +11695,8 @@ def looks_like_html_response(text: str) -> bool:
     return sample.startswith("<!doctype html") or sample.startswith("<html") or "<head" in sample
 
 def video_submit_url_candidates(provider, base_url):
+    if is_openrouter_provider(provider):
+        return [f"{base_url}/videos"]
     if is_agnes_provider(provider):
         return [f"{base_url}/v1/videos"]
     if is_apimart_provider(provider):
@@ -11344,6 +11711,9 @@ def video_submit_url_candidates(provider, base_url):
     return [f"{base_url}/v1/videos/generations", f"{base_url}/v2/videos/generations"]
 
 def video_task_url_candidates(provider, base_url, task_id, submit_url=""):
+    if is_openrouter_provider(provider):
+        quoted_id = urllib.parse.quote(str(task_id), safe="")
+        return [f"{base_url}/videos/{quoted_id}"]
     if is_agnes_provider(provider):
         quoted_id = urllib.parse.quote(str(task_id), safe="")
         return [
@@ -11708,6 +12078,7 @@ async def canvas_video(payload: CanvasVideoRequest):
     is_apimart = is_apimart_provider(provider)
     is_volcengine = is_volcengine_provider(provider)
     is_yuli = is_yuli_provider(provider)
+    is_openrouter = is_openrouter_provider(provider)
     is_agnes = is_agnes_provider(provider, payload.model)
     volc_is_proxy = bool(is_volcengine and urllib.parse.urlparse(base_url).path.rstrip("/"))
     submit_urls = video_submit_url_candidates(provider, base_url)
@@ -11984,6 +12355,46 @@ async def canvas_video(payload: CanvasVideoRequest):
                         body["aspect_ratio"] = ratio
                     if payload.enable_upsample:
                         body["enable_upsample"] = True
+                elif is_openrouter:
+                    body = {
+                        "prompt": payload.prompt,
+                        "model": selected_model(payload.model, "google/veo-3.1-fast"),
+                        "duration": payload.duration,
+                    }
+                    if payload.aspect_ratio:
+                        body["aspect_ratio"] = payload.aspect_ratio
+                    if payload.size:
+                        body["size"] = payload.size
+                    elif payload.resolution:
+                        body["resolution"] = payload.resolution
+                    if payload.generate_audio:
+                        body["generate_audio"] = True
+                    if payload.seed is not None:
+                        body["seed"] = payload.seed
+                    frame_images = []
+                    input_references = []
+                    for ref in payload.images[:4]:
+                        if not ref.url:
+                            continue
+                        image_url = ref.url if ref.url.startswith(("http://", "https://", "data:")) else reference_to_data_url(ref.dict(), max_size=1536)
+                        if not image_url:
+                            continue
+                        role = str(ref.role or "").strip().lower()
+                        item = {"type": "image_url", "image_url": {"url": image_url}}
+                        if role in {"first_frame", "last_frame"}:
+                            frame_item = dict(item)
+                            frame_item["frame_type"] = role
+                            frame_images.append(frame_item)
+                        elif not payload.multimodal and not frame_images and not input_references:
+                            frame_item = dict(item)
+                            frame_item["frame_type"] = "first_frame"
+                            frame_images.append(frame_item)
+                        else:
+                            input_references.append(item)
+                    if frame_images:
+                        body["frame_images"] = frame_images[:2]
+                    elif input_references:
+                        body["input_references"] = input_references
                 else:
                     image_payload = []
                     for ref in payload.images[:4]:

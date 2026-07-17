@@ -1,7 +1,8 @@
 @echo off
 cd /d "%~dp0"
 
-set "PYEXE=%~dp0python\python.exe"
+set "PYEXE=%~dp0.venv\Scripts\python.exe"
+if not exist "%PYEXE%" set "PYEXE=%~dp0python\python.exe"
 if not exist "%PYEXE%" set "PYEXE=python"
 
 set "LAN_IP=127.0.0.1"
