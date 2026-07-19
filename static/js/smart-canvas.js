@@ -2102,7 +2102,7 @@ function sanitizeSmartApiSelection(target=settings){
     clearVolcengineSelectionOutsideVolcengine(target);
     if((target.engine || 'api') === 'api'){
         target.provider_id = preferredSmartProviderId('image_models', target.provider_id, ['modelscope','volcengine']) || imageProviders()[0]?.id || '';
-        target.videoProvider = preferredSmartProviderId('video_models', target.videoProvider, ['modelscope']) || videoApiProviders()[0]?.id || 'comfly';
+        target.videoProvider = preferredSmartProviderId('video_models', target.videoProvider, ['modelscope','volcengine']) || videoApiProviders()[0]?.id || 'comfly';
     }
     if(target.provider_id){
         const models = providerImageModels(target.provider_id);
@@ -2394,7 +2394,7 @@ function renderApiParams(){
 }
 function renderApiVideoParams(){
     const providers = videoApiProviders();
-    if(!settings.videoProvider || !providers.some(p => p.id === settings.videoProvider)) settings.videoProvider = preferredSmartProviderId('video_models', settings.videoProvider, ['modelscope']) || providers[0]?.id || 'comfly';
+    if(!settings.videoProvider || !providers.some(p => p.id === settings.videoProvider)) settings.videoProvider = preferredSmartProviderId('video_models', settings.videoProvider, ['modelscope','volcengine']) || providers[0]?.id || 'comfly';
     const models = filterJimengVideoModels(providerVideoModels(settings.videoProvider));
     if(!settings.videoModel || !models.includes(settings.videoModel)) settings.videoModel = models[0] || 'veo3-fast';
     dynamicParams.innerHTML = `
