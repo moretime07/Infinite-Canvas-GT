@@ -148,6 +148,12 @@ function assertPrimaryButtonsAreCardSiblings(markup, expectedCount){
     assert.match(css, /\.provider-primary-btn:focus-visible\s*\{/);
     assert.doesNotMatch(css, /\.provider-card-shell\s*>\s*\.provider-card\s*\{[^}]*padding-right\s*:\s*104px/s,
         'card content must not be squeezed to make room for overlaid controls');
-    assert.match(css, /\.provider-card-shell\s*\{[^}]*display\s*:\s*grid/s, 'controls should use a dedicated shell layout');
+    assert.match(css, /\.provider-card-shell\s*\{[^}]*position\s*:\s*relative/s);
+    assert.doesNotMatch(css, /\.provider-card-shell\s*\{[^}]*display\s*:\s*grid/s, 'controls must not consume a dedicated second row');
+    assert.match(css, /\.provider-primary-btn\s*\{[^}]*(?:position\s*:\s*absolute[^}]*top\s*:\s*\d+px[^}]*right\s*:\s*\d+px|top\s*:\s*\d+px[^}]*right\s*:\s*\d+px[^}]*position\s*:\s*absolute)/s,
+        'the compact primary control must stay at the top-right');
+    assert.doesNotMatch(css, /\.provider-primary-btn\s*\{[^}]*grid-row\s*:\s*2/s);
+    assert.match(css, /\.provider-primary-btn\s*>\s*span\s*\{[^}]*clip/s,
+        'the compact icon control must retain accessible label text');
     console.log('api-settings-primary-provider: passed');
 })().catch(error=>{console.error(error);process.exitCode=1;});
