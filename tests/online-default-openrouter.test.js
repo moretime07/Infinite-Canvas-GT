@@ -6,8 +6,8 @@ const source = fs.readFileSync(path.resolve(__dirname, '..', 'static', 'online.h
 
 assert.match(
     source,
-    /let\s+provider\s*=\s*['"]custom-api['"]\s*;/,
-    'Online Image should initialize with OpenRouter'
+    /ProviderDefaults\.pickProvider\(apiProviders,\s*\{\s*capability:\s*['"]image_models['"],\s*requestedId:\s*provider\s*\}\)\?\.id\s*\|\|\s*provider\s*\|\|\s*['"]comfly['"]/,
+    'Online Image should choose its default through the shared image-capable provider selector'
 );
 assert.match(
     source,

@@ -22,6 +22,7 @@
     <script src="/static/js/i18n.js?v=2026.06.23.1782155110"></script>
     <script src="/static/js/image-preview.js?v=2026.06.23.1782155110"></script>
     <script src="/static/js/history-bulk-manager.js?v=2026.06.23.1782155110"></script>
+    <script src="/static/js/provider-defaults.js"></script>
     <style>
         @import url('/static/vendor/css/fonts.css?v=2026.06.23.1782155110');
         :root { --accent:#111827; --bg:#f9fafb; --card:#fff; --easing:cubic-bezier(0.4,0,0.2,1); }
@@ -253,7 +254,7 @@
         });
         let refs = {1:null,2:null,3:null};
         let refDims = {1:null,2:null,3:null};
-        let provider = 'custom-api';
+        let provider = '';
         let selectedModel = 'gpt-image-2';
         let apiProviders = [];
         let ratio = 'square';
@@ -416,7 +417,11 @@
                 models.nano = imageModels.find(m => m.toLowerCase().includes('nano')) || 'nano-banana-pro';
                 models.gpt = imageModels.find(m => !m.toLowerCase().includes('nano')) || cfg.image_model || 'gpt-image-2';
                 apiProviders = Array.isArray(cfg.api_providers) ? cfg.api_providers : [];
-                selectedModel = providerModels(provider)[0] || models.gpt;
+                provider = ProviderDefaults.pickProvider(apiProviders, {
+                    capability:'image_models',
+                    requestedId:provider
+                })?.id || provider || 'comfly';
+                selectedModel = ProviderDefaults.pickModel(providerById(provider), 'image_models', selectedModel).id || models.gpt;
             } catch(e) {}
             renderProviderControls();
         }

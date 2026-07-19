@@ -20,6 +20,7 @@
     <script src="/static/vendor/js/lucide.js?v=2026.06.23.1782155110"></script>
     <script src="/static/js/theme.js?v=2026.06.23.1782155110"></script>
     <script src="/static/js/i18n.js?v=2026.06.23.1782155110"></script>
+    <script src="/static/js/provider-defaults.js"></script>
     <link rel="stylesheet" href="/static/css/theme.css?v=2026.06.23.1782155110">
     <style>
         @import url('/static/vendor/css/fonts.css?v=2026.06.23.1782155110');
@@ -657,6 +658,8 @@
         }
 
         const savedChatSettings = readChatSettings();
+        const hasSavedChatProvider = typeof savedChatSettings.provider === 'string' && savedChatSettings.provider.trim() !== '';
+        const hasSavedImageProvider = typeof savedChatSettings.activeImageProvider === 'string' && savedChatSettings.activeImageProvider.trim() !== '';
         let conversations = [];
         let currentConversation = null;
         let mode = 'agent';
@@ -842,6 +845,14 @@
                 apiProviders = Array.isArray(config.api_providers) ? config.api_providers : [];
                 config.chat_model = (config.chat_models || []).find(m => m === 'gpt-5.5') || config.chat_model || 'gpt-5.5';
                 config.image_model = config.image_model || ((config.image_models || [])[0]) || 'gpt-image-2';
+                provider = ProviderDefaults.pickProvider(apiProviders, {
+                    capability:'chat_models',
+                    requestedId:hasSavedChatProvider ? provider : ''
+                })?.id || provider;
+                activeImageProvider = ProviderDefaults.pickProvider(apiProviders, {
+                    capability:'image_models',
+                    requestedId:hasSavedImageProvider ? activeImageProvider : ''
+                })?.id || activeImageProvider;
                 validateSavedProviderState();
                 setMode(mode, false);
                 updateModelLabel();
