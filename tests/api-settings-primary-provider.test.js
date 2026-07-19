@@ -82,6 +82,10 @@ function assertPrimaryButtonsAreCardSiblings(markup, expectedCount){
     assert.equal((markup.match(/provider-card-banner/g) || []).length, 4, 'all four built-in banners must render');
     assert.equal((markup.match(/provider-card-sortable/g) || []).length, 4, 'generic providers must retain sortable cards');
     assertPrimaryButtonsAreCardSiblings(markup, rows.length);
+    assert.match(markup, /provider-card-sortable[\s\S]*?provider-side-meta[\s\S]*?provider-protocol-pill[\s\S]*?provider-primary-btn/,
+        'generic protocol-pill cards retain a sibling primary action');
+    assert.match(markup, /provider-card-banner[\s\S]*?provider-logo-wrap[\s\S]*?provider-primary-btn/,
+        'built-in banner/logo cards retain a sibling primary action');
 
     assert.equal(state.api.providerPrimaryIssue(rows[1]), '', 'RunningHub wallet credentials are eligible');
     assert.equal(state.api.providerPrimaryIssue(rows[5]), '平台已停用');
@@ -166,6 +170,19 @@ function assertPrimaryButtonsAreCardSiblings(markup, expectedCount){
     assert.equal(savedRows.filter(item=>item.primary).length, 1);
 
     const css = fs.readFileSync(path.resolve(__dirname,'..','static','css','api-settings.css'),'utf8');
+    const actionWidth = Number(/--provider-primary-action-width\s*:\s*(\d+)px/.exec(css)?.[1] || 0);
+    assert.ok(actionWidth >= 80 && actionWidth <= 96, 'the primary action area must be compact and wide enough for disabled reasons');
+    assert.match(css, /\.provider-primary-btn\s*\{[^}]*width\s*:\s*var\(--provider-primary-action-width\)/s,
+        'the overlaid action must be bounded to the declared action area');
+    assert.match(css, /\.provider-card-shell\s*>\s*\.provider-card-sortable\s*\{[^}]*padding-right\s*:\s*calc\(var\(--provider-primary-action-width\)\s*\+\s*\d+px\)/s,
+        'generic cards must reserve the same right-side action area');
+    assert.match(css, /\.provider-card-shell\s*>\s*\.provider-card-banner\s*\{[^}]*padding-right\s*:\s*calc\(var\(--provider-primary-action-width\)\s*\+\s*\d+px\)/s,
+        'built-in banners must reserve the same right-side action area');
+    const longestDisabled = rows.map(item=>({item, reason:state.api.providerPrimaryIssue(item)}))
+        .filter(entry=>entry.reason).sort((a,b)=>b.reason.length-a.reason.length)[0];
+    const longestDisabledControl = state.api.providerPrimaryControl(longestDisabled.item);
+    assert.equal(/<span>([^<]+)<\/span>/.exec(longestDisabledControl)?.[1], longestDisabled.reason,
+        'the longest disabled reason remains visibly rendered inside the bounded action area');
     assert.match(css, /\.provider-primary-btn:focus-visible\s*\{/);
     assert.doesNotMatch(css, /\.provider-card-shell\s*>\s*\.provider-card\s*\{[^}]*padding-right\s*:\s*104px/s,
         'card content must not be squeezed to make room for overlaid controls');

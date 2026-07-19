@@ -5259,6 +5259,7 @@ html.studio-theme-dark body .recommend-account-invite {
     --provider-primary-bg:rgba(255,255,255,.92);
     --provider-primary-active:#f59e0b;
     --provider-primary-focus:#2563eb;
+    --provider-primary-action-width:84px;
     position:relative;
     min-width:0;
 }
@@ -5273,12 +5274,20 @@ html.studio-theme-dark body .recommend-account-invite {
     padding-bottom:20px !important;
 }
 
+.provider-card-shell > .provider-card-sortable {
+    padding-right:calc(var(--provider-primary-action-width) + 10px) !important;
+}
+
+.provider-card-shell > .provider-card-banner {
+    padding-right:calc(var(--provider-primary-action-width) + 10px) !important;
+}
+
 .provider-primary-btn {
     position:absolute;
     z-index:3;
     top:6px;
     right:7px;
-    width:auto;
+    width:var(--provider-primary-action-width);
     max-width:calc(100% - 14px);
     min-width:26px;
     height:26px;
