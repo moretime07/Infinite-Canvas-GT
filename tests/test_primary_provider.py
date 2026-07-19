@@ -60,6 +60,67 @@ class PrimaryProviderTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertTrue(main.provider_has_primary_credential(item))
 
+    def test_transition_rejects_removing_or_disabling_current_primary(self):
+        current = [provider("current", primary=True), provider("other")]
+        for proposed in (
+            [provider("other")],
+            [provider("current", enabled=False), provider("other")],
+            [provider("current", primary=False), provider("other")],
+        ):
+            with self.subTest(proposed=proposed), self.assertRaises(HTTPException) as raised:
+                main.validate_primary_transition(current, proposed)
+            self.assertIn("先设置另一个默认供应商", raised.exception.detail)
+
+    def test_transition_accepts_explicit_eligible_replacement(self):
+        current = [provider("current", primary=True), provider("other")]
+        proposed = [provider("current", enabled=False), provider("other", primary=True)]
+        with patch.object(main, "provider_env_key_value", return_value="secret"):
+            main.validate_primary_transition(current, proposed)
+
+    def test_transition_uses_submitted_credential_for_replacement(self):
+        current = [provider("current", primary=True), provider("other")]
+        proposed = [provider("current", enabled=False), provider("other", primary=True)]
+        with patch.object(main, "provider_env_key_value", return_value=""):
+            main.validate_primary_transition(current, proposed, {"other": "new-secret"})
+
+    def test_transition_rejects_clearing_current_primary_credential(self):
+        current = [provider("current", primary=True), provider("other")]
+        proposed = [provider("current", primary=True), provider("other")]
+        with patch.object(main, "provider_env_key_value", return_value="stored-secret"), self.assertRaises(
+            HTTPException
+        ) as raised:
+            main.validate_primary_transition(current, proposed, {"current": ""})
+        self.assertIn("先设置另一个默认供应商", raised.exception.detail)
+
+    async def test_full_save_keeps_submitted_primary_flag(self):
+        payload = [
+            main.ApiProviderPayload(id="one", name="One", enabled=True, primary=True, chat_models=["chat"]),
+            main.ApiProviderPayload(id="two", name="Two", enabled=True, primary=False, chat_models=["chat"]),
+        ]
+        saved = []
+        with patch.object(main, "load_api_providers", return_value=[provider("one", primary=True), provider("two")]), patch.object(
+            main, "provider_env_key_value", return_value="secret"
+        ), patch.object(main, "save_api_providers", side_effect=lambda items: saved.extend(items)), patch.object(
+            main, "update_env_values"
+        ), patch.object(main, "reload_env_globals"):
+            await main.save_providers(payload)
+        self.assertEqual([item["id"] for item in saved if item["primary"]], ["one"])
+
+    async def test_full_save_rejects_clearing_current_primary_key_before_writes(self):
+        payload = [
+            main.ApiProviderPayload(
+                id="one", name="One", enabled=True, primary=True, chat_models=["chat"], clear_key=True
+            ),
+            main.ApiProviderPayload(id="two", name="Two", enabled=True, primary=False, chat_models=["chat"]),
+        ]
+        with patch.object(main, "load_api_providers", return_value=[provider("one", primary=True), provider("two")]), patch.object(
+            main, "provider_env_key_value", return_value="stored-secret"
+        ), patch.object(main, "save_api_providers") as save, patch.object(main, "update_env_values") as update:
+            with self.assertRaises(HTTPException):
+                await main.save_providers(payload)
+        save.assert_not_called()
+        update.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

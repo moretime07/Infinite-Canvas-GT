@@ -671,9 +671,15 @@ def runninghub_wallet_key_value() -> str:
 def provider_has_primary_credential(provider: dict, credential_overrides: dict | None = None) -> bool:
     provider_id = str((provider or {}).get("id") or "").strip().lower()
     overrides = credential_overrides or {}
-    standard_key = str(overrides.get(provider_id) or provider_env_key_value(provider_id) or "").strip()
+    standard_key = str(
+        overrides[provider_id] if provider_id in overrides else provider_env_key_value(provider_id) or ""
+    ).strip()
     if provider_id == "runninghub":
-        wallet_key = str(overrides.get("runninghub_wallet") or runninghub_wallet_key_value() or "").strip()
+        wallet_key = str(
+            overrides["runninghub_wallet"]
+            if "runninghub_wallet" in overrides
+            else runninghub_wallet_key_value() or ""
+        ).strip()
         return bool(standard_key or wallet_key)
     return bool(standard_key)
 
@@ -687,6 +693,27 @@ def provider_primary_ineligibility(provider: dict, credential_overrides: dict | 
     if not any(provider.get(key) for key in ("image_models", "chat_models", "video_models")):
         return "未配置可用模型"
     return ""
+
+def validate_primary_transition(current, proposed, credential_overrides=None):
+    current_primary = next((item for item in current if item.get("primary")), None)
+    if current_primary is None:
+        return
+    same = next((item for item in proposed if item.get("id") == current_primary.get("id")), None)
+    if same is not None and same.get("enabled", True) is not False and same.get("primary"):
+        overrides = credential_overrides or {}
+        provider_id = str(same.get("id") or "").strip().lower()
+        credential_changed = provider_id in overrides or (
+            provider_id == "runninghub" and "runninghub_wallet" in overrides
+        )
+        if not credential_changed or not provider_primary_ineligibility(same, overrides):
+            return
+    replacement = next(
+        (item for item in proposed if item.get("primary") and item.get("id") != current_primary.get("id")),
+        None,
+    )
+    reason = provider_primary_ineligibility(replacement, credential_overrides)
+    if replacement is None or reason:
+        raise HTTPException(status_code=400, detail="请先设置另一个默认供应商")
 
 def volcengine_access_key_value() -> str:
     env_key = volcengine_access_key_env()
@@ -10630,8 +10657,10 @@ async def set_primary_api_provider(provider_id: str):
 
 @app.put("/api/providers")
 async def save_providers(payload: List[ApiProviderPayload]):
+    current_providers = load_api_providers()
     providers = []
     env_updates = {}
+    credential_overrides = {}
     # 收集每个 item 的 primary 字段
     raw_primary_flags = [bool(getattr(item, "primary", False)) for item in payload]
     for item in payload:
@@ -10644,14 +10673,20 @@ async def save_providers(payload: List[ApiProviderPayload]):
         key_env = provider_key_env(provider["id"])
         if item.clear_key:
             env_updates[key_env] = ""
+            credential_overrides[provider["id"]] = ""
         elif item.api_key is not None and item.api_key.strip():
-            env_updates[key_env] = item.api_key.strip()
+            api_key = item.api_key.strip()
+            env_updates[key_env] = api_key
+            credential_overrides[provider["id"]] = api_key
         if provider["id"] == "runninghub":
             wallet_env = runninghub_wallet_key_env()
             if item.clear_wallet_key:
                 env_updates[wallet_env] = ""
+                credential_overrides["runninghub_wallet"] = ""
             elif item.wallet_api_key is not None and item.wallet_api_key.strip():
-                env_updates[wallet_env] = item.wallet_api_key.strip()
+                wallet_api_key = item.wallet_api_key.strip()
+                env_updates[wallet_env] = wallet_api_key
+                credential_overrides["runninghub_wallet"] = wallet_api_key
         if provider["id"] == "volcengine":
             ak_env = volcengine_access_key_env()
             sk_env = volcengine_secret_key_env()
@@ -10682,6 +10717,7 @@ async def save_providers(payload: List[ApiProviderPayload]):
         winner = primary_indices[-1]
         for i, p in enumerate(providers):
             p["primary"] = (i == winner)
+    validate_primary_transition(current_providers, providers, credential_overrides)
     save_api_providers(providers)
     if env_updates:
         update_env_values(env_updates)
