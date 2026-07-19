@@ -284,7 +284,8 @@ function providerPrimaryControl(item){
     const reason = current ? '当前默认供应商' : providerPrimaryIssue(item);
     const pending = primaryProviderPendingId === item?.id;
     const disabled = current || Boolean(reason) || Boolean(primaryProviderPendingId);
-    return `<button class="provider-primary-btn ${current ? 'is-primary' : ''} ${pending ? 'is-pending' : ''}" type="button" ${disabled ? 'disabled' : ''} title="${escapeAttr(reason || '设为默认')}" aria-label="${escapeAttr(reason || `将 ${item.name || item.id} 设为默认供应商`)}" onclick="setPrimaryProvider(event,'${escapeAttr(item.id)}')"><i data-lucide="${pending ? 'loader-circle' : 'star'}"></i><span>${current ? '默认' : '设为默认'}</span></button>`;
+    const label = current ? '默认' : (reason || '设为默认');
+    return `<button class="provider-primary-btn ${current ? 'is-primary' : ''} ${pending ? 'is-pending' : ''}" type="button" ${disabled ? 'disabled' : ''} title="${escapeAttr(reason || '设为默认')}" aria-label="${escapeAttr(reason || `将 ${item.name || item.id} 设为默认供应商`)}" onclick="setPrimaryProvider(event,'${escapeAttr(item.id)}')"><i data-lucide="${pending ? 'loader-circle' : 'star'}"${current && !pending ? ' fill="currentColor"' : ''}></i><span>${label}</span></button>`;
 }
 function isOpenRouterProvider(item){
     const baseUrl = String(item?.base_url || '').trim().toLowerCase();
@@ -3124,14 +3125,18 @@ async function setPrimaryProvider(event, providerId){
     const item = providers.find(provider => provider.id === providerId);
     const reason = providerPrimaryIssue(item);
     if(!item || item.primary || reason || primaryProviderPendingId) return false;
+    syncEditor();
     primaryProviderPendingId = providerId;
     renderProviderList();
     try {
         const response = await fetch(`/api/providers/${encodeURIComponent(providerId)}/primary`, {method:'PUT'});
         const data = await response.json();
         if(!response.ok) throw new Error(data.detail || '设置默认供应商失败');
-        providers = data.providers || providers;
-        renderEditor();
+        const serverProviders = Array.isArray(data.providers) ? data.providers : [];
+        providers.forEach(provider => {
+            const authoritative = serverProviders.find(serverProvider => serverProvider.id === provider.id);
+            if(authoritative) provider.primary = authoritative.primary === true;
+        });
         setStatus(`已将 ${item.name || item.id} 设为默认供应商`);
         broadcastStudioApiChange('providers-changed');
         return true;

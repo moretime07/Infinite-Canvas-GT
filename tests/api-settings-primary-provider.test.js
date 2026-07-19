@@ -91,14 +91,18 @@ function assertPrimaryButtonsAreCardSiblings(markup, expectedCount){
     assert.match(state.api.providerCapabilityBadges(rows[4]), /视频/);
 
     const currentControl = state.api.providerPrimaryControl(rows[0]);
+    assert.match(currentControl, /data-lucide="star"[^>]*fill="currentColor"/);
+    assert.equal(/<span>([^<]+)<\/span>/.exec(currentControl)?.[1], '默认');
     assert.match(currentControl, /disabled/);
     assert.match(currentControl, /title="当前默认供应商"/);
     assert.match(currentControl, /aria-label="当前默认供应商"/);
     const disabledControl = state.api.providerPrimaryControl(rows[5]);
+    assert.equal(/<span>([^<]+)<\/span>/.exec(disabledControl)?.[1], state.api.providerPrimaryIssue(rows[5]));
     assert.match(disabledControl, /disabled/);
     assert.match(disabledControl, /title="平台已停用"/);
     assert.match(disabledControl, /aria-label="平台已停用"/);
     const eligibleControl = state.api.providerPrimaryControl(rows[4]);
+    assert.equal(/<span>([^<]+)<\/span>/.exec(eligibleControl)?.[1], '设为默认');
     assert.doesNotMatch(eligibleControl, / disabled/);
     assert.match(eligibleControl, /title="设为默认"/);
     assert.match(eligibleControl, /aria-label="将 Custom 设为默认供应商"/);
@@ -123,6 +127,23 @@ function assertPrimaryButtonsAreCardSiblings(markup, expectedCount){
     assert.equal(primaryCall.options.body, undefined);
     assert.ok(pendingState.messages.some(message=>message?.type === 'providers-changed'));
     assert.ok(!pendingState.messages.some(message=>message?.type === 'studio-api'), 'window messages use the established providers-changed contract');
+
+    const draftState = await createState(rows);
+    draftState.elements.get('nameInput').value = 'Unsaved display name';
+    draftState.elements.get('baseInput').value = 'https://draft.example/v1';
+    draftState.elements.get('keyInput').value = 'unsaved-key';
+    draftState.api.providers()[0].image_models = ['unsaved-image-model'];
+    assert.equal(await draftState.api.setPrimaryProvider(null, 'custom-api'), true);
+    const selectedDraft = draftState.api.providers().find(item=>item.id === 'modelscope');
+    assert.equal(draftState.api.selected(), 'modelscope', 'the selected editor card survives a primary switch');
+    assert.equal(selectedDraft.name, 'Unsaved display name');
+    assert.equal(selectedDraft.base_url, 'https://draft.example/v1');
+    assert.equal(selectedDraft.api_key, 'unsaved-key');
+    assert.deepEqual(Array.from(selectedDraft.image_models), ['unsaved-image-model']);
+    assert.equal(draftState.elements.get('nameInput').value, 'Unsaved display name');
+    assert.equal(draftState.elements.get('baseInput').value, 'https://draft.example/v1');
+    assert.equal(draftState.elements.get('keyInput').value, 'unsaved-key');
+    assert.equal(draftState.api.providers().filter(item=>item.primary).map(item=>item.id).join(','), 'custom-api');
 
     const errorState = await createState(rows, {primaryHandler:async()=>({ok:false,json:async()=>({detail:'switch rejected'})})});
     assert.equal(await errorState.api.setPrimaryProvider(null, 'custom-api'), false);
@@ -153,7 +174,7 @@ function assertPrimaryButtonsAreCardSiblings(markup, expectedCount){
     assert.match(css, /\.provider-primary-btn\s*\{[^}]*(?:position\s*:\s*absolute[^}]*top\s*:\s*\d+px[^}]*right\s*:\s*\d+px|top\s*:\s*\d+px[^}]*right\s*:\s*\d+px[^}]*position\s*:\s*absolute)/s,
         'the compact primary control must stay at the top-right');
     assert.doesNotMatch(css, /\.provider-primary-btn\s*\{[^}]*grid-row\s*:\s*2/s);
-    assert.match(css, /\.provider-primary-btn\s*>\s*span\s*\{[^}]*clip/s,
-        'the compact icon control must retain accessible label text');
+    assert.doesNotMatch(css, /\.provider-primary-btn\s*>\s*span\s*\{[^}]*clip/s,
+        'the primary control label must remain visibly rendered');
     console.log('api-settings-primary-provider: passed');
 })().catch(error=>{console.error(error);process.exitCode=1;});

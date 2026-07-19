@@ -701,11 +701,7 @@ def validate_primary_transition(current, proposed, credential_overrides=None):
     same = next((item for item in proposed if item.get("id") == current_primary.get("id")), None)
     if same is not None and same.get("enabled", True) is not False and same.get("primary"):
         overrides = credential_overrides or {}
-        provider_id = str(same.get("id") or "").strip().lower()
-        credential_changed = provider_id in overrides or (
-            provider_id == "runninghub" and "runninghub_wallet" in overrides
-        )
-        if not credential_changed or not provider_primary_ineligibility(same, overrides):
+        if not provider_primary_ineligibility(same, overrides):
             return
     replacement = next(
         (item for item in proposed if item.get("primary") and item.get("id") != current_primary.get("id")),
@@ -10651,7 +10647,7 @@ async def set_primary_api_provider(provider_id: str):
     reason = provider_primary_ineligibility(target)
     if reason:
         raise HTTPException(status_code=400, detail=reason)
-    updated = [{**item, "primary": item.get("id") == provider_id} for item in stored]
+    updated = [{**item, "primary": item is target} for item in stored]
     save_api_providers(updated)
     return {"providers": [public_provider(item) for item in updated]}
 
@@ -10664,7 +10660,7 @@ async def save_providers(payload: List[ApiProviderPayload]):
     # 收集每个 item 的 primary 字段
     raw_primary_flags = [bool(getattr(item, "primary", False)) for item in payload]
     for item in payload:
-        provider = normalize_provider(item.dict(exclude={"api_key"}))
+        provider = normalize_provider(item.model_dump(exclude={"api_key"}))
         if provider["id"] == "runninghub":
             provider = preserve_runninghub_hidden_overrides(provider)
         if any(existing["id"] == provider["id"] for existing in providers):

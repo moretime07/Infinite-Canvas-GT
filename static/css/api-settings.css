@@ -5273,22 +5273,20 @@ html.studio-theme-dark body .recommend-account-invite {
     padding-bottom:20px !important;
 }
 
-.provider-card-shell > .provider-card .provider-side-meta,
-.provider-card-shell > .provider-card-banner .provider-banner-inner > .provider-protocol-pill {
-    margin-right:30px;
-}
-
 .provider-primary-btn {
     position:absolute;
     z-index:3;
     top:6px;
     right:7px;
-    width:26px;
+    width:auto;
+    max-width:calc(100% - 14px);
+    min-width:26px;
     height:26px;
-    padding:0;
+    padding:0 7px;
     display:inline-flex;
     align-items:center;
     justify-content:center;
+    gap:4px;
     border:1px solid var(--line-strong);
     border-radius:8px;
     background:var(--provider-primary-bg);
@@ -5300,15 +5298,10 @@ html.studio-theme-dark body .recommend-account-invite {
 }
 
 .provider-primary-btn > span {
-    position:absolute;
-    width:1px;
-    height:1px;
-    padding:0;
-    margin:-1px;
+    min-width:0;
     overflow:hidden;
-    clip:rect(0, 0, 0, 0);
+    text-overflow:ellipsis;
     white-space:nowrap;
-    border:0;
 }
 
 .provider-primary-btn i {
