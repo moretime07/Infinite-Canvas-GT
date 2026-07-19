@@ -1875,6 +1875,9 @@ function toggleZoomPreview(){
 function imageProviders(){
     return (apiProviders || []).filter(p => p.enabled !== false && p.id !== 'modelscope' && p.id !== 'volcengine' && (p.image_models || []).length);
 }
+function preferredSmartProviderId(capability, requestedId='', excludeIds=[]){
+    return ProviderDefaults.pickProvider(apiProviders || [], {capability, requestedId, excludeIds})?.id || '';
+}
 function volcengineProvider(){
     return (apiProviders || []).find(p => p.id === 'volcengine' && p.enabled !== false) || {
         id:'volcengine',
@@ -1981,8 +1984,7 @@ function chatApiProviders(){
 }
 function resolveChatProviderId(providerId=''){
     const providers = chatApiProviders();
-    if(providers.some(p => p.id === providerId)) return providerId;
-    return providers[0]?.id || 'comfly';
+    return preferredSmartProviderId('chat_models', providerId) || providers[0]?.id || 'comfly';
 }
 function providerChatModels(providerId){
     const provider = chatApiProviders().find(p => p.id === providerId);
@@ -2098,6 +2100,10 @@ function sanitizeSmartApiSelection(target=settings){
         return target;
     }
     clearVolcengineSelectionOutsideVolcengine(target);
+    if((target.engine || 'api') === 'api'){
+        target.provider_id = preferredSmartProviderId('image_models', target.provider_id, ['modelscope','volcengine']) || imageProviders()[0]?.id || '';
+        target.videoProvider = preferredSmartProviderId('video_models', target.videoProvider, ['modelscope']) || videoApiProviders()[0]?.id || 'comfly';
+    }
     if(target.provider_id){
         const models = providerImageModels(target.provider_id);
         if(models.length && !models.includes(target.model)) target.model = models[0] || '';
@@ -2372,7 +2378,7 @@ function renderDynamicParams(){
 }
 function renderApiParams(){
     const providers = imageProviders();
-    if(!settings.provider_id || !providers.some(p => p.id === settings.provider_id)) settings.provider_id = providers[0]?.id || '';
+    if(!settings.provider_id || !providers.some(p => p.id === settings.provider_id)) settings.provider_id = preferredSmartProviderId('image_models', settings.provider_id, ['modelscope','volcengine']) || providers[0]?.id || '';
     const models = filterJimengImageModels(providerImageModels(settings.provider_id));
     if(!settings.model || !models.includes(settings.model)) settings.model = models[0] || '';
     // 切换平台/模型时保留用户已选的分辨率（记忆），normalizeApiSizeSettings 只会修正非法的 auto。
@@ -2388,7 +2394,7 @@ function renderApiParams(){
 }
 function renderApiVideoParams(){
     const providers = videoApiProviders();
-    if(!settings.videoProvider || !providers.some(p => p.id === settings.videoProvider)) settings.videoProvider = providers[0]?.id || 'comfly';
+    if(!settings.videoProvider || !providers.some(p => p.id === settings.videoProvider)) settings.videoProvider = preferredSmartProviderId('video_models', settings.videoProvider, ['modelscope']) || providers[0]?.id || 'comfly';
     const models = filterJimengVideoModels(providerVideoModels(settings.videoProvider));
     if(!settings.videoModel || !models.includes(settings.videoModel)) settings.videoModel = models[0] || 'veo3-fast';
     dynamicParams.innerHTML = `
