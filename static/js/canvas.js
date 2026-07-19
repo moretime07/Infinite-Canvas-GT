@@ -548,6 +548,12 @@ function uniqueModels(list){
 function defaultApiProviders(){
     return [{id:'comfly', name:'Comfly', base_url:'', enabled:true, image_models:imageModels, chat_models:chatModels, video_models:videoModels.length ? videoModels : DEFAULT_VIDEO_MODELS, has_key:false, key_preview:''}];
 }
+function preferredProviderId(capability, requestedId='', excludeIds=[]){
+    return ProviderDefaults.pickProvider(
+        apiProviders.length ? apiProviders : defaultApiProviders(),
+        {capability, requestedId, excludeIds}
+    )?.id || '';
+}
 function isRunningHubProvider(provider){
     const id = String(provider?.id || '').trim().toLowerCase();
     const protocol = String(provider?.protocol || '').trim().toLowerCase();
@@ -574,8 +580,7 @@ function chatApiProviders(){
     return providers.length ? providers : defaultApiProviders();
 }
 function resolveChatProviderId(id){
-    const providers = chatApiProviders();
-    return providers.find(p => p.id === id)?.id || providers[0]?.id || 'comfly';
+    return preferredProviderId('chat_models', id) || 'comfly';
 }
 function chatProviderOptions(selectedId){
     const selected = resolveChatProviderId(selectedId);
@@ -586,8 +591,7 @@ function providerChatModels(providerId){
     return uniqueModels(provider?.chat_models || []);
 }
 function resolveImageProviderId(id){
-    const providers = imageApiProviders();
-    return providers.find(p => p.id === id)?.id || providers[0]?.id || '';
+    return preferredProviderId('image_models', id, ['modelscope']);
 }
 function providerOptions(selectedId){
     const selected = resolveImageProviderId(selectedId);
@@ -613,8 +617,7 @@ function videoApiProviders(){
     return providers.length ? providers : defaultApiProviders();
 }
 function resolveVideoProviderId(id){
-    const providers = videoApiProviders();
-    return providers.find(p => p.id === id)?.id || providers[0]?.id || 'comfly';
+    return preferredProviderId('video_models', id, ['modelscope']) || 'comfly';
 }
 function videoProviderOptions(selectedId){
     const selected = resolveVideoProviderId(selectedId);
@@ -627,7 +630,7 @@ function providerVideoModels(providerId){
 }
 function sanitizeVideoNodeProviderModel(node){
     if(!node || node.type !== 'video') return;
-    node.apiProvider = resolveVideoProviderId(node.apiProvider || 'comfly');
+    node.apiProvider = resolveVideoProviderId(node.apiProvider || '');
     const models = providerVideoModels(node.apiProvider);
     if(!models.length) node.model = '';
     else if(!models.includes(node.model)) node.model = models[0] || '';
@@ -2318,7 +2321,7 @@ function pickMediaForNode(nodeId){
 }
 function addLLMNode(point){
     const p = point || defaultPoint(80, 0);
-    const providerId = chatApiProviders()[0]?.id || 'comfly';
+    const providerId = preferredProviderId('chat_models');
     return addNode({
         id:uid('llm'),
         type:'llm',
@@ -2338,7 +2341,7 @@ function addLLMNode(point){
 }
 function addGeneratorNode(point){
     const p = point || defaultPoint(120, 0);
-    const providerId = imageApiProviders()[0]?.id || '';
+    const providerId = preferredProviderId('image_models', '', ['modelscope']);
     const model = allImageModels(providerId)[0] || '';
     return addNode({id:uid('gen'), type:'generator', x:p.x, y:p.y, apiProvider:providerId, model, ratio:'square', resolution:defaultApiImageResolution(model), customRatio:'', customSize:'', customRatioWidth:'', customRatioHeight:'', customWidth:'', customHeight:'', inputs:[]});
 }
@@ -2369,7 +2372,7 @@ function addMsGenNode(point){
 }
 function addVideoNode(point){
     const p = point || defaultPoint(160, 0);
-    const providerId = videoApiProviders()[0]?.id || 'comfly';
+    const providerId = preferredProviderId('video_models', '', ['modelscope']);
     const models = providerVideoModels(providerId);
     return addNode({
         id:uid('vid'),
@@ -7628,7 +7631,7 @@ function renderLLMBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'llm-body';
     const mode = node.mode || 'node';
-    node.llmProvider = resolveChatProviderId(node.llmProvider || 'comfly');
+    node.llmProvider = resolveChatProviderId(node.llmProvider || '');
     const llmProv = node.llmProvider;
     if(llmProv === 'modelscope') node.model = node.llmMsModel || node.model;
     if(!providerChatModels(llmProv).includes(node.model)) node.model = providerChatModels(llmProv)[0] || node.model;
@@ -9937,7 +9940,7 @@ async function runGenerator(genId, opts={}){
     const run = runSnapshot(gen, prompt || 'Edit the reference images.', refs);
     const payload = {
         prompt: prompt || 'Edit the reference images.',
-        provider_id:resolveImageProviderId(gen.apiProvider || 'comfly'),
+        provider_id:resolveImageProviderId(gen.apiProvider || ''),
         model:resolveImageModel(gen.model),
         size:await generatorSizeForRun(gen, refs),
         reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
@@ -10033,7 +10036,7 @@ async function runGeneratorLegacy(genId, opts={}){
     try {
         const payload = {
             prompt: prompt || 'Edit the reference images.',
-            provider_id:resolveImageProviderId(gen.apiProvider || 'comfly'),
+            provider_id:resolveImageProviderId(gen.apiProvider || ''),
             model:resolveImageModel(gen.model),
             size:requestSize,
             reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
@@ -10091,7 +10094,7 @@ async function runVideoNode(nodeId, opts={}){
             headers:{'Content-Type':'application/json'},
             body:JSON.stringify({
                 prompt,
-                provider_id:resolveVideoProviderId(node.apiProvider || 'comfly'),
+                provider_id:resolveVideoProviderId(node.apiProvider || ''),
                 model:node.model || 'veo3-fast',
                 duration:Number(node.duration || 5),
                 aspect_ratio:node.aspectRatio || '16:9',
@@ -10954,7 +10957,7 @@ async function runComfyNode(nodeId, opts={}){
     }
 }
 async function callCanvasLLM(node, message, messages=[], options={}){
-    const llmProv = resolveChatProviderId(node.llmProvider || 'comfly');
+    const llmProv = resolveChatProviderId(node.llmProvider || '');
     const model = resolveChatModel(node.model || node.llmMsModel, llmProv);
     const images = llmInputImages(node);
     const videos = llmInputVideos(node);
