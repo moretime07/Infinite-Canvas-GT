@@ -668,6 +668,26 @@ def runninghub_wallet_key_value() -> str:
     env_key = runninghub_wallet_key_env()
     return os.getenv(env_key, "") or read_api_env_value(env_key)
 
+def provider_has_primary_credential(provider: dict, credential_overrides: dict | None = None) -> bool:
+    provider_id = str((provider or {}).get("id") or "").strip().lower()
+    overrides = credential_overrides or {}
+    standard_key = str(overrides.get(provider_id) or provider_env_key_value(provider_id) or "").strip()
+    if provider_id == "runninghub":
+        wallet_key = str(overrides.get("runninghub_wallet") or runninghub_wallet_key_value() or "").strip()
+        return bool(standard_key or wallet_key)
+    return bool(standard_key)
+
+def provider_primary_ineligibility(provider: dict, credential_overrides: dict | None = None) -> str:
+    if not provider:
+        return "API 平台不存在"
+    if provider.get("enabled", True) is False:
+        return "平台已停用"
+    if not provider_has_primary_credential(provider, credential_overrides):
+        return "未配置可用密钥"
+    if not any(provider.get(key) for key in ("image_models", "chat_models", "video_models")):
+        return "未配置可用模型"
+    return ""
+
 def volcengine_access_key_value() -> str:
     env_key = volcengine_access_key_env()
     return os.getenv(env_key, "") or read_api_env_value(env_key)
@@ -10594,6 +10614,19 @@ async def ai_models():
 @app.get("/api/providers")
 async def api_providers():
     return {"providers": public_api_providers()}
+
+@app.put("/api/providers/{provider_id}/primary")
+async def set_primary_api_provider(provider_id: str):
+    stored = load_api_providers()
+    target = next((item for item in stored if item.get("id") == provider_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="API 平台不存在")
+    reason = provider_primary_ineligibility(target)
+    if reason:
+        raise HTTPException(status_code=400, detail=reason)
+    updated = [{**item, "primary": item.get("id") == provider_id} for item in stored]
+    save_api_providers(updated)
+    return {"providers": [public_provider(item) for item in updated]}
 
 @app.put("/api/providers")
 async def save_providers(payload: List[ApiProviderPayload]):
