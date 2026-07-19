@@ -12,9 +12,10 @@
             && Array.isArray(provider[capability]) && provider[capability].length > 0);
     }
     function isOpenRouter(provider){
-        const name = String(provider?.name || '').toLowerCase();
-        const base = String(provider?.base_url || '').toLowerCase();
-        return name.includes('openrouter') || base.includes('openrouter.ai');
+        const name = String(provider?.name || '').trim().toLowerCase();
+        let hostname = '';
+        try { hostname = new URL(String(provider?.base_url || '')).hostname.toLowerCase().replace(/\.$/, ''); } catch(_) {}
+        return name === 'openrouter' || hostname === 'openrouter.ai' || hostname.endsWith('.openrouter.ai');
     }
     function pickProvider(providers, options={}){
         const capability = options.capability || 'image_models';

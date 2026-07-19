@@ -26,7 +26,6 @@ const context = {
     volcengineVideoModels:() => ['volc-video'],
     providerImageModels:id => providers.find(provider => provider.id === id)?.image_models || [],
     providerVideoModels:id => providers.find(provider => provider.id === id)?.video_models || [],
-    videoApiProviders:() => providers.filter(provider => provider.enabled !== false && provider.id !== 'volcengine' && provider.video_models?.length),
     isGptImageAutoSizeModel:() => false,
 };
 context.globalThis = context;
@@ -36,9 +35,12 @@ const chatStart = source.indexOf('function chatApiProviders');
 const chatEnd = source.indexOf('function providerChatModels');
 const sanitizeStart = source.indexOf('function sanitizeSmartApiSelection');
 const sanitizeEnd = source.indexOf('function modelscopeProvider');
+const videoProvidersStart = source.indexOf('const DEFAULT_VIDEO_MODELS');
+const videoProvidersEnd = source.indexOf('function videoProviderById');
 vm.runInNewContext([
     source.slice(adapterStart, adapterEnd),
     source.slice(chatStart, chatEnd),
+    source.slice(videoProvidersStart, videoProvidersEnd),
     source.slice(sanitizeStart, sanitizeEnd),
     'globalThis.smartDefaultsTest = {resolveChatProviderId, sanitizeSmartApiSelection};',
 ].join('\n'), context);
@@ -54,6 +56,12 @@ context.smartDefaultsTest.sanitizeSmartApiSelection(saved);
 assert.equal(saved.provider_id, 'saved-image', 'valid saved image provider should remain authoritative');
 assert.equal(saved.videoProvider, 'saved-video', 'valid saved video provider should remain authoritative');
 assert.equal(context.smartDefaultsTest.resolveChatProviderId('saved-chat'), 'saved-chat', 'valid saved chat provider should remain authoritative');
+
+context.apiProviders = providers.filter(provider => ['modelscope','volcengine'].includes(provider.id));
+const dedicatedOnly = {engine:'api', apiKind:'video', provider_id:'', model:'', videoProvider:'', videoModel:''};
+context.smartDefaultsTest.sanitizeSmartApiSelection(dedicatedOnly);
+assert.equal(dedicatedOnly.videoProvider, 'comfly', 'generic video fallback must not leak ModelScope or Volcengine');
+context.apiProviders = providers;
 
 const dedicatedVolcengine = {engine:'volcengine', apiKind:'video', videoProvider:'', videoModel:''};
 context.smartDefaultsTest.sanitizeSmartApiSelection(dedicatedVolcengine);
