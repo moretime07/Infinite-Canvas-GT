@@ -1,5 +1,6 @@
 let providers = [];
 let selectedId = '';
+let primaryProviderPendingId = '';
 const providerList = document.getElementById('providerList');
 const editorTitle = document.getElementById('editorTitle');
 const statusEl = document.getElementById('status');
@@ -263,6 +264,27 @@ function isProviderTemporarilyHidden(item){
 }
 function visibleProviders(){
     return (providers || []).filter(item => !isProviderTemporarilyHidden(item));
+}
+function providerHasPrimaryCredential(item){
+    if(item?.id === 'runninghub') return item.has_key === true || item.has_wallet_key === true;
+    return item?.has_key === true;
+}
+function providerPrimaryIssue(item){
+    if(!item || item.enabled === false) return '平台已停用';
+    if(!providerHasPrimaryCredential(item)) return '未配置密钥';
+    if(!['image_models', 'chat_models', 'video_models'].some(key => Array.isArray(item[key]) && item[key].length)) return '未配置模型';
+    return '';
+}
+function providerCapabilityBadges(item){
+    const values = [['image_models', '图片'], ['chat_models', '对话'], ['video_models', '视频']];
+    return `<span class="provider-capabilities">${values.filter(([key]) => item?.[key]?.length).map(([, label]) => `<span>${label}</span>`).join('')}</span>`;
+}
+function providerPrimaryControl(item){
+    const current = item?.primary === true;
+    const reason = current ? '当前默认供应商' : providerPrimaryIssue(item);
+    const pending = primaryProviderPendingId === item?.id;
+    const disabled = current || Boolean(reason) || Boolean(primaryProviderPendingId);
+    return `<button class="provider-primary-btn ${current ? 'is-primary' : ''} ${pending ? 'is-pending' : ''}" type="button" ${disabled ? 'disabled' : ''} title="${escapeAttr(reason || '设为默认')}" aria-label="${escapeAttr(reason || `将 ${item.name || item.id} 设为默认供应商`)}" onclick="setPrimaryProvider(event,'${escapeAttr(item.id)}')"><i data-lucide="${pending ? 'loader-circle' : 'star'}"></i><span>${current ? '默认' : '设为默认'}</span></button>`;
 }
 function isOpenRouterProvider(item){
     const baseUrl = String(item?.base_url || '').trim().toLowerCase();
@@ -2181,6 +2203,7 @@ function renderProviderList(){
         const protocolLabel = item.id === 'runninghub' ? 'RH' : String(item.protocol || 'openai').toUpperCase();
         if(item.id === 'modelscope'){
             return `
+                <div class="provider-card-shell">
                 <button class="provider-card provider-card-banner ${active} ${stateClass}" type="button" onclick="selectProvider('${escapeHtml(item.id)}')">
                     <span class="provider-banner-inner">
                         <span class="provider-logo-wrap">
@@ -2191,10 +2214,14 @@ function renderProviderList(){
                         <span class="provider-protocol-pill">OpenAI</span>
                     </span>
                 </button>
+                ${providerCapabilityBadges(item)}
+                ${providerPrimaryControl(item)}
+                </div>
             `;
         }
         if(item.id === 'runninghub'){
             return `
+                <div class="provider-card-shell">
                 <button class="provider-card provider-card-banner ${active} ${stateClass}" type="button" onclick="selectProvider('${escapeHtml(item.id)}')">
                     <span class="provider-banner-inner">
                         <span class="provider-logo-wrap">
@@ -2205,10 +2232,14 @@ function renderProviderList(){
                         <span class="provider-protocol-pill">RH</span>
                     </span>
                 </button>
+                ${providerCapabilityBadges(item)}
+                ${providerPrimaryControl(item)}
+                </div>
             `;
         }
         if(item.id === 'volcengine'){
             return `
+                <div class="provider-card-shell">
                 <button class="provider-card provider-card-banner ${active} ${stateClass}" type="button" onclick="selectProvider('${escapeHtml(item.id)}')">
                     <span class="provider-banner-inner">
                         <span class="provider-logo-wrap">
@@ -2219,10 +2250,14 @@ function renderProviderList(){
                         <span class="provider-protocol-pill">Ark</span>
                     </span>
                 </button>
+                ${providerCapabilityBadges(item)}
+                ${providerPrimaryControl(item)}
+                </div>
             `;
         }
         if(item.id === 'lingjing'){
             return `
+                <div class="provider-card-shell">
                 <button class="provider-card provider-card-banner ${active} ${stateClass}" type="button" onclick="selectProvider('${escapeHtml(item.id)}')">
                     <span class="provider-banner-inner">
                         <span class="provider-logo-wrap">
@@ -2233,9 +2268,13 @@ function renderProviderList(){
                         <span class="provider-protocol-pill">OpenAI</span>
                     </span>
                 </button>
+                ${providerCapabilityBadges(item)}
+                ${providerPrimaryControl(item)}
+                </div>
             `;
         }
         return `
+            <div class="provider-card-shell">
             <button class="provider-card provider-card-sortable ${active} ${stateClass}" type="button" onclick="selectProvider('${escapeHtml(item.id)}')"${providerDragAttrs(item)}>
                 <span class="provider-drag-handle" aria-hidden="true"><i data-lucide="grip-vertical" class="w-3.5 h-3.5"></i></span>
                 <span class="provider-mark"><i data-lucide="${item.has_key ? 'key-round' : 'key'}" class="w-4 h-4"></i></span>
@@ -2248,6 +2287,9 @@ function renderProviderList(){
                     <span class="provider-protocol-pill">${escapeHtml(protocolLabel)}</span>
                 </span>
             </button>
+            ${providerCapabilityBadges(item)}
+            ${providerPrimaryControl(item)}
+            </div>
         `;
     }).join('');
     refreshIcons();
@@ -3076,9 +3118,36 @@ function addProvider(){
     selectedId = id;
     renderEditor();
 }
+async function setPrimaryProvider(event, providerId){
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const item = providers.find(provider => provider.id === providerId);
+    const reason = providerPrimaryIssue(item);
+    if(!item || item.primary || reason || primaryProviderPendingId) return false;
+    primaryProviderPendingId = providerId;
+    renderProviderList();
+    try {
+        const response = await fetch(`/api/providers/${encodeURIComponent(providerId)}/primary`, {method:'PUT'});
+        const data = await response.json();
+        if(!response.ok) throw new Error(data.detail || '设置默认供应商失败');
+        providers = data.providers || providers;
+        renderEditor();
+        setStatus(`已将 ${item.name || item.id} 设为默认供应商`);
+        broadcastStudioApiChange('providers-changed');
+        try { window.parent?.postMessage({type:'studio-api', event:'providers-changed'}, '*'); } catch(error) {}
+        return true;
+    } catch(error) {
+        setStatus(error.message || '设置默认供应商失败');
+        return false;
+    } finally {
+        primaryProviderPendingId = '';
+        renderProviderList();
+    }
+}
 function deleteProvider(){
     const item = provider();
     if(!item) return;
+    if(item.primary){ alert('请先设置另一个默认供应商'); return; }
     if(isFixedProvider(item)){ alert(tr('api.defaultNoDelete') || '默认平台不能删除'); return; }
     if(providers.length <= 1){ alert(tr('api.keepOne')); return; }
     providers = providers.filter(p => p.id !== item.id);
@@ -3263,7 +3332,7 @@ async function saveProviders(){
                 image_generation_endpoint:item.image_generation_endpoint || '',
                 image_edit_endpoint:item.image_edit_endpoint || '',
                 enabled:item.enabled !== false,
-                primary:false,
+                primary:item.primary === true,
                 image_models:item.image_models || [],
                 chat_models:item.chat_models || [],
                 video_models:item.video_models || [],

@@ -5254,6 +5254,113 @@ html.studio-theme-dark body .recommend-account-invite {
     box-shadow:inset 0 0 0 1px var(--line-strong) !important;
 }
 
+/* Default-provider control: interactive actions remain siblings of card buttons. */
+.provider-card-shell {
+    --provider-primary-bg:rgba(255,255,255,.92);
+    --provider-primary-active:#f59e0b;
+    --provider-primary-focus:#2563eb;
+    position:relative;
+    min-width:0;
+}
+
+.provider-card-shell + .provider-card-shell {
+    margin-top:2px;
+}
+
+.provider-card-shell > .provider-card {
+    padding-right:104px !important;
+}
+
+.provider-primary-btn {
+    position:absolute;
+    z-index:2;
+    top:7px;
+    right:7px;
+    min-height:24px;
+    max-width:94px;
+    padding:3px 7px;
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    gap:4px;
+    border:1px solid var(--line-strong);
+    border-radius:999px;
+    background:var(--provider-primary-bg);
+    color:var(--muted);
+    font-size:10px;
+    font-weight:800;
+    line-height:1;
+    white-space:nowrap;
+}
+
+.provider-primary-btn i {
+    width:12px;
+    height:12px;
+    flex:0 0 auto;
+}
+
+.provider-primary-btn:hover:not(:disabled) {
+    border-color:var(--provider-primary-active);
+    color:var(--provider-primary-active);
+}
+
+.provider-primary-btn:focus-visible {
+    outline:2px solid var(--provider-primary-focus);
+    outline-offset:2px;
+}
+
+.provider-primary-btn.is-primary {
+    border-color:color-mix(in srgb, var(--provider-primary-active) 45%, transparent);
+    background:color-mix(in srgb, var(--provider-primary-active) 12%, var(--panel));
+    color:var(--provider-primary-active);
+}
+
+.provider-primary-btn.is-pending i {
+    animation:provider-primary-spin .8s linear infinite;
+}
+
+.provider-primary-btn:disabled {
+    cursor:not-allowed;
+    opacity:.58;
+}
+
+.provider-primary-btn.is-primary:disabled {
+    opacity:1;
+}
+
+.provider-capabilities {
+    position:absolute;
+    z-index:1;
+    right:9px;
+    bottom:7px;
+    max-width:94px;
+    display:flex;
+    justify-content:flex-end;
+    gap:3px;
+    pointer-events:none;
+}
+
+.provider-capabilities > span {
+    padding:2px 4px;
+    border-radius:4px;
+    background:var(--soft);
+    color:var(--faint);
+    font-size:8px;
+    font-weight:800;
+    line-height:1;
+}
+
+body.studio-theme-dark .provider-card-shell,
+html.studio-theme-dark body .provider-card-shell {
+    --provider-primary-bg:rgba(28,30,38,.94);
+    --provider-primary-active:#fbbf24;
+    --provider-primary-focus:#60a5fa;
+}
+
+@keyframes provider-primary-spin {
+    to { transform:rotate(360deg); }
+}
+
 body:not(.studio-theme-dark) .runninghub-config-block,
 html:not(.studio-theme-dark) body:not(.theme-dark) .runninghub-config-block {
     background:#ffffff !important;
