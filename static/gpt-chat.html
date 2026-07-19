@@ -658,8 +658,8 @@
         }
 
         const savedChatSettings = readChatSettings();
-        const hasSavedChatProvider = typeof savedChatSettings.provider === 'string' && savedChatSettings.provider.trim() !== '';
-        const hasSavedImageProvider = typeof savedChatSettings.activeImageProvider === 'string' && savedChatSettings.activeImageProvider.trim() !== '';
+        let hasSavedChatProvider = typeof savedChatSettings.provider === 'string' && savedChatSettings.provider.trim() !== '';
+        let hasSavedImageProvider = typeof savedChatSettings.activeImageProvider === 'string' && savedChatSettings.activeImageProvider.trim() !== '';
         let conversations = [];
         let currentConversation = null;
         let mode = 'agent';
@@ -854,6 +854,8 @@
                     requestedId:hasSavedImageProvider ? activeImageProvider : ''
                 })?.id || activeImageProvider;
                 validateSavedProviderState();
+                hasSavedChatProvider = chatProviders().some(item => item.id === provider);
+                hasSavedImageProvider = imageProviders().some(item => item.id === activeImageProvider);
                 setMode(mode, false);
                 updateModelLabel();
                 saveChatSettings();
@@ -871,8 +873,13 @@
         } catch(e) {}
 
         function setProvider(p, kind=activePickerKind()) {
-            if(kind === 'image') activeImageProvider = p;
-            else provider = p;
+            if(kind === 'image') {
+                activeImageProvider = p;
+                hasSavedImageProvider = true;
+            } else {
+                provider = p;
+                hasSavedChatProvider = true;
+            }
             const models = modelListForCurrent(kind);
             if(kind === 'image') activeImageModel = models[0] || activeImageModel;
             else {
