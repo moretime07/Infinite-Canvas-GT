@@ -3134,7 +3134,6 @@ async function setPrimaryProvider(event, providerId){
         renderEditor();
         setStatus(`已将 ${item.name || item.id} 设为默认供应商`);
         broadcastStudioApiChange('providers-changed');
-        try { window.parent?.postMessage({type:'studio-api', event:'providers-changed'}, '*'); } catch(error) {}
         return true;
     } catch(error) {
         setStatus(error.message || '设置默认供应商失败');

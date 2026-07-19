@@ -5259,8 +5259,12 @@ html.studio-theme-dark body .recommend-account-invite {
     --provider-primary-bg:rgba(255,255,255,.92);
     --provider-primary-active:#f59e0b;
     --provider-primary-focus:#2563eb;
-    position:relative;
+    display:grid;
+    grid-template-columns:minmax(0,1fr) auto;
+    align-items:center;
+    gap:5px 8px;
     min-width:0;
+    padding-bottom:6px;
 }
 
 .provider-card-shell + .provider-card-shell {
@@ -5268,16 +5272,18 @@ html.studio-theme-dark body .recommend-account-invite {
 }
 
 .provider-card-shell > .provider-card {
-    padding-right:104px !important;
+    grid-column:1 / -1;
+    grid-row:1;
+    min-width:0;
 }
 
 .provider-primary-btn {
-    position:absolute;
-    z-index:2;
-    top:7px;
-    right:7px;
+    grid-column:2;
+    grid-row:2;
+    justify-self:end;
+    margin-right:7px;
     min-height:24px;
-    max-width:94px;
+    max-width:110px;
     padding:3px 7px;
     display:inline-flex;
     align-items:center;
@@ -5329,13 +5335,13 @@ html.studio-theme-dark body .recommend-account-invite {
 }
 
 .provider-capabilities {
-    position:absolute;
-    z-index:1;
-    right:9px;
-    bottom:7px;
-    max-width:94px;
+    grid-column:1;
+    grid-row:2;
+    min-width:0;
+    padding-left:10px;
     display:flex;
-    justify-content:flex-end;
+    flex-wrap:wrap;
+    justify-content:flex-start;
     gap:3px;
     pointer-events:none;
 }
