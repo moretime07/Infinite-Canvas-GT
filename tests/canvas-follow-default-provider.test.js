@@ -114,6 +114,10 @@ assert.match(productionFunction('syncFollowingDefaultCanvasNodes'), /node\.provi
 assert.match(productionFunction('refreshCanvasConfigFromSettings'), /const\s+changed\s*=\s*syncFollowingDefaultCanvasNodes\(\)/);
 assert.match(productionFunction('refreshCanvasConfigFromSettings'), /if\s*\(changed\s*&&\s*canvas\)\s*scheduleSave\(\)/);
 assert.match(productionFunction('renderNode'), /syncDefaultCanvasNodeProvider\(node\)/);
+assert.match(productionFunction('renderGeneratorBody'), /prepareCanvasNodeForRender\(node\)/);
+assert.match(productionFunction('renderLLMBody'), /prepareCanvasNodeForRender\(node\)/);
+assert.match(productionFunction('renderVideoBody'), /prepareCanvasNodeForRender\(node\)/);
+assert.match(productionFunction('saveCanvas'), /logs\s*:\s*serializableCanvasLogs\(\)/);
 
 [
     ['runGenerator', 'gen'],
@@ -128,41 +132,52 @@ assert.match(productionFunction('renderNode'), /syncDefaultCanvasNodeProvider\(n
     );
 });
 
-['runGenerator', 'runGeneratorLegacy', 'runVideoNode', 'callCanvasLLM'].forEach(name => {
-    assert.doesNotMatch(
-        productionFunction(name),
-        /CanvasProviderMode\.DEFAULT_VALUE/,
-        `${name} must never put the UI default sentinel in a request`
-    );
-});
-
 const sandbox = {
     CanvasProviderMode:mode,
+    ProviderDefaults:global.ProviderDefaults,
     apiProviders:providers,
     defaultApiProviders:() => providers,
     preferredProviderId:capability => global.ProviderDefaults.pickProvider(providers, {capability})?.id || '',
     tr:() => 'Follow default API',
     escapeHtml:value => String(value),
-    chatApiProviders:() => providers.filter(provider => provider.chat_models.length),
-    imageApiProviders:() => providers.filter(provider => provider.image_models.length),
-    videoApiProviders:() => providers.filter(provider => provider.video_models.length),
+    chatApiProviders:() => sandbox.apiProviders.filter(provider => provider.enabled !== false && provider.chat_models.length),
+    imageApiProviders:() => sandbox.apiProviders.filter(provider => provider.enabled !== false && provider.image_models.length),
+    videoApiProviders:() => sandbox.apiProviders.filter(provider => provider.enabled !== false && provider.video_models.length),
+    uniqueModels:list => [...new Set((list || []).filter(Boolean))],
+    allImageModels:id => id === 'removed-image' ? [] : ['image-b'],
+    allChatModels:() => ['chat-b'],
+    providerChatModels:id => id === 'disabled-chat' ? [] : ['chat-b'],
+    providerVideoModels:id => id === 'removed-video' ? [] : ['video-b'],
+    resolveImageModel:model => model || 'image-b',
+    resolveChatModel:model => model || 'chat-b',
     resolveChatProviderId:id => id || 'openrouter',
     resolveImageProviderId:id => id || 'openrouter',
-    resolveVideoProviderId:id => id || 'openrouter'
+    resolveVideoProviderId:id => id || 'openrouter',
+    uid:prefix => `${prefix}-1`,
+    runPlatformLabel:() => 'API',
+    runTaskLabel:() => 'model',
+    canvas:null
 };
 const executableNames = [
+    'preferredProviderId', 'resolveChatProviderId', 'resolveImageProviderId', 'resolveVideoProviderId',
     'canvasProviderMode', 'chatProviderModeOptions', 'imageProviderModeOptions', 'videoProviderModeOptions',
-    'syncCanvasNodeProvider', 'syncFollowingDefaultCanvasNodes', 'syncDefaultCanvasNodeProvider',
-    'serializableCanvasNode', 'followDefaultOption',
+    'syncCanvasNodeProvider', 'syncFollowingDefaultCanvasNodes', 'syncDefaultCanvasNodeProvider', 'prepareCanvasNodeForRender',
+    'normalizeCanvasProviderSentinels', 'serializableCanvasNode', 'serializableCanvasLogs', 'runSnapshot', 'addGenerationLog',
+    'followDefaultOption',
     'applyCanvasProviderSelection', 'applyChatProviderSelection',
     'applyImageProviderSelection', 'applyVideoProviderSelection',
-    'chatProviderOptions', 'providerOptions', 'videoProviderOptions'
+    'chatProviderOptions', 'providerOptions', 'videoProviderOptions',
+    'imageModelOptions', 'chatModelOptions', 'videoModelOptions'
 ];
 vm.runInNewContext(
     `${executableNames.map(productionFunction).join('\n')}\nthis.controls = {${executableNames.join(',')}};`,
     sandbox
 );
 const controls = sandbox.controls;
+
+assert.notEqual(controls.resolveImageProviderId(mode.DEFAULT_VALUE), mode.DEFAULT_VALUE);
+assert.notEqual(controls.resolveChatProviderId(mode.DEFAULT_VALUE), mode.DEFAULT_VALUE);
+assert.notEqual(controls.resolveVideoProviderId(mode.DEFAULT_VALUE), mode.DEFAULT_VALUE);
 
 sandbox.nodes = mixed.map(node => ({...node}));
 sandbox.apiProviders = nextPrimaryProviders;
@@ -179,6 +194,32 @@ const legacyFixed = {type:'generator', apiProvider:'fallback', model:'image-c'};
 assert.equal(controls.syncDefaultCanvasNodeProvider(legacyFixed), false);
 assert.deepEqual(legacyFixed, {type:'generator', apiProvider:'fallback', model:'image-c'});
 
+const unavailableFixedNodes = [
+    {type:'generator', providerMode:'fixed', apiProvider:'removed-image', model:'removed-image-model'},
+    {type:'llm', llmProvider:'disabled-chat', model:'disabled-chat-model'},
+    {type:'video', providerMode:'fixed', apiProvider:'removed-video', model:'removed-video-model'}
+];
+sandbox.nodes = unavailableFixedNodes.map(node => ({...node}));
+assert.equal(controls.syncFollowingDefaultCanvasNodes(), false);
+assert.deepEqual(sandbox.nodes, unavailableFixedNodes);
+
+unavailableFixedNodes.forEach(node => {
+    const rendered = {...node};
+    controls.prepareCanvasNodeForRender(rendered);
+    assert.deepEqual(rendered, node, 'render preparation must not rewrite fixed or missing-mode nodes');
+});
+
+assert.match(controls.providerOptions('removed-image', unavailableFixedNodes[0]), /value="removed-image" selected/);
+assert.match(controls.chatProviderOptions('disabled-chat', unavailableFixedNodes[1]), /value="disabled-chat" selected/);
+assert.match(controls.videoProviderOptions('removed-video', unavailableFixedNodes[2]), /value="removed-video" selected/);
+assert.match(controls.imageModelOptions('removed-image-model', 'removed-image'), /value="removed-image-model" selected/);
+assert.match(controls.chatModelOptions('disabled-chat-model', 'disabled-chat'), /value="disabled-chat-model" selected/);
+assert.match(controls.videoModelOptions('removed-video-model', 'removed-video'), /value="removed-video-model" selected/);
+
+sandbox.apiProviders = [{id:'chat-only', enabled:true, chat_models:['chat-a'], image_models:[], video_models:[]}];
+assert.match(controls.providerOptions('removed-image', unavailableFixedNodes[0]), /value="removed-image" selected/);
+sandbox.apiProviders = nextPrimaryProviders;
+
 [
     {type:'generator', apiProvider:mode.DEFAULT_VALUE, model:'image-c'},
     {type:'llm', llmProvider:mode.DEFAULT_VALUE, model:'chat-c'},
@@ -188,6 +229,43 @@ assert.deepEqual(legacyFixed, {type:'generator', apiProvider:'fallback', model:'
     assert.notEqual(serialized.apiProvider, mode.DEFAULT_VALUE);
     assert.notEqual(serialized.llmProvider, mode.DEFAULT_VALUE);
 });
+assert.equal(
+    JSON.stringify(controls.serializableCanvasNode(unavailableFixedNodes[0])),
+    JSON.stringify(unavailableFixedNodes[0]),
+    'serialization must not normalize legitimate unavailable fixed values'
+);
+
+const circularEditor = {};
+circularEditor.self = circularEditor;
+const serializedWithRuntimeState = controls.serializableCanvasNode({
+    type:'generator',
+    apiProvider:'fallback',
+    model:'image-c',
+    _ltxEditor:circularEditor
+});
+assert.equal(serializedWithRuntimeState._ltxEditor, undefined);
+
+const malformedRun = controls.runSnapshot(
+    {type:'generator', providerMode:'fixed', apiProvider:mode.DEFAULT_VALUE, model:'image-c'},
+    'prompt'
+);
+assert.doesNotMatch(JSON.stringify(malformedRun), /__default__/);
+assert.equal(malformedRun.node.apiProvider, 'openrouter');
+
+sandbox.canvas = {logs:[]};
+controls.addGenerationLog({
+    run:{
+        nodeType:'generator',
+        node:{type:'generator', apiProvider:mode.DEFAULT_VALUE, model:'image-c'},
+        request:{provider_id:mode.DEFAULT_VALUE},
+        prompt:'prompt',
+        refs:[]
+    }
+});
+assert.doesNotMatch(JSON.stringify(sandbox.canvas.logs), /__default__/);
+assert.doesNotMatch(JSON.stringify(controls.serializableCanvasLogs([
+    {nodeType:'video', request:{provider_id:mode.DEFAULT_VALUE}, nested:{provider:mode.DEFAULT_VALUE}}
+])), /__default__/);
 
 function assertDefaultTransition(adapter, providerField, initialProvider, initialModel, expectedProvider, expectedModel){
     const node = {providerMode:'fixed', [providerField]:initialProvider, model:initialModel};

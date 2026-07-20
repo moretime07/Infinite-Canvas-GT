@@ -142,11 +142,6 @@ function applyLanguage(lang){
 async function refreshCanvasConfigFromSettings(){
     await loadConfig();
     pruneMissingComfyWorkflows();
-    (nodes || []).forEach(node => {
-        if(node.providerMode === 'default') return;
-        sanitizeImageNodeProviderModel(node);
-        sanitizeVideoNodeProviderModel(node);
-    });
     const changed = syncFollowingDefaultCanvasNodes();
     if(typeof render === 'function') render();
     if(changed && canvas) scheduleSave();
@@ -597,6 +592,9 @@ function syncDefaultCanvasNodeProvider(node){
     if(node.type === 'video') return syncCanvasNodeProvider(node, videoProviderModeOptions());
     return false;
 }
+function prepareCanvasNodeForRender(node){
+    return syncDefaultCanvasNodeProvider(node);
+}
 function followDefaultOption(node, capability, excludeIds=[]){
     const providerId = preferredProviderId(capability, '', excludeIds);
     const provider = apiProviders.find(item => item.id === providerId);
@@ -648,9 +646,13 @@ function resolveChatProviderId(id){
     return preferredProviderId('chat_models', id) || 'comfly';
 }
 function chatProviderOptions(selectedId, node){
-    const selected = node && canvasProviderMode(node) === 'default' ? '' : resolveChatProviderId(selectedId);
-    const options = chatApiProviders().map(provider => `<option value="${escapeHtml(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
-    return node ? followDefaultOption(node, 'chat_models') + options : options;
+    const providers = chatApiProviders();
+    const selected = node ? (canvasProviderMode(node) === 'default' ? '' : String(selectedId || '')) : resolveChatProviderId(selectedId);
+    const unavailable = selected && !providers.some(provider => provider.id === selected)
+        ? `<option value="${escapeHtml(selected)}" selected>${escapeHtml(`${selected} (Unavailable)`)}</option>`
+        : '';
+    const options = providers.map(provider => `<option value="${escapeHtml(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
+    return node ? followDefaultOption(node, 'chat_models') + unavailable + options : options;
 }
 function providerChatModels(providerId){
     const provider = apiProviders.find(p => p.id === providerId);
@@ -660,20 +662,22 @@ function resolveImageProviderId(id){
     return preferredProviderId('image_models', id, ['modelscope']);
 }
 function providerOptions(selectedId, node){
-    const selected = node && canvasProviderMode(node) === 'default' ? '' : resolveImageProviderId(selectedId);
     const providers = imageApiProviders();
-    if(!providers.length) return `<option value="" disabled selected>${tr('canvas.noApiProviders') || '暂无 API 平台'}</option>`;
+    const selected = node ? (canvasProviderMode(node) === 'default' ? '' : String(selectedId || '')) : resolveImageProviderId(selectedId);
+    const unavailable = selected && !providers.some(provider => provider.id === selected)
+        ? `<option value="${escapeHtml(selected)}" selected>${escapeHtml(`${selected} (Unavailable)`)}</option>`
+        : '';
+    if(!providers.length){
+        const empty = `<option value="" disabled ${unavailable ? '' : 'selected'}>${tr('canvas.noApiProviders') || '暂无 API 平台'}</option>`;
+        return node ? followDefaultOption(node, 'image_models', ['modelscope']) + unavailable + empty : empty;
+    }
     const options = providers.map(provider => `<option value="${escapeHtml(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
-    return node ? followDefaultOption(node, 'image_models', ['modelscope']) + options : options;
+    return node ? followDefaultOption(node, 'image_models', ['modelscope']) + unavailable + options : options;
 }
 function providerImageModels(providerId){
     // 不走 providerById（会 fallback 到第一个 provider，造成串台），直接查精确匹配
     const provider = apiProviders.find(p => p.id === providerId);
     return uniqueModels(provider?.image_models || []);
-}
-function sanitizeImageNodeProviderModel(node){
-    if(!node || node.type !== 'generator') return;
-    syncCanvasNodeProvider(node, imageProviderModeOptions());
 }
 function videoApiProviders(){
     const providers = (apiProviders.length ? apiProviders : defaultApiProviders())
@@ -684,22 +688,23 @@ function resolveVideoProviderId(id){
     return preferredProviderId('video_models', id, ['modelscope']) || 'comfly';
 }
 function videoProviderOptions(selectedId, node){
-    const selected = node && canvasProviderMode(node) === 'default' ? '' : resolveVideoProviderId(selectedId);
-    const options = videoApiProviders().map(provider => `<option value="${escapeHtml(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
-    return node ? followDefaultOption(node, 'video_models', ['modelscope']) + options : options;
+    const providers = videoApiProviders();
+    const selected = node ? (canvasProviderMode(node) === 'default' ? '' : String(selectedId || '')) : resolveVideoProviderId(selectedId);
+    const unavailable = selected && !providers.some(provider => provider.id === selected)
+        ? `<option value="${escapeHtml(selected)}" selected>${escapeHtml(`${selected} (Unavailable)`)}</option>`
+        : '';
+    const options = providers.map(provider => `<option value="${escapeHtml(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
+    return node ? followDefaultOption(node, 'video_models', ['modelscope']) + unavailable + options : options;
 }
 function providerVideoModels(providerId){
     // 不走 providerById（会 fallback 到第一个 provider，造成串台），直接查精确匹配
     const provider = apiProviders.find(p => p.id === providerId);
     return uniqueModels(provider?.video_models || []);
 }
-function sanitizeVideoNodeProviderModel(node){
-    if(!node || node.type !== 'video') return;
-    syncCanvasNodeProvider(node, videoProviderModeOptions());
-}
 function videoModelOptions(selectedModel, providerId){
     const models = providerVideoModels(providerId);
     if(!models.length){
+        if(selectedModel) return `<option value="${escapeHtml(selectedModel)}" selected>${escapeHtml(`${selectedModel} (Unavailable)`)}</option>`;
         return `<option value="" disabled selected>${tr('canvas.noModelsHint') || '暂无模型，请到 API 设置添加'}</option>`;
     }
     const selected = selectedModel || models[0];
@@ -972,13 +977,15 @@ function normalizeApiNodeLayout(node){
 }
 function imageModelOptions(selectedModel, providerId){
     if(!imageApiProviders().length){
+        if(selectedModel) return `<option value="${escapeHtml(selectedModel)}" selected>${escapeHtml(`${selectedModel} (Unavailable)`)}</option>`;
         return `<option value="" disabled selected>${tr('canvas.noApiProvidersHint') || '暂无 API 平台，请到 API 设置添加'}</option>`;
     }
     const models = allImageModels(providerId);
     if(!models.length){
+        if(selectedModel) return `<option value="${escapeHtml(selectedModel)}" selected>${escapeHtml(`${selectedModel} (Unavailable)`)}</option>`;
         return `<option value="" disabled selected>${tr('canvas.noImageModelsHint') || '暂无生图模型，请到 API 设置添加'}</option>`;
     }
-    const selectedValue = resolveImageModel(selectedModel);
+    const selectedValue = selectedModel || resolveImageModel(selectedModel);
     const options = models.map(model => `<option value="${escapeHtml(model)}" ${model === selectedValue ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
     const hasSelected = models.includes(selectedValue);
     return `${hasSelected || !selectedValue ? '' : `<option value="${escapeHtml(selectedValue)}" selected>${escapeHtml(selectedValue)}</option>`}${options}`;
@@ -986,9 +993,10 @@ function imageModelOptions(selectedModel, providerId){
 function chatModelOptions(selectedModel, providerId=''){
     const models = providerId ? providerChatModels(providerId) : allChatModels();
     if(!models.length){
+        if(selectedModel) return `<option value="${escapeHtml(selectedModel)}" selected>${escapeHtml(`${selectedModel} (Unavailable)`)}</option>`;
         return `<option value="" disabled selected>${tr('canvas.noModelsHint') || '暂无模型，请到 API 设置添加'}</option>`;
     }
-    const selectedValue = resolveChatModel(selectedModel, providerId);
+    const selectedValue = selectedModel || resolveChatModel(selectedModel, providerId);
     const options = models.map(model => `<option value="${escapeHtml(model)}" ${model === selectedValue ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
     const hasSelected = models.includes(selectedValue);
     return `${hasSelected || !selectedValue ? '' : `<option value="${escapeHtml(selectedValue)}" selected>${escapeHtml(selectedValue)}</option>`}${options}`;
@@ -1312,17 +1320,24 @@ function refreshOutputTimer(){
         outputTimer = null;
     }
 }
+function normalizeCanvasProviderSentinels(value, nodeType='', field=''){
+    if(value === CanvasProviderMode.DEFAULT_VALUE && ['apiProvider','llmProvider','provider','provider_id','providerId'].includes(field)){
+        const capability = field === 'llmProvider' || field === 'provider' || nodeType === 'llm'
+            ? 'chat_models'
+            : nodeType === 'video' ? 'video_models' : 'image_models';
+        const excludeIds = capability === 'chat_models' ? [] : ['modelscope'];
+        return preferredProviderId(capability, '', excludeIds);
+    }
+    if(Array.isArray(value)) return value.map(item => normalizeCanvasProviderSentinels(item, nodeType));
+    if(!value || typeof value !== 'object') return value;
+    const localNodeType = value.nodeType || value.type || nodeType;
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+        key,
+        normalizeCanvasProviderSentinels(item, localNodeType, key)
+    ]));
+}
 function serializableCanvasNode(node){
     const copy = {...(node || {})};
-    if(copy.type === 'generator' && copy.apiProvider === CanvasProviderMode.DEFAULT_VALUE){
-        syncCanvasNodeProvider(copy, imageProviderModeOptions());
-    }
-    if(copy.type === 'llm' && copy.llmProvider === CanvasProviderMode.DEFAULT_VALUE){
-        syncCanvasNodeProvider(copy, chatProviderModeOptions());
-    }
-    if(copy.type === 'video' && copy.apiProvider === CanvasProviderMode.DEFAULT_VALUE){
-        syncCanvasNodeProvider(copy, videoProviderModeOptions());
-    }
     delete copy._ltxEditor;
     delete copy.running;
     delete copy.runStatus;
@@ -1330,10 +1345,13 @@ function serializableCanvasNode(node){
     delete copy._cascadeIdx;
     delete copy._cascadeFailed;
     delete copy._activeLoopCtx;
-    return copy;
+    return normalizeCanvasProviderSentinels(copy, node?.type || '');
 }
 function serializableCanvasNodes(list=nodes){
     return (list || []).map(serializableCanvasNode);
+}
+function serializableCanvasLogs(list=canvas?.logs || []){
+    return normalizeCanvasProviderSentinels(list || []);
 }
 async function saveCanvas(){
     if(!canvas || applyingRemoteCanvas) return;
@@ -1354,7 +1372,7 @@ async function saveCanvas(){
                 nodes:serializableCanvasNodes(),
                 connections,
                 viewport,
-                logs:canvas.logs || [],
+                logs:serializableCanvasLogs(),
                 client_id:CLIENT_ID,
                 base_updated_at:Number(lastCanvasUpdatedAt || canvas.updated_at || 0)
             })
@@ -7705,10 +7723,8 @@ function renderLLMBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'llm-body';
     const mode = node.mode || 'node';
-    syncCanvasNodeProvider(node, {capability:'chat_models', providerField:'llmProvider'});
+    prepareCanvasNodeForRender(node);
     const llmProv = node.llmProvider;
-    if(llmProv === 'modelscope') node.model = node.llmMsModel || node.model;
-    if(!providerChatModels(llmProv).includes(node.model)) node.model = providerChatModels(llmProv)[0] || node.model;
     const modelOpts = chatModelOptions(node.model, llmProv);
     const imgs = llmInputImages(node);
     const videos = llmInputVideos(node);
@@ -7992,7 +8008,7 @@ function renderGeneratorBody(node){
     const ordered = orderedSources(node, inputSources);
     const mediaInputs = ordered.filter(src => src.refs?.some(ref => ['image','video','audio'].includes(mediaKindForRef(ref))));
     const promptInputs = ordered.filter(src => src.prompt && !src.refs?.length);
-    sanitizeImageNodeProviderModel(node);
+    prepareCanvasNodeForRender(node);
     normalizeApiNodeSizeChoice(node);
     wrap.innerHTML = `
         <div class="prompt-list mb-3"></div>
@@ -8310,8 +8326,7 @@ function renderVideoBody(node){
         audio:mediaInputs.filter(src => src.refs?.some(ref => mediaKindForRef(ref) === 'audio')),
     };
     const promptInputs = ordered.filter(src => src.prompt && !src.refs?.length);
-    sanitizeVideoNodeProviderModel(node);
-    node.model = node.model || 'veo3-fast';
+    prepareCanvasNodeForRender(node);
     wrap.innerHTML = `
         <div class="prompt-list mb-3"></div>
         ${mediaInputsByKind.image.length ? `
@@ -11598,7 +11613,7 @@ function outputMetaFor(url, out){
     return item && typeof item === 'object' ? item : {};
 }
 function runSnapshot(node, prompt, refs=[]){
-    const clone = JSON.parse(JSON.stringify(node || {}));
+    const clone = normalizeCanvasProviderSentinels(JSON.parse(JSON.stringify(node || {})), node?.type || '');
     delete clone.running;
     delete clone.runStatus;
     delete clone.runError;
@@ -11681,7 +11696,7 @@ function addGenerationLog({run, outputs=[], runMs=0, error=''}) {
         runMs:Number(runMs || 0),
         error:error ? String(error) : '',
     };
-    canvas.logs = [entry, ...canvas.logs].slice(0, 500);
+    canvas.logs = [normalizeCanvasProviderSentinels(entry, entry.nodeType), ...serializableCanvasLogs(canvas.logs)].slice(0, 500);
 }
 function renderCanvasLog(){
     const list = document.getElementById('logList') || (typeof logList !== 'undefined' ? logList : null);
