@@ -581,6 +581,15 @@ function applyCanvasProviderSelection(node, selectedValue, options){
     if(transition.providerMode === 'fixed') node[options.providerField] = transition.requestedId;
     return syncCanvasNodeProvider(node, options);
 }
+function applyChatProviderSelection(node, selectedValue){
+    return applyCanvasProviderSelection(node, selectedValue, {capability:'chat_models', providerField:'llmProvider'});
+}
+function applyImageProviderSelection(node, selectedValue){
+    return applyCanvasProviderSelection(node, selectedValue, {capability:'image_models', providerField:'apiProvider', excludeIds:['modelscope']});
+}
+function applyVideoProviderSelection(node, selectedValue){
+    return applyCanvasProviderSelection(node, selectedValue, {capability:'video_models', providerField:'apiProvider', excludeIds:['modelscope']});
+}
 function isRunningHubProvider(provider){
     const id = String(provider?.id || '').trim().toLowerCase();
     const protocol = String(provider?.protocol || '').trim().toLowerCase();
@@ -7692,7 +7701,7 @@ function renderLLMBody(node){
     });
     providerSelect.onchange = e => {
         e.stopPropagation();
-        applyCanvasProviderSelection(node, e.target.value, {capability:'chat_models', providerField:'llmProvider'});
+        applyChatProviderSelection(node, e.target.value);
         if(node.llmProvider === 'modelscope') node.llmMsModel = node.model;
         render();
         scheduleSave();
@@ -8024,7 +8033,7 @@ function renderGeneratorBody(node){
     providerSelect.onclick = e => e.stopPropagation();
     providerSelect.onchange = e => {
         e.stopPropagation();
-        applyCanvasProviderSelection(node, e.target.value, {capability:'image_models', providerField:'apiProvider', excludeIds:['modelscope']});
+        applyImageProviderSelection(node, e.target.value);
         node._apiResolutionUserSet = false;
         node.resolution = defaultApiImageResolution(node.model);
         modelSelect.innerHTML = imageModelOptions(node.model, node.apiProvider);
@@ -8356,7 +8365,7 @@ function renderVideoBody(node){
     });
     providerSelect.onchange = e => {
         e.stopPropagation();
-        applyCanvasProviderSelection(node, e.target.value, {capability:'video_models', providerField:'apiProvider', excludeIds:['modelscope']});
+        applyVideoProviderSelection(node, e.target.value);
         modelSelect.innerHTML = videoModelOptions(node.model, node.apiProvider);
         scheduleSave();
     };
