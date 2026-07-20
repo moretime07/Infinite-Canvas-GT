@@ -554,6 +554,33 @@ function preferredProviderId(capability, requestedId='', excludeIds=[]){
         {capability, requestedId, excludeIds}
     )?.id || '';
 }
+function canvasProviderMode(node){
+    return CanvasProviderMode.mode(node);
+}
+function syncCanvasNodeProvider(node, options){
+    const resolved = CanvasProviderMode.resolve(
+        node,
+        apiProviders.length ? apiProviders : defaultApiProviders(),
+        options
+    );
+    node.providerMode = resolved.providerMode;
+    node[options.providerField] = resolved.providerId;
+    node.model = resolved.model;
+    return resolved;
+}
+function followDefaultOption(node, capability, excludeIds=[]){
+    const providerId = preferredProviderId(capability, '', excludeIds);
+    const provider = apiProviders.find(item => item.id === providerId);
+    const selected = canvasProviderMode(node) === 'default' ? 'selected' : '';
+    const label = tr('canvas.followDefaultApi') || '鐠虹喖娈㈡妯款吇 API';
+    return `<option value="${CanvasProviderMode.DEFAULT_VALUE}" ${selected}>${escapeHtml(`${label}（${provider?.name || providerId || '暂无'}）`)}</option>`;
+}
+function applyCanvasProviderSelection(node, selectedValue, options){
+    const transition = CanvasProviderMode.select(node, selectedValue);
+    node.providerMode = transition.providerMode;
+    if(transition.providerMode === 'fixed') node[options.providerField] = transition.requestedId;
+    return syncCanvasNodeProvider(node, options);
+}
 function isRunningHubProvider(provider){
     const id = String(provider?.id || '').trim().toLowerCase();
     const protocol = String(provider?.protocol || '').trim().toLowerCase();
@@ -582,9 +609,10 @@ function chatApiProviders(){
 function resolveChatProviderId(id){
     return preferredProviderId('chat_models', id) || 'comfly';
 }
-function chatProviderOptions(selectedId){
-    const selected = resolveChatProviderId(selectedId);
-    return chatApiProviders().map(provider => `<option value="${escapeHtml(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
+function chatProviderOptions(selectedId, node){
+    const selected = node && canvasProviderMode(node) === 'default' ? '' : resolveChatProviderId(selectedId);
+    const options = chatApiProviders().map(provider => `<option value="${escapeHtml(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
+    return node ? followDefaultOption(node, 'chat_models') + options : options;
 }
 function providerChatModels(providerId){
     const provider = apiProviders.find(p => p.id === providerId);
@@ -593,11 +621,12 @@ function providerChatModels(providerId){
 function resolveImageProviderId(id){
     return preferredProviderId('image_models', id, ['modelscope']);
 }
-function providerOptions(selectedId){
-    const selected = resolveImageProviderId(selectedId);
+function providerOptions(selectedId, node){
+    const selected = node && canvasProviderMode(node) === 'default' ? '' : resolveImageProviderId(selectedId);
     const providers = imageApiProviders();
     if(!providers.length) return `<option value="" disabled selected>${tr('canvas.noApiProviders') || '暂无 API 平台'}</option>`;
-    return providers.map(provider => `<option value="${escapeHtml(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
+    const options = providers.map(provider => `<option value="${escapeHtml(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
+    return node ? followDefaultOption(node, 'image_models', ['modelscope']) + options : options;
 }
 function providerImageModels(providerId){
     // 不走 providerById（会 fallback 到第一个 provider，造成串台），直接查精确匹配
@@ -606,10 +635,7 @@ function providerImageModels(providerId){
 }
 function sanitizeImageNodeProviderModel(node){
     if(!node || node.type !== 'generator') return;
-    node.apiProvider = resolveImageProviderId(node.apiProvider || '');
-    const models = providerImageModels(node.apiProvider);
-    if(!models.length) node.model = '';
-    else if(!models.includes(resolveImageModel(node.model))) node.model = models[0] || '';
+    syncCanvasNodeProvider(node, {capability:'image_models', providerField:'apiProvider', excludeIds:['modelscope']});
 }
 function videoApiProviders(){
     const providers = (apiProviders.length ? apiProviders : defaultApiProviders())
@@ -619,9 +645,10 @@ function videoApiProviders(){
 function resolveVideoProviderId(id){
     return preferredProviderId('video_models', id, ['modelscope']) || 'comfly';
 }
-function videoProviderOptions(selectedId){
-    const selected = resolveVideoProviderId(selectedId);
-    return videoApiProviders().map(provider => `<option value="${escapeHtml(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
+function videoProviderOptions(selectedId, node){
+    const selected = node && canvasProviderMode(node) === 'default' ? '' : resolveVideoProviderId(selectedId);
+    const options = videoApiProviders().map(provider => `<option value="${escapeHtml(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
+    return node ? followDefaultOption(node, 'video_models', ['modelscope']) + options : options;
 }
 function providerVideoModels(providerId){
     // 不走 providerById（会 fallback 到第一个 provider，造成串台），直接查精确匹配
@@ -630,10 +657,7 @@ function providerVideoModels(providerId){
 }
 function sanitizeVideoNodeProviderModel(node){
     if(!node || node.type !== 'video') return;
-    node.apiProvider = resolveVideoProviderId(node.apiProvider || '');
-    const models = providerVideoModels(node.apiProvider);
-    if(!models.length) node.model = '';
-    else if(!models.includes(node.model)) node.model = models[0] || '';
+    syncCanvasNodeProvider(node, {capability:'video_models', providerField:'apiProvider', excludeIds:['modelscope']});
 }
 function videoModelOptions(selectedModel, providerId){
     const models = providerVideoModels(providerId);
@@ -2327,6 +2351,7 @@ function addLLMNode(point){
         type:'llm',
         x:p.x,
         y:p.y,
+        providerMode:'default',
         llmProvider:providerId,
         model:resolveChatModel('', providerId),
         mode:'node',
@@ -2343,7 +2368,7 @@ function addGeneratorNode(point){
     const p = point || defaultPoint(120, 0);
     const providerId = preferredProviderId('image_models', '', ['modelscope']);
     const model = allImageModels(providerId)[0] || '';
-    return addNode({id:uid('gen'), type:'generator', x:p.x, y:p.y, apiProvider:providerId, model, ratio:'square', resolution:defaultApiImageResolution(model), customRatio:'', customSize:'', customRatioWidth:'', customRatioHeight:'', customWidth:'', customHeight:'', inputs:[]});
+    return addNode({id:uid('gen'), type:'generator', x:p.x, y:p.y, providerMode:'default', apiProvider:providerId, model, ratio:'square', resolution:defaultApiImageResolution(model), customRatio:'', customSize:'', customRatioWidth:'', customRatioHeight:'', customWidth:'', customHeight:'', inputs:[]});
 }
 function addMsGenNode(point){
     const p = point || defaultPoint(140, 0);
@@ -2379,6 +2404,7 @@ function addVideoNode(point){
         type:'video',
         x:p.x,
         y:p.y,
+        providerMode:'default',
         apiProvider:providerId,
         model:models[0] || videoModels[0] || DEFAULT_VIDEO_MODELS[0],
         duration:5,
@@ -7631,7 +7657,7 @@ function renderLLMBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'llm-body';
     const mode = node.mode || 'node';
-    node.llmProvider = resolveChatProviderId(node.llmProvider || '');
+    syncCanvasNodeProvider(node, {capability:'chat_models', providerField:'llmProvider'});
     const llmProv = node.llmProvider;
     if(llmProv === 'modelscope') node.model = node.llmMsModel || node.model;
     if(!providerChatModels(llmProv).includes(node.model)) node.model = providerChatModels(llmProv)[0] || node.model;
@@ -7646,7 +7672,7 @@ function renderLLMBody(node){
     node.showSystem = Boolean(node.showSystem);
     wrap.innerHTML = `
         <div class="llm-row">
-            <select class="select-lite llm-provider-select" style="flex:1">${chatProviderOptions(llmProv)}</select>
+            <select class="select-lite llm-provider-select" style="flex:1">${chatProviderOptions(llmProv, node)}</select>
             <select class="select-lite llm-model">${modelOpts}</select>
             <div class="llm-mode"><button data-mode="node">${tr('canvas.nodeMode')}</button><button data-mode="chat">${tr('canvas.chatMode')}</button></div>
             <button class="llm-sys-toggle ${node.showSystem ? 'active' : ''}" type="button">System</button>
@@ -7658,7 +7684,7 @@ function renderLLMBody(node){
     `;
     const providerSelect = wrap.querySelector('.llm-provider-select');
     const modelSelect = wrap.querySelector('.llm-model');
-    providerSelect.value = llmProv;
+    providerSelect.value = canvasProviderMode(node) === 'default' ? CanvasProviderMode.DEFAULT_VALUE : llmProv;
     modelSelect.value = resolveChatModel(node.model, llmProv);
     [providerSelect, modelSelect].forEach(input => {
         input.onmousedown = e => e.stopPropagation();
@@ -7666,9 +7692,7 @@ function renderLLMBody(node){
     });
     providerSelect.onchange = e => {
         e.stopPropagation();
-        node.llmProvider = e.target.value;
-        const models = providerChatModels(node.llmProvider);
-        node.model = models[0] || '';
+        applyCanvasProviderSelection(node, e.target.value, {capability:'chat_models', providerField:'llmProvider'});
         if(node.llmProvider === 'modelscope') node.llmMsModel = node.model;
         render();
         scheduleSave();
@@ -7928,7 +7952,7 @@ function renderGeneratorBody(node){
         <div class="input-list"></div>
         <div class="gen-settings">
             <div class="gen-settings-row">
-                <select class="select-lite provider-select">${providerOptions(node.apiProvider)}</select>
+                <select class="select-lite provider-select">${providerOptions(node.apiProvider, node)}</select>
                 <select class="select-lite model-select">${imageModelOptions(node.model, node.apiProvider)}</select>
             </div>
             <div class="gen-settings-row api-size-row">
@@ -8000,9 +8024,7 @@ function renderGeneratorBody(node){
     providerSelect.onclick = e => e.stopPropagation();
     providerSelect.onchange = e => {
         e.stopPropagation();
-        node.apiProvider = e.target.value;
-        const providerModels = providerImageModels(node.apiProvider);
-        if(!providerModels.includes(resolveImageModel(node.model))) node.model = providerModels[0] || '';
+        applyCanvasProviderSelection(node, e.target.value, {capability:'image_models', providerField:'apiProvider', excludeIds:['modelscope']});
         node._apiResolutionUserSet = false;
         node.resolution = defaultApiImageResolution(node.model);
         modelSelect.innerHTML = imageModelOptions(node.model, node.apiProvider);
@@ -8270,7 +8292,7 @@ function renderVideoBody(node){
         </div>` : ''}
         <div class="gen-settings">
             <div class="gen-settings-row">
-                <select class="select-lite video-provider" style="flex:1">${videoProviderOptions(node.apiProvider)}</select>
+                <select class="select-lite video-provider" style="flex:1">${videoProviderOptions(node.apiProvider, node)}</select>
                 <select class="select-lite video-model" style="flex:2">${videoModelOptions(node.model, node.apiProvider)}</select>
             </div>
             <div class="gen-settings-row">
@@ -8324,7 +8346,7 @@ function renderVideoBody(node){
     const durationSelect = wrap.querySelector('.video-duration');
     const aspectSelect = wrap.querySelector('.video-aspect');
     const resolutionSelect = wrap.querySelector('.video-resolution');
-    providerSelect.value = node.apiProvider;
+    providerSelect.value = canvasProviderMode(node) === 'default' ? CanvasProviderMode.DEFAULT_VALUE : node.apiProvider;
     durationSelect.value = String(node.duration || 5);
     aspectSelect.value = node.aspectRatio || '16:9';
     resolutionSelect.value = node.resolution || '';
@@ -8334,9 +8356,7 @@ function renderVideoBody(node){
     });
     providerSelect.onchange = e => {
         e.stopPropagation();
-        node.apiProvider = e.target.value;
-        const models = providerVideoModels(node.apiProvider);
-        if(!models.includes(node.model)) node.model = models[0] || node.model;
+        applyCanvasProviderSelection(node, e.target.value, {capability:'video_models', providerField:'apiProvider', excludeIds:['modelscope']});
         modelSelect.innerHTML = videoModelOptions(node.model, node.apiProvider);
         scheduleSave();
     };

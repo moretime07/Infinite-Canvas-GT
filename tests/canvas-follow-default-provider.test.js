@@ -1,7 +1,10 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 global.ProviderDefaults = require('../static/js/provider-defaults.js');
 const mode = require('../static/js/canvas-provider-mode.js');
+const source = fs.readFileSync(path.resolve(__dirname, '..', 'static', 'js', 'canvas.js'), 'utf8');
 
 const providers = [
     {id:'chat-only', enabled:true, primary:false, chat_models:['chat-a'], image_models:[], video_models:[]},
@@ -48,3 +51,28 @@ assert.equal(
     ).model,
     'image-c'
 );
+
+assert.match(source, /addGeneratorNode[\s\S]*providerMode\s*:\s*['"]default['"]/);
+assert.match(source, /addLLMNode[\s\S]*providerMode\s*:\s*['"]default['"]/);
+assert.match(source, /addVideoNode[\s\S]*providerMode\s*:\s*['"]default['"]/);
+assert.match(source, /鐠虹喖娈㈡妯款吇 API/);
+assert.match(source, /CanvasProviderMode\.DEFAULT_VALUE/);
+assert.match(source, /CanvasProviderMode\.select/);
+
+const imageNode = {providerMode:'fixed', apiProvider:'fallback'};
+const imageDefaultTransition = mode.select(imageNode, mode.DEFAULT_VALUE);
+imageNode.providerMode = imageDefaultTransition.providerMode;
+if(imageDefaultTransition.providerMode === 'fixed') imageNode.apiProvider = imageDefaultTransition.requestedId;
+assert.equal(imageNode.providerMode, 'default');
+assert.equal(imageNode.apiProvider, 'fallback');
+assert.notEqual(imageNode.apiProvider, mode.DEFAULT_VALUE);
+
+const llmNode = {providerMode:'default', llmProvider:'chat-only'};
+const llmFixedTransition = mode.select(llmNode, 'fallback');
+llmNode.providerMode = llmFixedTransition.providerMode;
+if(llmFixedTransition.providerMode === 'fixed') llmNode.llmProvider = llmFixedTransition.requestedId;
+assert.equal(llmNode.providerMode, 'fixed');
+assert.equal(llmNode.llmProvider, 'fallback');
+assert.notEqual(llmNode.llmProvider, mode.DEFAULT_VALUE);
+
+console.log('canvas-follow-default-provider: passed');

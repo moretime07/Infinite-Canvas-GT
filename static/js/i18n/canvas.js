@@ -1,6 +1,7 @@
 (function(){
     if(!window.StudioI18n) return;
     window.StudioI18n.register({
+        "canvas.followDefaultApi": { zh: "鐠虹喖娈㈡妯款吇 API", en: "Follow default API" },
         "canvas.noApiProviders": { zh: "暂无 API 平台", en: "No API providers" },
         "canvas.noApiProvidersHint": { zh: "暂无 API 平台，请到 API 设置添加", en: "No API providers. Add one in API Settings." },
         "canvas.noImageModelsHint": { zh: "暂无生图模型，请到 API 设置添加", en: "No image models. Add some in API Settings." },
