@@ -104,9 +104,23 @@ assert.equal(
 assert.match(productionFunction('addGeneratorNode'), /providerMode\s*:\s*['"]default['"]/);
 assert.match(productionFunction('addLLMNode'), /providerMode\s*:\s*['"]default['"]/);
 assert.match(productionFunction('addVideoNode'), /providerMode\s*:\s*['"]default['"]/);
-assert.match(source, /璺熼殢榛樿 API/);
-assert.doesNotMatch(source, /鐠虹喖娈㈡妯款吇 API/);
-assert.match(i18nSource, /"canvas\.followDefaultApi"\s*:\s*\{\s*zh:\s*"璺熼殢榛樿 API",\s*en:\s*"Follow default API"\s*\}/);
+const requiredChineseCodePoints = [0x8ddf, 0x968f, 0x9ed8, 0x8ba4];
+const rejectedMojibakeCodePoints = [0x74ba, 0x71bc, 0x6ba2, 0x699b, 0x6a3f, 0xe17b];
+const i18nSandbox = {window:{StudioI18n:{register:value => { i18nSandbox.registered = value; }}}};
+vm.runInNewContext(i18nSource, i18nSandbox);
+const registeredChineseLabel = i18nSandbox.registered['canvas.followDefaultApi'].zh.replace(/ API$/, '');
+assert.deepEqual(Array.from(registeredChineseLabel, char => char.codePointAt(0)), requiredChineseCodePoints);
+assert.notDeepEqual(Array.from(registeredChineseLabel, char => char.codePointAt(0)), rejectedMojibakeCodePoints);
+
+const fallbackSandbox = {
+    preferredProviderId:()=>'', apiProviders:[], canvasProviderMode:()=> 'default', tr:()=>'',
+    escapeHtml:value=>String(value), CanvasProviderMode:mode
+};
+vm.runInNewContext(`${productionFunction('followDefaultOption')}\nthis.followDefaultOption = followDefaultOption;`, fallbackSandbox);
+const fallbackOption = fallbackSandbox.followDefaultOption({providerMode:'default'}, 'image_models');
+const fallbackChineseLabel = fallbackOption.match(/>(.*?) API/)[1];
+assert.deepEqual(Array.from(fallbackChineseLabel, char => char.codePointAt(0)), requiredChineseCodePoints);
+assert.notDeepEqual(Array.from(fallbackChineseLabel, char => char.codePointAt(0)), rejectedMojibakeCodePoints);
 assert.match(source, /CanvasProviderMode\.DEFAULT_VALUE/);
 assert.match(source, /CanvasProviderMode\.select/);
 

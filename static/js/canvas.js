@@ -632,7 +632,7 @@ function followDefaultOption(node, capability, excludeIds=[]){
     const providerId = preferredProviderId(capability, '', excludeIds);
     const provider = apiProviders.find(item => item.id === providerId);
     const selected = canvasProviderMode(node) === 'default' ? 'selected' : '';
-    const label = tr('canvas.followDefaultApi') || '璺熼殢榛樿 API';
+    const label = tr('canvas.followDefaultApi') || '\u8ddf\u968f\u9ed8\u8ba4 API';
     return `<option value="${CanvasProviderMode.DEFAULT_VALUE}" ${selected}>${escapeHtml(`${label}（${provider?.name || providerId || '暂无'}）`)}</option>`;
 }
 function applyCanvasProviderSelection(node, selectedValue, options){
