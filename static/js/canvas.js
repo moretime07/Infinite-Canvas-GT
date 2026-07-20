@@ -592,6 +592,23 @@ function syncDefaultCanvasNodeProvider(node){
     if(node.type === 'video') return syncCanvasNodeProvider(node, videoProviderModeOptions());
     return false;
 }
+function unresolvedDefaultCanvasNodeError(node, providerField){
+    if(node?.providerMode !== 'default') return '';
+    if(!String(node?.[providerField] || '').trim()){
+        return tr('canvas.noApiProvidersHint') || '暂无 API 平台，请到 API 设置添加';
+    }
+    if(!String(node?.model || '').trim()){
+        return tr('canvas.noModelsHint') || '暂无模型，请到 API 设置添加';
+    }
+    return '';
+}
+function stopUnresolvedDefaultCanvasRun(node, providerField, options={}){
+    const message = unresolvedDefaultCanvasNodeError(node, providerField);
+    if(!message) return false;
+    if(options.cascade) throw new Error(message);
+    showErrorModal(message, tr('canvas.apiFailed'));
+    return true;
+}
 function prepareCanvasNodeForRender(node){
     return syncDefaultCanvasNodeProvider(node);
 }
@@ -651,8 +668,9 @@ function chatProviderOptions(selectedId, node){
     const unavailable = selected && !providers.some(provider => provider.id === selected)
         ? `<option value="${escapeHtml(selected)}" selected>${escapeHtml(`${selected} (Unavailable)`)}</option>`
         : '';
+    const empty = providers.length ? '' : `<option value="" disabled>${tr('canvas.noApiProviders') || '暂无 API 平台'}</option>`;
     const options = providers.map(provider => `<option value="${escapeHtml(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
-    return node ? followDefaultOption(node, 'chat_models') + unavailable + options : options;
+    return node ? followDefaultOption(node, 'chat_models') + unavailable + empty + options : empty + options;
 }
 function providerChatModels(providerId){
     const provider = apiProviders.find(p => p.id === providerId);
@@ -693,8 +711,9 @@ function videoProviderOptions(selectedId, node){
     const unavailable = selected && !providers.some(provider => provider.id === selected)
         ? `<option value="${escapeHtml(selected)}" selected>${escapeHtml(`${selected} (Unavailable)`)}</option>`
         : '';
+    const empty = providers.length ? '' : `<option value="" disabled>${tr('canvas.noApiProviders') || '暂无 API 平台'}</option>`;
     const options = providers.map(provider => `<option value="${escapeHtml(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
-    return node ? followDefaultOption(node, 'video_models', ['modelscope']) + unavailable + options : options;
+    return node ? followDefaultOption(node, 'video_models', ['modelscope']) + unavailable + empty + options : empty + options;
 }
 function providerVideoModels(providerId){
     // 不走 providerById（会 fallback 到第一个 provider，造成串台），直接查精确匹配
@@ -10015,6 +10034,7 @@ async function runGenerator(genId, opts={}){
     const gen = nodes.find(n => n.id === genId);
     if(!gen || (gen.running && !opts.cascade)) return;
     syncDefaultCanvasNodeProvider(gen);
+    if(stopUnresolvedDefaultCanvasRun(gen, 'apiProvider', opts)) return;
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const sources = orderedSources(gen, generatorSources(gen));
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
@@ -10103,6 +10123,7 @@ async function runGeneratorLegacy(genId, opts={}){
     const gen = nodes.find(n => n.id === genId);
     if(!gen || (gen.running && !opts.cascade)) return;
     syncDefaultCanvasNodeProvider(gen);
+    if(stopUnresolvedDefaultCanvasRun(gen, 'apiProvider', opts)) return;
     const sources = orderedSources(gen, generatorSources(gen));
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
     const refs = imageRefsOnly(sources.flatMap(s => s.refs || []));
@@ -10158,6 +10179,7 @@ async function runVideoNode(nodeId, opts={}){
     const node = nodes.find(n => n.id === nodeId);
     if(!node || (node.running && !opts.cascade)) return;
     syncDefaultCanvasNodeProvider(node);
+    if(stopUnresolvedDefaultCanvasRun(node, 'apiProvider', opts)) return;
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const sources = orderedSources(node, generatorSources(node));
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
@@ -11045,6 +11067,8 @@ async function runComfyNode(nodeId, opts={}){
 }
 async function callCanvasLLM(node, message, messages=[], options={}){
     syncDefaultCanvasNodeProvider(node);
+    const providerError = unresolvedDefaultCanvasNodeError(node, 'llmProvider');
+    if(providerError) throw new Error(providerError);
     const llmProv = resolveChatProviderId(node.llmProvider || '');
     const model = resolveChatModel(node.model || node.llmMsModel, llmProv);
     const images = llmInputImages(node);

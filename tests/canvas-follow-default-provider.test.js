@@ -8,9 +8,12 @@ const mode = require('../static/js/canvas-provider-mode.js');
 const source = fs.readFileSync(path.resolve(__dirname, '..', 'static', 'js', 'canvas.js'), 'utf8');
 
 function productionFunction(name){
-    const start = source.indexOf(`function ${name}(`);
+    const asyncStart = source.indexOf(`async function ${name}(`);
+    const start = asyncStart === -1 ? source.indexOf(`function ${name}(`) : asyncStart;
     assert.notEqual(start, -1, `canvas.js should define ${name}`);
-    const next = source.indexOf('\nfunction ', start + 1);
+    const nextSync = source.indexOf('\nfunction ', start + 1);
+    const nextAsync = source.indexOf('\nasync function ', start + 1);
+    const next = [nextSync, nextAsync].filter(index => index !== -1).sort((a, b) => a - b)[0] ?? -1;
     return source.slice(start, next === -1 ? source.length : next);
 }
 
@@ -138,7 +141,12 @@ const sandbox = {
     apiProviders:providers,
     defaultApiProviders:() => providers,
     preferredProviderId:capability => global.ProviderDefaults.pickProvider(providers, {capability})?.id || '',
-    tr:() => 'Follow default API',
+    tr:key => ({
+        'canvas.followDefaultApi':'Follow default API',
+        'canvas.noApiProviders':'No API providers',
+        'canvas.noApiProvidersHint':'No API providers. Add one in API Settings.',
+        'canvas.noModelsHint':'No models. Add some in API Settings.'
+    })[key] || key,
     escapeHtml:value => String(value),
     chatApiProviders:() => sandbox.apiProviders.filter(provider => provider.enabled !== false && provider.chat_models.length),
     imageApiProviders:() => sandbox.apiProviders.filter(provider => provider.enabled !== false && provider.image_models.length),
@@ -161,9 +169,11 @@ const sandbox = {
 const executableNames = [
     'chatApiProviders', 'videoApiProviders', 'providerChatModels', 'providerVideoModels',
     'allChatModels', 'resolveChatModel', 'addLLMNode', 'addVideoNode',
+    'runGenerator', 'runGeneratorLegacy', 'runVideoNode', 'callCanvasLLM',
     'preferredProviderId', 'resolveChatProviderId', 'resolveImageProviderId', 'resolveVideoProviderId',
     'canvasProviderMode', 'chatProviderModeOptions', 'imageProviderModeOptions', 'videoProviderModeOptions',
-    'syncCanvasNodeProvider', 'syncFollowingDefaultCanvasNodes', 'syncDefaultCanvasNodeProvider', 'prepareCanvasNodeForRender',
+    'syncCanvasNodeProvider', 'syncFollowingDefaultCanvasNodes', 'syncDefaultCanvasNodeProvider',
+    'unresolvedDefaultCanvasNodeError', 'stopUnresolvedDefaultCanvasRun', 'prepareCanvasNodeForRender',
     'normalizeCanvasProviderSentinels', 'serializableCanvasNode', 'serializableCanvasLogs', 'runSnapshot', 'addGenerationLog',
     'followDefaultOption',
     'applyCanvasProviderSelection', 'applyChatProviderSelection',
@@ -203,6 +213,12 @@ assert.deepEqual({
 }, 'configured providers with no compatible chat/video capability must keep default nodes unresolved');
 assert.match(controls.chatModelOptions('', '', {providerMode:'default'}), /value="" disabled selected/, 'an unresolved default LLM node should show the existing no-model hint');
 assert.match(controls.videoModelOptions('', ''), /value="" disabled selected/, 'an unresolved default video node should show the existing no-model hint');
+const noCompatibleChatProviders = controls.chatProviderOptions('', {providerMode:'default'});
+assert.match(noCompatibleChatProviders, /value="__default__" selected/, 'unresolved LLM controls should retain the follow-default option');
+assert.match(noCompatibleChatProviders, /value="" disabled[^>]*>No API providers</, 'unresolved LLM controls should include the no-provider hint');
+const noCompatibleVideoProviders = controls.videoProviderOptions('', {providerMode:'default'});
+assert.match(noCompatibleVideoProviders, /value="__default__" selected/, 'unresolved video controls should retain the follow-default option');
+assert.match(noCompatibleVideoProviders, /value="" disabled[^>]*>No API providers</, 'unresolved video controls should include the no-provider hint');
 sandbox.apiProviders = providers;
 
 assert.notEqual(controls.resolveImageProviderId(mode.DEFAULT_VALUE), mode.DEFAULT_VALUE);
@@ -328,4 +344,114 @@ assert.match(controls.providerOptions('openrouter', {providerMode:'default'}), /
 assert.match(controls.chatProviderOptions('openrouter', {providerMode:'default'}), /value="__default__" selected/);
 assert.match(controls.videoProviderOptions('openrouter', {providerMode:'default'}), /value="__default__" selected/);
 
-console.log('canvas-follow-default-provider: passed');
+async function unresolvedRunResult(node, invoke){
+    sandbox.apiProviders = [{id:'empty', enabled:true, primary:true, chat_models:[], image_models:[], video_models:[]}];
+    sandbox.nodes = [node];
+    sandbox.networkCalls = 0;
+    sandbox.runErrors = [];
+    sandbox.fetch = async () => {
+        sandbox.networkCalls += 1;
+        throw new Error('network attempted');
+    };
+    sandbox.cascadeFetch = sandbox.fetch;
+    sandbox.createCanvasImageTask = async () => {
+        sandbox.networkCalls += 1;
+        throw new Error('network attempted');
+    };
+    sandbox.showErrorModal = message => sandbox.runErrors.push(String(message));
+    sandbox.alert = message => sandbox.runErrors.push(String(message));
+    let thrown = '';
+    try {
+        await invoke(node);
+    } catch(error) {
+        thrown = error.message || String(error);
+    }
+    return {
+        networkCalls:sandbox.networkCalls,
+        errors:[...sandbox.runErrors, thrown].filter(Boolean),
+        provider:node.llmProvider ?? node.apiProvider,
+        model:node.model
+    };
+}
+
+sandbox.cascadeTargetIdFromOptions = () => '';
+sandbox.generatorSources = () => [];
+sandbox.orderedSources = () => [{prompt:'prompt', refs:[]}];
+sandbox.imageRefsOnly = refs => refs || [];
+sandbox.videoRefsOnly = refs => refs || [];
+sandbox.audioRefsOnly = refs => refs || [];
+sandbox.applyUploadedUrlToRefs = refs => refs || [];
+sandbox.mediaKindForRef = () => '';
+sandbox.outputForNode = () => null;
+sandbox.runSnapshot = () => ({nodeType:'test', node:{}});
+sandbox.generatorSizeForRun = async () => '1024x1024';
+sandbox.normalizedImageQuality = () => '';
+sandbox.nowMs = () => 0;
+sandbox.refreshRunNodes = () => {};
+sandbox.scheduleSave = () => {};
+sandbox.addGenerationLog = () => {};
+sandbox.collectRunMetas = () => [];
+sandbox.collectRunMeta = () => ({runMs:0, run:{}});
+sandbox.isCascadeAbortError = () => false;
+sandbox.makePendingForRun = () => ({});
+sandbox.manualVideoUrlForNode = () => '';
+sandbox.tempShUploadedUrlForNode = (_node, url) => url;
+sandbox.llmInputImages = () => [];
+sandbox.llmInputVideos = () => [];
+sandbox.CANVAS_REFERENCE_IMAGE_MAX = 8;
+
+(async () => {
+    const expectedError = 'No API providers. Add one in API Settings.';
+    const results = {
+        generator:await unresolvedRunResult(
+            {id:'gen-run', type:'generator', providerMode:'default', apiProvider:'stale', model:'stale'},
+            node => controls.runGenerator(node.id, {cascade:true})
+        ),
+        generatorLegacy:await unresolvedRunResult(
+            {id:'gen-legacy-run', type:'generator', providerMode:'default', apiProvider:'stale', model:'stale'},
+            node => controls.runGeneratorLegacy(node.id, {cascade:true})
+        ),
+        video:await unresolvedRunResult(
+            {id:'video-run', type:'video', providerMode:'default', apiProvider:'stale', model:'stale'},
+            node => controls.runVideoNode(node.id, {cascade:true})
+        ),
+        llm:await unresolvedRunResult(
+            {id:'llm-run', type:'llm', providerMode:'default', llmProvider:'stale', model:'stale'},
+            node => controls.callCanvasLLM(node, 'prompt')
+        )
+    };
+    Object.entries(results).forEach(([name, result]) => {
+        assert.equal(result.networkCalls, 0, `${name} must stop before fetch/request helpers`);
+        assert.deepEqual(result.errors, [expectedError], `${name} should surface the existing no-provider error`);
+        assert.equal(result.provider, '', `${name} should retain an empty resolved provider`);
+        assert.equal(result.model, '', `${name} should retain an empty resolved model`);
+    });
+    assert.equal(
+        controls.unresolvedDefaultCanvasNodeError(
+            {providerMode:'default', llmProvider:'configured-chat', model:''},
+            'llmProvider'
+        ),
+        'No models. Add some in API Settings.',
+        'an explicit default node with a provider but no model should surface the existing no-model error'
+    );
+
+    const fixedLlm = await unresolvedRunResult(
+        {id:'fixed-llm-run', type:'llm', providerMode:'fixed', llmProvider:'fixed-chat', model:'fixed-model'},
+        node => controls.callCanvasLLM(node, 'prompt')
+    );
+    assert.equal(fixedLlm.networkCalls, 1, 'fixed LLM request behavior must not be stopped by the explicit-default guard');
+    assert.equal(fixedLlm.provider, 'fixed-chat');
+    assert.equal(fixedLlm.model, 'fixed-model');
+
+    const legacyVideo = await unresolvedRunResult(
+        {id:'legacy-video-run', type:'video', apiProvider:'legacy-video', model:'legacy-model'},
+        node => controls.runVideoNode(node.id, {cascade:true})
+    );
+    assert.equal(legacyVideo.networkCalls, 1, 'missing-mode legacy video request behavior must not be stopped by the explicit-default guard');
+    assert.equal(legacyVideo.provider, 'legacy-video');
+    assert.equal(legacyVideo.model, 'legacy-model');
+    console.log('canvas-follow-default-provider: passed');
+})().catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+});
