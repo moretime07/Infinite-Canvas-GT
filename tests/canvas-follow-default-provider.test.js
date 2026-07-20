@@ -159,6 +159,8 @@ const sandbox = {
     canvas:null
 };
 const executableNames = [
+    'chatApiProviders', 'videoApiProviders', 'providerChatModels', 'providerVideoModels',
+    'allChatModels', 'resolveChatModel', 'addLLMNode', 'addVideoNode',
     'preferredProviderId', 'resolveChatProviderId', 'resolveImageProviderId', 'resolveVideoProviderId',
     'canvasProviderMode', 'chatProviderModeOptions', 'imageProviderModeOptions', 'videoProviderModeOptions',
     'syncCanvasNodeProvider', 'syncFollowingDefaultCanvasNodes', 'syncDefaultCanvasNodeProvider', 'prepareCanvasNodeForRender',
@@ -174,6 +176,34 @@ vm.runInNewContext(
     sandbox
 );
 const controls = sandbox.controls;
+
+sandbox.addNode = node => node;
+sandbox.chatModels = ['fabricated-chat-model'];
+sandbox.localChatModels = [];
+sandbox.hasManagedChatModels = false;
+sandbox.videoModels = ['fabricated-video-model'];
+sandbox.DEFAULT_VIDEO_MODELS = ['fabricated-default-video-model'];
+
+const noCompatibleProviders = [
+    {id:'image-only', enabled:true, primary:true, chat_models:[], image_models:['image-only-model'], video_models:[]}
+];
+sandbox.apiProviders = noCompatibleProviders;
+const noCompatibleLlm = controls.addLLMNode({x:10, y:20});
+const noCompatibleVideo = controls.addVideoNode({x:30, y:40});
+assert.deepEqual({
+    chatProviders:Array.from(controls.chatApiProviders(), provider => provider.id),
+    videoProviders:Array.from(controls.videoApiProviders(), provider => provider.id),
+    llm:{provider:noCompatibleLlm.llmProvider, model:noCompatibleLlm.model},
+    video:{provider:noCompatibleVideo.apiProvider, model:noCompatibleVideo.model}
+}, {
+    chatProviders:[],
+    videoProviders:[],
+    llm:{provider:'', model:''},
+    video:{provider:'', model:''}
+}, 'configured providers with no compatible chat/video capability must keep default nodes unresolved');
+assert.match(controls.chatModelOptions('', '', {providerMode:'default'}), /value="" disabled selected/, 'an unresolved default LLM node should show the existing no-model hint');
+assert.match(controls.videoModelOptions('', ''), /value="" disabled selected/, 'an unresolved default video node should show the existing no-model hint');
+sandbox.apiProviders = providers;
 
 assert.notEqual(controls.resolveImageProviderId(mode.DEFAULT_VALUE), mode.DEFAULT_VALUE);
 assert.notEqual(controls.resolveChatProviderId(mode.DEFAULT_VALUE), mode.DEFAULT_VALUE);

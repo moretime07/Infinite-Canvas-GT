@@ -640,7 +640,7 @@ function resolveProviderId(id){
 function chatApiProviders(){
     const providers = (apiProviders.length ? apiProviders : defaultApiProviders())
         .filter(p => p.enabled !== false && (p.chat_models || []).length);
-    return providers.length ? providers : defaultApiProviders();
+    return providers;
 }
 function resolveChatProviderId(id){
     return preferredProviderId('chat_models', id) || 'comfly';
@@ -682,7 +682,7 @@ function providerImageModels(providerId){
 function videoApiProviders(){
     const providers = (apiProviders.length ? apiProviders : defaultApiProviders())
         .filter(p => p.id !== 'modelscope' && p.enabled !== false && (p.video_models || []).length);
-    return providers.length ? providers : defaultApiProviders();
+    return providers;
 }
 function resolveVideoProviderId(id){
     return preferredProviderId('video_models', id, ['modelscope']) || 'comfly';
@@ -990,8 +990,9 @@ function imageModelOptions(selectedModel, providerId){
     const hasSelected = models.includes(selectedValue);
     return `${hasSelected || !selectedValue ? '' : `<option value="${escapeHtml(selectedValue)}" selected>${escapeHtml(selectedValue)}</option>`}${options}`;
 }
-function chatModelOptions(selectedModel, providerId=''){
-    const models = providerId ? providerChatModels(providerId) : allChatModels();
+function chatModelOptions(selectedModel, providerId='', node){
+    const unresolvedDefault = canvasProviderMode(node) === 'default' && !providerId;
+    const models = unresolvedDefault ? [] : (providerId ? providerChatModels(providerId) : allChatModels());
     if(!models.length){
         if(selectedModel) return `<option value="${escapeHtml(selectedModel)}" selected>${escapeHtml(`${selectedModel} (Unavailable)`)}</option>`;
         return `<option value="" disabled selected>${tr('canvas.noModelsHint') || '暂无模型，请到 API 设置添加'}</option>`;
@@ -2418,7 +2419,7 @@ function addLLMNode(point){
         y:p.y,
         providerMode:'default',
         llmProvider:providerId,
-        model:resolveChatModel('', providerId),
+        model:providerId ? resolveChatModel('', providerId) : '',
         mode:'node',
         systemPrompt:'You are a helpful assistant. Rewrite the input into a concise image prompt.',
         chatInput:'',
@@ -2471,7 +2472,7 @@ function addVideoNode(point){
         y:p.y,
         providerMode:'default',
         apiProvider:providerId,
-        model:models[0] || videoModels[0] || DEFAULT_VIDEO_MODELS[0],
+        model:providerId ? (models[0] || '') : '',
         duration:5,
         aspectRatio:'16:9',
         resolution:'',
@@ -7725,7 +7726,7 @@ function renderLLMBody(node){
     const mode = node.mode || 'node';
     prepareCanvasNodeForRender(node);
     const llmProv = node.llmProvider;
-    const modelOpts = chatModelOptions(node.model, llmProv);
+    const modelOpts = chatModelOptions(node.model, llmProv, node);
     const imgs = llmInputImages(node);
     const videos = llmInputVideos(node);
     const mediaBadgeText = [
