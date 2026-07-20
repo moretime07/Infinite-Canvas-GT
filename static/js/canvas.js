@@ -609,6 +609,22 @@ function stopUnresolvedDefaultCanvasRun(node, providerField, options={}){
     showErrorModal(message, tr('canvas.apiFailed'));
     return true;
 }
+function resolveCanvasNodeRequest(node, options){
+    const providerId = String(node?.[options.providerField] || '').trim();
+    const providers = apiProviders.length ? apiProviders : defaultApiProviders();
+    const provider = providers.find(item => String(item?.id || '') === providerId);
+    const excluded = new Set((options.excludeIds || []).map(String));
+    const models = Array.isArray(provider?.[options.capability]) ? provider[options.capability].filter(Boolean) : [];
+    if(!providerId || !provider || provider.enabled === false || excluded.has(providerId) || !models.length){
+        throw new Error(`API provider "${providerId || '(empty)'}" is unavailable for this node.`);
+    }
+    const storedModel = String(node?.model || '').trim();
+    const model = options.resolveModel ? String(options.resolveModel(storedModel, providerId) || '').trim() : storedModel;
+    if(!model || !models.includes(model)){
+        throw new Error(`Model "${model || storedModel || '(empty)'}" is unavailable for provider "${providerId}".`);
+    }
+    return {providerId, model};
+}
 function prepareCanvasNodeForRender(node){
     return syncDefaultCanvasNodeProvider(node);
 }
@@ -616,7 +632,7 @@ function followDefaultOption(node, capability, excludeIds=[]){
     const providerId = preferredProviderId(capability, '', excludeIds);
     const provider = apiProviders.find(item => item.id === providerId);
     const selected = canvasProviderMode(node) === 'default' ? 'selected' : '';
-    const label = tr('canvas.followDefaultApi') || '鐠虹喖娈㈡妯款吇 API';
+    const label = tr('canvas.followDefaultApi') || '璺熼殢榛樿 API';
     return `<option value="${CanvasProviderMode.DEFAULT_VALUE}" ${selected}>${escapeHtml(`${label}（${provider?.name || providerId || '暂无'}）`)}</option>`;
 }
 function applyCanvasProviderSelection(node, selectedValue, options){
@@ -1992,6 +2008,7 @@ async function openCanvas(id){
         }
         canvas.logs = canvas.logs || [];
         nodes = canvas.nodes || [];
+        const defaultsChanged = syncFollowingDefaultCanvasNodes();
         connections = canvas.connections || [];
         viewport = localViewportForCanvas(canvas.id, canvas.viewport || {x:0, y:0, scale:1});
         canvas.viewport = {...viewport};
@@ -2008,6 +2025,7 @@ async function openCanvas(id){
         resumeCanvasImageTasks();
         startCanvasRemotePolling();
         setStatus('Ready');
+        if(defaultsChanged) scheduleSave();
     } catch(e) {
         setStatus(tr('canvas.openFailed'));
         console.error(e);
@@ -2023,6 +2041,7 @@ function applyRemoteCanvasData(remote){
         return;
     }
     applyingRemoteCanvas = true;
+    let defaultsChanged = false;
     try {
         resetCascadeRuntimeState();
         const localViewport = localViewportForCanvas(canvas.id, viewport || remote.viewport || {x:0, y:0, scale:1});
@@ -2030,6 +2049,7 @@ function applyRemoteCanvasData(remote){
         canvas = remote;
         canvas.logs = canvas.logs || [];
         nodes = canvas.nodes || [];
+        defaultsChanged = syncFollowingDefaultCanvasNodes();
         connections = canvas.connections || [];
         viewport = localViewport;
         canvas.viewport = {...viewport};
@@ -2048,6 +2068,7 @@ function applyRemoteCanvasData(remote){
         setStatus('Synced');
     } finally {
         applyingRemoteCanvas = false;
+        if(defaultsChanged) scheduleSave();
     }
 }
 function resetTransientRunState(list=nodes){
@@ -10035,6 +10056,7 @@ async function runGenerator(genId, opts={}){
     if(!gen || (gen.running && !opts.cascade)) return;
     syncDefaultCanvasNodeProvider(gen);
     if(stopUnresolvedDefaultCanvasRun(gen, 'apiProvider', opts)) return;
+    const requestProvider = resolveCanvasNodeRequest(gen, {...imageProviderModeOptions(), resolveModel:resolveImageModel});
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const sources = orderedSources(gen, generatorSources(gen));
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
@@ -10045,8 +10067,8 @@ async function runGenerator(genId, opts={}){
     const run = runSnapshot(gen, prompt || 'Edit the reference images.', refs);
     const payload = {
         prompt: prompt || 'Edit the reference images.',
-        provider_id:resolveImageProviderId(gen.apiProvider || ''),
-        model:resolveImageModel(gen.model),
+        provider_id:requestProvider.providerId,
+        model:requestProvider.model,
         size:await generatorSizeForRun(gen, refs),
         reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
     };
@@ -10124,6 +10146,7 @@ async function runGeneratorLegacy(genId, opts={}){
     if(!gen || (gen.running && !opts.cascade)) return;
     syncDefaultCanvasNodeProvider(gen);
     if(stopUnresolvedDefaultCanvasRun(gen, 'apiProvider', opts)) return;
+    const requestProvider = resolveCanvasNodeRequest(gen, {...imageProviderModeOptions(), resolveModel:resolveImageModel});
     const sources = orderedSources(gen, generatorSources(gen));
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
     const refs = imageRefsOnly(sources.flatMap(s => s.refs || []));
@@ -10143,8 +10166,8 @@ async function runGeneratorLegacy(genId, opts={}){
     try {
         const payload = {
             prompt: prompt || 'Edit the reference images.',
-            provider_id:resolveImageProviderId(gen.apiProvider || ''),
-            model:resolveImageModel(gen.model),
+            provider_id:requestProvider.providerId,
+            model:requestProvider.model,
             size:requestSize,
             reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
         };
@@ -10180,6 +10203,7 @@ async function runVideoNode(nodeId, opts={}){
     if(!node || (node.running && !opts.cascade)) return;
     syncDefaultCanvasNodeProvider(node);
     if(stopUnresolvedDefaultCanvasRun(node, 'apiProvider', opts)) return;
+    const requestProvider = resolveCanvasNodeRequest(node, videoProviderModeOptions());
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const sources = orderedSources(node, generatorSources(node));
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
@@ -10203,8 +10227,8 @@ async function runVideoNode(nodeId, opts={}){
             headers:{'Content-Type':'application/json'},
             body:JSON.stringify({
                 prompt,
-                provider_id:resolveVideoProviderId(node.apiProvider || ''),
-                model:node.model || 'veo3-fast',
+                provider_id:requestProvider.providerId,
+                model:requestProvider.model,
                 duration:Number(node.duration || 5),
                 aspect_ratio:node.aspectRatio || '16:9',
                 resolution:node.resolution || '',
@@ -11069,8 +11093,9 @@ async function callCanvasLLM(node, message, messages=[], options={}){
     syncDefaultCanvasNodeProvider(node);
     const providerError = unresolvedDefaultCanvasNodeError(node, 'llmProvider');
     if(providerError) throw new Error(providerError);
-    const llmProv = resolveChatProviderId(node.llmProvider || '');
-    const model = resolveChatModel(node.model || node.llmMsModel, llmProv);
+    const requestProvider = resolveCanvasNodeRequest(node, {...chatProviderModeOptions(), resolveModel:resolveChatModel});
+    const llmProv = requestProvider.providerId;
+    const model = requestProvider.model;
     const images = llmInputImages(node);
     const videos = llmInputVideos(node);
     const result = await cascadeFetch('/api/canvas-llm', {

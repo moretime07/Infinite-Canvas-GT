@@ -6,6 +6,7 @@ const vm = require('node:vm');
 global.ProviderDefaults = require('../static/js/provider-defaults.js');
 const mode = require('../static/js/canvas-provider-mode.js');
 const source = fs.readFileSync(path.resolve(__dirname, '..', 'static', 'js', 'canvas.js'), 'utf8');
+const i18nSource = fs.readFileSync(path.resolve(__dirname, '..', 'static', 'js', 'i18n', 'canvas.js'), 'utf8');
 
 function productionFunction(name){
     const asyncStart = source.indexOf(`async function ${name}(`);
@@ -103,7 +104,9 @@ assert.equal(
 assert.match(productionFunction('addGeneratorNode'), /providerMode\s*:\s*['"]default['"]/);
 assert.match(productionFunction('addLLMNode'), /providerMode\s*:\s*['"]default['"]/);
 assert.match(productionFunction('addVideoNode'), /providerMode\s*:\s*['"]default['"]/);
-assert.match(source, /鐠虹喖娈㈡妯款吇 API/);
+assert.match(source, /璺熼殢榛樿 API/);
+assert.doesNotMatch(source, /鐠虹喖娈㈡妯款吇 API/);
+assert.match(i18nSource, /"canvas\.followDefaultApi"\s*:\s*\{\s*zh:\s*"璺熼殢榛樿 API",\s*en:\s*"Follow default API"\s*\}/);
 assert.match(source, /CanvasProviderMode\.DEFAULT_VALUE/);
 assert.match(source, /CanvasProviderMode\.select/);
 
@@ -173,6 +176,7 @@ const executableNames = [
     'preferredProviderId', 'resolveChatProviderId', 'resolveImageProviderId', 'resolveVideoProviderId',
     'canvasProviderMode', 'chatProviderModeOptions', 'imageProviderModeOptions', 'videoProviderModeOptions',
     'syncCanvasNodeProvider', 'syncFollowingDefaultCanvasNodes', 'syncDefaultCanvasNodeProvider',
+    'resolveCanvasNodeRequest',
     'unresolvedDefaultCanvasNodeError', 'stopUnresolvedDefaultCanvasRun', 'prepareCanvasNodeForRender',
     'normalizeCanvasProviderSentinels', 'serializableCanvasNode', 'serializableCanvasLogs', 'runSnapshot', 'addGenerationLog',
     'followDefaultOption',
@@ -435,21 +439,124 @@ sandbox.CANVAS_REFERENCE_IMAGE_MAX = 8;
         'an explicit default node with a provider but no model should surface the existing no-model error'
     );
 
-    const fixedLlm = await unresolvedRunResult(
-        {id:'fixed-llm-run', type:'llm', providerMode:'fixed', llmProvider:'fixed-chat', model:'fixed-model'},
+    async function requestPathResult(node, providersForRun, invoke){
+        sandbox.apiProviders = providersForRun;
+        sandbox.nodes = [node];
+        sandbox.networkCalls = 0;
+        sandbox.requestBodies = [];
+        sandbox.runErrors = [];
+        const response = {ok:true, json:async () => ({task_id:'task-1', text:'ok', images:['/output/image.png'], videos:['/output/video.mp4']})};
+        sandbox.fetch = async (_url, options={}) => {
+            sandbox.networkCalls += 1;
+            if(options.body) sandbox.requestBodies.push(JSON.parse(options.body));
+            return response;
+        };
+        sandbox.cascadeFetch = sandbox.fetch;
+        sandbox.createCanvasImageTask = async payload => {
+            sandbox.networkCalls += 1;
+            sandbox.requestBodies.push(payload);
+            return {task_id:'task-1'};
+        };
+        sandbox.waitCanvasImageTaskResult = async () => ({images:['/output/image.png']});
+        sandbox.showErrorModal = message => sandbox.runErrors.push(String(message));
+        sandbox.alert = message => sandbox.runErrors.push(String(message));
+        let thrown = '';
+        try { await invoke(node); } catch(error) { thrown = error.message || String(error); }
+        return {networkCalls:sandbox.networkCalls, bodies:sandbox.requestBodies, errors:[...sandbox.runErrors, thrown].filter(Boolean)};
+    }
+
+    const validProviders = [
+        {id:'primary-all', enabled:true, primary:true, image_models:['primary-image'], chat_models:['primary-chat'], video_models:['primary-video']},
+        {id:'stored-all', enabled:true, primary:false, image_models:['stored-image'], chat_models:['stored-chat'], video_models:['stored-video']}
+    ];
+    const pathCases = [
+        ['modern image', {id:'fixed-modern', type:'generator', providerMode:'fixed', apiProvider:'stored-all', model:'stored-image'}, node => controls.runGenerator(node.id, {cascade:true}), 'provider_id'],
+        ['legacy image', {id:'legacy-image', type:'generator', apiProvider:'stored-all', model:'stored-image'}, node => controls.runGeneratorLegacy(node.id, {cascade:true}), 'provider_id'],
+        ['video', {id:'fixed-video', type:'video', providerMode:'fixed', apiProvider:'stored-all', model:'stored-video'}, node => controls.runVideoNode(node.id, {cascade:true}), 'provider_id'],
+        ['LLM', {id:'legacy-llm', type:'llm', llmProvider:'stored-all', model:'stored-chat'}, node => controls.callCanvasLLM(node, 'prompt'), 'provider']
+    ];
+    for(const [name, node, invoke, providerKey] of pathCases){
+        const result = await requestPathResult({...node}, validProviders, invoke);
+        assert.equal(result.networkCalls, 1, `${name} should make one request for a valid fixed/legacy node`);
+        assert.equal(result.bodies[0][providerKey], 'stored-all', `${name} must use the exact stored provider`);
+        assert.equal(result.bodies[0].model, node.model, `${name} must preserve the compatible stored model`);
+    }
+
+    for(const [name, node, invoke] of pathCases){
+        const unavailableProvider = await requestPathResult({...node, [node.type === 'llm' ? 'llmProvider' : 'apiProvider']:'removed'}, validProviders, invoke);
+        assert.equal(unavailableProvider.networkCalls, 0, `${name} must not request when its stored provider is unavailable`);
+        assert.match(unavailableProvider.errors.join('\n'), /provider.*removed.*unavailable/i, `${name} should report the unavailable stored provider`);
+
+        const providerField = node.type === 'llm' ? 'llmProvider' : 'apiProvider';
+        const capabilityField = node.type === 'llm' ? 'chat_models' : node.type === 'video' ? 'video_models' : 'image_models';
+        const disabledProvider = await requestPathResult(
+            {...node, [providerField]:'disabled'},
+            [...validProviders, {id:'disabled', enabled:false, image_models:['stored-image'], chat_models:['stored-chat'], video_models:['stored-video']}],
+            invoke
+        );
+        assert.equal(disabledProvider.networkCalls, 0, `${name} must not request when its stored provider is disabled`);
+        assert.match(disabledProvider.errors.join('\n'), /provider.*disabled.*unavailable/i);
+
+        const incompatibleProvider = await requestPathResult(
+            {...node, [providerField]:'incompatible'},
+            [...validProviders, {id:'incompatible', enabled:true, image_models:[], chat_models:[], video_models:[], [capabilityField]:[]}],
+            invoke
+        );
+        assert.equal(incompatibleProvider.networkCalls, 0, `${name} must not request when its stored provider lacks the required capability`);
+        assert.match(incompatibleProvider.errors.join('\n'), /provider.*incompatible.*unavailable/i);
+
+        const unavailableModel = await requestPathResult({...node, model:'wrong-model'}, validProviders, invoke);
+        assert.equal(unavailableModel.networkCalls, 0, `${name} must not request with a provider/model mismatch`);
+        assert.match(unavailableModel.errors.join('\n'), /model.*wrong-model.*unavailable.*stored-all/i, `${name} should report the unavailable stored model`);
+    }
+
+    const explicitDefault = await requestPathResult(
+        {id:'default-llm', type:'llm', providerMode:'default', llmProvider:'removed', model:'wrong-model'},
+        validProviders,
         node => controls.callCanvasLLM(node, 'prompt')
     );
-    assert.equal(fixedLlm.networkCalls, 1, 'fixed LLM request behavior must not be stopped by the explicit-default guard');
-    assert.equal(fixedLlm.provider, 'fixed-chat');
-    assert.equal(fixedLlm.model, 'fixed-model');
+    assert.equal(explicitDefault.networkCalls, 1, 'an explicit-default node may resolve to the compatible primary provider');
+    assert.equal(explicitDefault.bodies[0].provider, 'primary-all');
+    assert.equal(explicitDefault.bodies[0].model, 'primary-chat');
 
-    const legacyVideo = await unresolvedRunResult(
-        {id:'legacy-video-run', type:'video', apiProvider:'legacy-video', model:'legacy-model'},
-        node => controls.runVideoNode(node.id, {cascade:true})
-    );
-    assert.equal(legacyVideo.networkCalls, 1, 'missing-mode legacy video request behavior must not be stopped by the explicit-default guard');
-    assert.equal(legacyVideo.provider, 'legacy-video');
-    assert.equal(legacyVideo.model, 'legacy-model');
+    const lifecycleSandbox = {
+        syncCalls:0, saveCalls:0, events:[], nodes:[], connections:[], viewport:{x:0,y:0,scale:1},
+        selected:new Set(), canvas:null, localCanvasDirty:false, saveTimer:null, savingCanvasNow:false,
+        saveCanvasAgain:false, applyingRemoteCanvas:false, lastCanvasUpdatedAt:0,
+        fetch:async () => ({ok:true, json:async () => ({canvas:{id:'canvas-1', kind:'classic', title:'Canvas', updated_at:1, nodes:[], connections:[], viewport:{x:0,y:0,scale:1}}})}),
+        tr:key => key, resetCascadeRuntimeState:()=>{}, rememberCanvasListProject:()=>{}, touchCanvasOpened:async()=>null,
+        openSmartCanvasPage:()=>{}, localViewportForCanvas:(_id, value)=>value, resetTransientRunState:()=>{},
+        sanitizeConnections:()=>{}, pruneMissingComfyWorkflows:()=>{}, refreshMissingCanvasAssets:async()=>{},
+        setCanvasMode:()=>{}, renderCanvasList:()=>{}, render:()=>lifecycleSandbox.events.push('render'),
+        resumeCanvasImageTasks:()=>{}, startCanvasRemotePolling:()=>{}, setStatus:value=>lifecycleSandbox.events.push(value),
+        syncFollowingDefaultCanvasNodes:()=>{ lifecycleSandbox.syncCalls += 1; lifecycleSandbox.events.push('sync'); return lifecycleSandbox.syncChanged; },
+        scheduleSave:()=>{ lifecycleSandbox.saveCalls += 1; lifecycleSandbox.events.push(`save:${lifecycleSandbox.applyingRemoteCanvas}`); },
+        currentCanvasTitle:null, currentCanvasTime:null, formatCanvasTime:()=>'', setTimeout:()=>1, clearTimeout:()=>{},
+        console:{error:error=>lifecycleSandbox.events.push(`error:${error?.message || error}`)}, window:{location:{replace:()=>{}}}, canvasListUrlForProject:()=>'', requestedCanvasListProject:()=>'', rememberedCanvasListProject:()=>''
+    };
+    vm.runInNewContext(`${productionFunction('openCanvas')}\n${productionFunction('applyRemoteCanvasData')}\nthis.lifecycle={openCanvas,applyRemoteCanvasData};`, lifecycleSandbox);
+
+    lifecycleSandbox.syncChanged = true;
+    await lifecycleSandbox.lifecycle.openCanvas('canvas-1');
+    assert.equal(lifecycleSandbox.syncCalls, 1, `open should synchronize once after assigning saved nodes; events=${lifecycleSandbox.events.join('|')}`);
+    assert.equal(lifecycleSandbox.saveCalls, 1, 'changed open synchronization should schedule exactly one save');
+    assert.ok(lifecycleSandbox.events.indexOf('sync') < lifecycleSandbox.events.indexOf('render'), 'open synchronization must precede render');
+    assert.ok(lifecycleSandbox.events.indexOf('Ready') < lifecycleSandbox.events.indexOf('save:false'), 'open save must be scheduled after ready');
+
+    lifecycleSandbox.syncCalls = 0; lifecycleSandbox.saveCalls = 0; lifecycleSandbox.events = []; lifecycleSandbox.syncChanged = false;
+    await lifecycleSandbox.lifecycle.openCanvas('canvas-1');
+    assert.equal(lifecycleSandbox.saveCalls, 0, 'unchanged open synchronization must not save');
+
+    lifecycleSandbox.canvas = {id:'canvas-1'}; lifecycleSandbox.syncCalls = 0; lifecycleSandbox.saveCalls = 0; lifecycleSandbox.events = []; lifecycleSandbox.syncChanged = true;
+    lifecycleSandbox.lifecycle.applyRemoteCanvasData({id:'canvas-1', title:'Remote', updated_at:2, nodes:[], connections:[], viewport:{x:0,y:0,scale:1}});
+    assert.equal(lifecycleSandbox.syncCalls, 1, 'remote apply should synchronize once after replacing nodes');
+    assert.equal(lifecycleSandbox.saveCalls, 1, 'changed remote synchronization should schedule exactly one save');
+    assert.ok(lifecycleSandbox.events.indexOf('sync') < lifecycleSandbox.events.indexOf('render'), 'remote synchronization must precede render');
+    assert.ok(lifecycleSandbox.events.includes('save:false'), 'remote save must be scheduled only after applyingRemoteCanvas is cleared');
+
+    lifecycleSandbox.syncCalls = 0; lifecycleSandbox.saveCalls = 0; lifecycleSandbox.events = []; lifecycleSandbox.syncChanged = false;
+    lifecycleSandbox.lifecycle.applyRemoteCanvasData({id:'canvas-1', title:'Remote 2', updated_at:3, nodes:[], connections:[], viewport:{x:0,y:0,scale:1}});
+    assert.equal(lifecycleSandbox.saveCalls, 0, 'unchanged remote synchronization must not save');
     console.log('canvas-follow-default-provider: passed');
 })().catch(error => {
     console.error(error);
