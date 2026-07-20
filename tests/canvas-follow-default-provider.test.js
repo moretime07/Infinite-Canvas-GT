@@ -35,6 +35,43 @@ assert.equal(
     'fallback'
 );
 
+const changedPrimaryProviders = providers.map(provider => ({
+    ...provider,
+    primary:provider.id === 'fallback'
+}));
+const mixed = [
+    {type:'generator', providerMode:'default', apiProvider:'fallback', model:'image-c'},
+    {type:'generator', providerMode:'fixed', apiProvider:'fallback', model:'image-c'},
+    {type:'generator', apiProvider:'fallback', model:'image-c'}
+];
+const mixedResolved = mixed.map(node => mode.resolve(
+    node,
+    changedPrimaryProviders,
+    {capability:'image_models', providerField:'apiProvider'}
+));
+assert.equal(mixedResolved[0].changed, false);
+assert.equal(mixedResolved[0].providerId, 'fallback');
+assert.equal(mixedResolved[1].changed, false);
+assert.equal(mixedResolved[1].providerId, 'fallback');
+assert.equal(mixedResolved[2].changed, false);
+assert.equal(mixedResolved[2].providerId, 'fallback');
+
+const nextPrimaryProviders = providers.map(provider => ({
+    ...provider,
+    primary:provider.id === 'openrouter'
+}));
+const afterPrimaryChange = mixed.map(node => mode.resolve(
+    node,
+    nextPrimaryProviders,
+    {capability:'image_models', providerField:'apiProvider'}
+));
+assert.equal(afterPrimaryChange[0].changed, true);
+assert.equal(afterPrimaryChange[0].providerId, 'openrouter');
+assert.equal(afterPrimaryChange[1].changed, false);
+assert.equal(afterPrimaryChange[1].providerId, 'fallback');
+assert.equal(afterPrimaryChange[2].changed, false);
+assert.equal(afterPrimaryChange[2].providerId, 'fallback');
+
 assert.deepEqual(mode.select(following, mode.DEFAULT_VALUE), {providerMode:'default', requestedId:''});
 assert.deepEqual(mode.select(following, 'fallback'), {providerMode:'fixed', requestedId:'fallback'});
 
@@ -73,6 +110,31 @@ assert.match(source, /CanvasProviderMode\.select/);
 assert.match(productionFunction('renderLLMBody'), /providerSelect\.onchange[\s\S]*applyChatProviderSelection\(node,\s*e\.target\.value\)/);
 assert.match(productionFunction('renderGeneratorBody'), /providerSelect\.onchange[\s\S]*applyImageProviderSelection\(node,\s*e\.target\.value\)/);
 assert.match(productionFunction('renderVideoBody'), /providerSelect\.onchange[\s\S]*applyVideoProviderSelection\(node,\s*e\.target\.value\)/);
+assert.match(productionFunction('syncFollowingDefaultCanvasNodes'), /node\.providerMode\s*!==\s*['"]default['"]/);
+assert.match(productionFunction('refreshCanvasConfigFromSettings'), /const\s+changed\s*=\s*syncFollowingDefaultCanvasNodes\(\)/);
+assert.match(productionFunction('refreshCanvasConfigFromSettings'), /if\s*\(changed\s*&&\s*canvas\)\s*scheduleSave\(\)/);
+assert.match(productionFunction('renderNode'), /syncDefaultCanvasNodeProvider\(node\)/);
+
+[
+    ['runGenerator', 'gen'],
+    ['runGeneratorLegacy', 'gen'],
+    ['runVideoNode', 'node'],
+    ['callCanvasLLM', 'node']
+].forEach(([name, variable]) => {
+    assert.match(
+        productionFunction(name),
+        new RegExp(`syncDefaultCanvasNodeProvider\\(${variable}\\)`),
+        `${name} should resolve a following-default node before building requests`
+    );
+});
+
+['runGenerator', 'runGeneratorLegacy', 'runVideoNode', 'callCanvasLLM'].forEach(name => {
+    assert.doesNotMatch(
+        productionFunction(name),
+        /CanvasProviderMode\.DEFAULT_VALUE/,
+        `${name} must never put the UI default sentinel in a request`
+    );
+});
 
 const sandbox = {
     CanvasProviderMode:mode,
@@ -89,7 +151,9 @@ const sandbox = {
     resolveVideoProviderId:id => id || 'openrouter'
 };
 const executableNames = [
-    'canvasProviderMode', 'syncCanvasNodeProvider', 'followDefaultOption',
+    'canvasProviderMode', 'chatProviderModeOptions', 'imageProviderModeOptions', 'videoProviderModeOptions',
+    'syncCanvasNodeProvider', 'syncFollowingDefaultCanvasNodes', 'syncDefaultCanvasNodeProvider',
+    'serializableCanvasNode', 'followDefaultOption',
     'applyCanvasProviderSelection', 'applyChatProviderSelection',
     'applyImageProviderSelection', 'applyVideoProviderSelection',
     'chatProviderOptions', 'providerOptions', 'videoProviderOptions'
@@ -99,6 +163,31 @@ vm.runInNewContext(
     sandbox
 );
 const controls = sandbox.controls;
+
+sandbox.nodes = mixed.map(node => ({...node}));
+sandbox.apiProviders = nextPrimaryProviders;
+assert.equal(controls.syncFollowingDefaultCanvasNodes(), true);
+assert.equal(sandbox.nodes[0].apiProvider, 'openrouter');
+assert.equal(sandbox.nodes[0].model, 'image-b');
+assert.equal(sandbox.nodes[1].apiProvider, 'fallback');
+assert.equal(sandbox.nodes[1].model, 'image-c');
+assert.equal(sandbox.nodes[2].apiProvider, 'fallback');
+assert.equal(sandbox.nodes[2].model, 'image-c');
+assert.equal(controls.syncFollowingDefaultCanvasNodes(), false);
+
+const legacyFixed = {type:'generator', apiProvider:'fallback', model:'image-c'};
+assert.equal(controls.syncDefaultCanvasNodeProvider(legacyFixed), false);
+assert.deepEqual(legacyFixed, {type:'generator', apiProvider:'fallback', model:'image-c'});
+
+[
+    {type:'generator', apiProvider:mode.DEFAULT_VALUE, model:'image-c'},
+    {type:'llm', llmProvider:mode.DEFAULT_VALUE, model:'chat-c'},
+    {type:'video', apiProvider:mode.DEFAULT_VALUE, model:'video-c'}
+].forEach(node => {
+    const serialized = controls.serializableCanvasNode(node);
+    assert.notEqual(serialized.apiProvider, mode.DEFAULT_VALUE);
+    assert.notEqual(serialized.llmProvider, mode.DEFAULT_VALUE);
+});
 
 function assertDefaultTransition(adapter, providerField, initialProvider, initialModel, expectedProvider, expectedModel){
     const node = {providerMode:'fixed', [providerField]:initialProvider, model:initialModel};

@@ -143,10 +143,13 @@ async function refreshCanvasConfigFromSettings(){
     await loadConfig();
     pruneMissingComfyWorkflows();
     (nodes || []).forEach(node => {
+        if(node.providerMode === 'default') return;
         sanitizeImageNodeProviderModel(node);
         sanitizeVideoNodeProviderModel(node);
     });
+    const changed = syncFollowingDefaultCanvasNodes();
     if(typeof render === 'function') render();
+    if(changed && canvas) scheduleSave();
 }
 window.addEventListener('message', event => {
     if(event.origin && event.origin !== location.origin) return;
@@ -557,6 +560,15 @@ function preferredProviderId(capability, requestedId='', excludeIds=[]){
 function canvasProviderMode(node){
     return CanvasProviderMode.mode(node);
 }
+function chatProviderModeOptions(){
+    return {capability:'chat_models', providerField:'llmProvider'};
+}
+function imageProviderModeOptions(){
+    return {capability:'image_models', providerField:'apiProvider', excludeIds:['modelscope']};
+}
+function videoProviderModeOptions(){
+    return {capability:'video_models', providerField:'apiProvider', excludeIds:['modelscope']};
+}
 function syncCanvasNodeProvider(node, options){
     const resolved = CanvasProviderMode.resolve(
         node,
@@ -566,7 +578,24 @@ function syncCanvasNodeProvider(node, options){
     node.providerMode = resolved.providerMode;
     node[options.providerField] = resolved.providerId;
     node.model = resolved.model;
-    return resolved;
+    return resolved.changed;
+}
+function syncFollowingDefaultCanvasNodes(){
+    let changed = false;
+    (nodes || []).forEach(node => {
+        if(node.providerMode !== 'default') return;
+        if(node.type === 'generator') changed = syncCanvasNodeProvider(node, imageProviderModeOptions()) || changed;
+        if(node.type === 'llm') changed = syncCanvasNodeProvider(node, chatProviderModeOptions()) || changed;
+        if(node.type === 'video') changed = syncCanvasNodeProvider(node, videoProviderModeOptions()) || changed;
+    });
+    return changed;
+}
+function syncDefaultCanvasNodeProvider(node){
+    if(node?.providerMode !== 'default') return false;
+    if(node.type === 'generator') return syncCanvasNodeProvider(node, imageProviderModeOptions());
+    if(node.type === 'llm') return syncCanvasNodeProvider(node, chatProviderModeOptions());
+    if(node.type === 'video') return syncCanvasNodeProvider(node, videoProviderModeOptions());
+    return false;
 }
 function followDefaultOption(node, capability, excludeIds=[]){
     const providerId = preferredProviderId(capability, '', excludeIds);
@@ -582,13 +611,13 @@ function applyCanvasProviderSelection(node, selectedValue, options){
     return syncCanvasNodeProvider(node, options);
 }
 function applyChatProviderSelection(node, selectedValue){
-    return applyCanvasProviderSelection(node, selectedValue, {capability:'chat_models', providerField:'llmProvider'});
+    return applyCanvasProviderSelection(node, selectedValue, chatProviderModeOptions());
 }
 function applyImageProviderSelection(node, selectedValue){
-    return applyCanvasProviderSelection(node, selectedValue, {capability:'image_models', providerField:'apiProvider', excludeIds:['modelscope']});
+    return applyCanvasProviderSelection(node, selectedValue, imageProviderModeOptions());
 }
 function applyVideoProviderSelection(node, selectedValue){
-    return applyCanvasProviderSelection(node, selectedValue, {capability:'video_models', providerField:'apiProvider', excludeIds:['modelscope']});
+    return applyCanvasProviderSelection(node, selectedValue, videoProviderModeOptions());
 }
 function isRunningHubProvider(provider){
     const id = String(provider?.id || '').trim().toLowerCase();
@@ -644,7 +673,7 @@ function providerImageModels(providerId){
 }
 function sanitizeImageNodeProviderModel(node){
     if(!node || node.type !== 'generator') return;
-    syncCanvasNodeProvider(node, {capability:'image_models', providerField:'apiProvider', excludeIds:['modelscope']});
+    syncCanvasNodeProvider(node, imageProviderModeOptions());
 }
 function videoApiProviders(){
     const providers = (apiProviders.length ? apiProviders : defaultApiProviders())
@@ -666,7 +695,7 @@ function providerVideoModels(providerId){
 }
 function sanitizeVideoNodeProviderModel(node){
     if(!node || node.type !== 'video') return;
-    syncCanvasNodeProvider(node, {capability:'video_models', providerField:'apiProvider', excludeIds:['modelscope']});
+    syncCanvasNodeProvider(node, videoProviderModeOptions());
 }
 function videoModelOptions(selectedModel, providerId){
     const models = providerVideoModels(providerId);
@@ -1285,6 +1314,15 @@ function refreshOutputTimer(){
 }
 function serializableCanvasNode(node){
     const copy = {...(node || {})};
+    if(copy.type === 'generator' && copy.apiProvider === CanvasProviderMode.DEFAULT_VALUE){
+        syncCanvasNodeProvider(copy, imageProviderModeOptions());
+    }
+    if(copy.type === 'llm' && copy.llmProvider === CanvasProviderMode.DEFAULT_VALUE){
+        syncCanvasNodeProvider(copy, chatProviderModeOptions());
+    }
+    if(copy.type === 'video' && copy.apiProvider === CanvasProviderMode.DEFAULT_VALUE){
+        syncCanvasNodeProvider(copy, videoProviderModeOptions());
+    }
     delete copy._ltxEditor;
     delete copy.running;
     delete copy.runStatus;
@@ -5795,6 +5833,7 @@ function isNodeDragSurface(target){
     return !isNodeControl(target) && !target.closest('.port, .resize-handle, .output-img-wrap');
 }
 function renderNode(node){
+    syncDefaultCanvasNodeProvider(node);
     normalizeApiNodeLayout(node);
     if(node.type === 'rh' && Number(node.h) === 560) delete node.h;
     const el = document.createElement('div');
@@ -9959,6 +9998,7 @@ function refreshGeneratorInputViews(){
 async function runGenerator(genId, opts={}){
     const gen = nodes.find(n => n.id === genId);
     if(!gen || (gen.running && !opts.cascade)) return;
+    syncDefaultCanvasNodeProvider(gen);
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const sources = orderedSources(gen, generatorSources(gen));
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
@@ -10046,6 +10086,7 @@ async function runGenerator(genId, opts={}){
 async function runGeneratorLegacy(genId, opts={}){
     const gen = nodes.find(n => n.id === genId);
     if(!gen || (gen.running && !opts.cascade)) return;
+    syncDefaultCanvasNodeProvider(gen);
     const sources = orderedSources(gen, generatorSources(gen));
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
     const refs = imageRefsOnly(sources.flatMap(s => s.refs || []));
@@ -10100,6 +10141,7 @@ async function runGeneratorLegacy(genId, opts={}){
 async function runVideoNode(nodeId, opts={}){
     const node = nodes.find(n => n.id === nodeId);
     if(!node || (node.running && !opts.cascade)) return;
+    syncDefaultCanvasNodeProvider(node);
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const sources = orderedSources(node, generatorSources(node));
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
@@ -10986,6 +11028,7 @@ async function runComfyNode(nodeId, opts={}){
     }
 }
 async function callCanvasLLM(node, message, messages=[], options={}){
+    syncDefaultCanvasNodeProvider(node);
     const llmProv = resolveChatProviderId(node.llmProvider || '');
     const model = resolveChatModel(node.model || node.llmMsModel, llmProv);
     const images = llmInputImages(node);
