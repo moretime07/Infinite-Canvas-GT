@@ -616,14 +616,23 @@ function resolveCanvasNodeRequest(node, options){
     const excluded = new Set((options.excludeIds || []).map(String));
     const models = Array.isArray(provider?.[options.capability]) ? provider[options.capability].filter(Boolean) : [];
     if(!providerId || !provider || provider.enabled === false || excluded.has(providerId) || !models.length){
-        throw new Error(`API provider "${providerId || '(empty)'}" is unavailable for this node.`);
+        throw new Error(trf('canvas.providerUnavailable', {provider:providerId || '(empty)'}));
     }
     const storedModel = String(node?.model || '').trim();
     const model = options.resolveModel ? String(options.resolveModel(storedModel, providerId) || '').trim() : storedModel;
     if(!model || !models.includes(model)){
-        throw new Error(`Model "${model || storedModel || '(empty)'}" is unavailable for provider "${providerId}".`);
+        throw new Error(trf('canvas.modelUnavailable', {model:model || storedModel || '(empty)', provider:providerId}));
     }
     return {providerId, model};
+}
+function preflightCanvasNodeRequest(node, options, runOptions, showError){
+    try {
+        return resolveCanvasNodeRequest(node, options);
+    } catch(error) {
+        if(runOptions?.cascade) throw error;
+        showError(error.message || String(error));
+        return null;
+    }
 }
 function prepareCanvasNodeForRender(node){
     return syncDefaultCanvasNodeProvider(node);
@@ -10056,7 +10065,13 @@ async function runGenerator(genId, opts={}){
     if(!gen || (gen.running && !opts.cascade)) return;
     syncDefaultCanvasNodeProvider(gen);
     if(stopUnresolvedDefaultCanvasRun(gen, 'apiProvider', opts)) return;
-    const requestProvider = resolveCanvasNodeRequest(gen, {...imageProviderModeOptions(), resolveModel:resolveImageModel});
+    const requestProvider = preflightCanvasNodeRequest(
+        gen,
+        {...imageProviderModeOptions(), resolveModel:resolveImageModel},
+        opts,
+        message => showErrorModal(message, tr('canvas.apiFailed'))
+    );
+    if(!requestProvider) return;
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const sources = orderedSources(gen, generatorSources(gen));
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
@@ -10146,7 +10161,13 @@ async function runGeneratorLegacy(genId, opts={}){
     if(!gen || (gen.running && !opts.cascade)) return;
     syncDefaultCanvasNodeProvider(gen);
     if(stopUnresolvedDefaultCanvasRun(gen, 'apiProvider', opts)) return;
-    const requestProvider = resolveCanvasNodeRequest(gen, {...imageProviderModeOptions(), resolveModel:resolveImageModel});
+    const requestProvider = preflightCanvasNodeRequest(
+        gen,
+        {...imageProviderModeOptions(), resolveModel:resolveImageModel},
+        opts,
+        message => showErrorModal(message, tr('canvas.apiFailed'))
+    );
+    if(!requestProvider) return;
     const sources = orderedSources(gen, generatorSources(gen));
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
     const refs = imageRefsOnly(sources.flatMap(s => s.refs || []));
@@ -10203,7 +10224,8 @@ async function runVideoNode(nodeId, opts={}){
     if(!node || (node.running && !opts.cascade)) return;
     syncDefaultCanvasNodeProvider(node);
     if(stopUnresolvedDefaultCanvasRun(node, 'apiProvider', opts)) return;
-    const requestProvider = resolveCanvasNodeRequest(node, videoProviderModeOptions());
+    const requestProvider = preflightCanvasNodeRequest(node, videoProviderModeOptions(), opts, message => alert(message));
+    if(!requestProvider) return;
     const cascadeTargetId = cascadeTargetIdFromOptions(opts);
     const sources = orderedSources(node, generatorSources(node));
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');

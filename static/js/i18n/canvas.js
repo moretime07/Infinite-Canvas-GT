@@ -2,6 +2,8 @@
     if(!window.StudioI18n) return;
     window.StudioI18n.register({
         "canvas.followDefaultApi": { zh: "\u8ddf\u968f\u9ed8\u8ba4 API", en: "Follow default API" },
+        "canvas.providerUnavailable": { zh: "API \u5e73\u53f0\u201c{provider}\u201d\u4e0d\u53ef\u7528\u3002", en: "API provider \"{provider}\" is unavailable for this node." },
+        "canvas.modelUnavailable": { zh: "\u6a21\u578b\u201c{model}\u201d\u5728 API \u5e73\u53f0\u201c{provider}\u201d\u4e2d\u4e0d\u53ef\u7528\u3002", en: "Model \"{model}\" is unavailable for provider \"{provider}\"." },
         "canvas.noApiProviders": { zh: "暂无 API 平台", en: "No API providers" },
         "canvas.noApiProvidersHint": { zh: "暂无 API 平台，请到 API 设置添加", en: "No API providers. Add one in API Settings." },
         "canvas.noImageModelsHint": { zh: "暂无生图模型，请到 API 设置添加", en: "No image models. Add some in API Settings." },

@@ -111,6 +111,18 @@ vm.runInNewContext(i18nSource, i18nSandbox);
 const registeredChineseLabel = i18nSandbox.registered['canvas.followDefaultApi'].zh.replace(/ API$/, '');
 assert.deepEqual(Array.from(registeredChineseLabel, char => char.codePointAt(0)), requiredChineseCodePoints);
 assert.notDeepEqual(Array.from(registeredChineseLabel, char => char.codePointAt(0)), rejectedMojibakeCodePoints);
+const expectedUnavailableProviderZh = 'API \u5e73\u53f0\u201c{provider}\u201d\u4e0d\u53ef\u7528\u3002';
+const expectedUnavailableModelZh = '\u6a21\u578b\u201c{model}\u201d\u5728 API \u5e73\u53f0\u201c{provider}\u201d\u4e2d\u4e0d\u53ef\u7528\u3002';
+assert.deepEqual(
+    Array.from(i18nSandbox.registered['canvas.providerUnavailable'].zh, char => char.codePointAt(0)),
+    Array.from(expectedUnavailableProviderZh, char => char.codePointAt(0))
+);
+assert.deepEqual(
+    Array.from(i18nSandbox.registered['canvas.modelUnavailable'].zh, char => char.codePointAt(0)),
+    Array.from(expectedUnavailableModelZh, char => char.codePointAt(0))
+);
+assert.equal(i18nSandbox.registered['canvas.providerUnavailable'].en, 'API provider "{provider}" is unavailable for this node.');
+assert.equal(i18nSandbox.registered['canvas.modelUnavailable'].en, 'Model "{model}" is unavailable for provider "{provider}".');
 
 const fallbackSandbox = {
     preferredProviderId:()=>'', apiProviders:[], canvasProviderMode:()=> 'default', tr:()=>'',
@@ -164,6 +176,13 @@ const sandbox = {
         'canvas.noApiProvidersHint':'No API providers. Add one in API Settings.',
         'canvas.noModelsHint':'No models. Add some in API Settings.'
     })[key] || key,
+    trf:(key, values={}) => Object.entries(values).reduce(
+        (text, [name, value]) => text.replaceAll(`{${name}}`, String(value)),
+        ({
+            'canvas.providerUnavailable':'API provider "{provider}" is unavailable for this node.',
+            'canvas.modelUnavailable':'Model "{model}" is unavailable for provider "{provider}".'
+        })[key] || key
+    ),
     escapeHtml:value => String(value),
     chatApiProviders:() => sandbox.apiProviders.filter(provider => provider.enabled !== false && provider.chat_models.length),
     imageApiProviders:() => sandbox.apiProviders.filter(provider => provider.enabled !== false && provider.image_models.length),
@@ -190,7 +209,7 @@ const executableNames = [
     'preferredProviderId', 'resolveChatProviderId', 'resolveImageProviderId', 'resolveVideoProviderId',
     'canvasProviderMode', 'chatProviderModeOptions', 'imageProviderModeOptions', 'videoProviderModeOptions',
     'syncCanvasNodeProvider', 'syncFollowingDefaultCanvasNodes', 'syncDefaultCanvasNodeProvider',
-    'resolveCanvasNodeRequest',
+    'resolveCanvasNodeRequest', 'preflightCanvasNodeRequest',
     'unresolvedDefaultCanvasNodeError', 'stopUnresolvedDefaultCanvasRun', 'prepareCanvasNodeForRender',
     'normalizeCanvasProviderSentinels', 'serializableCanvasNode', 'serializableCanvasLogs', 'runSnapshot', 'addGenerationLog',
     'followDefaultOption',
@@ -476,7 +495,13 @@ sandbox.CANVAS_REFERENCE_IMAGE_MAX = 8;
         sandbox.alert = message => sandbox.runErrors.push(String(message));
         let thrown = '';
         try { await invoke(node); } catch(error) { thrown = error.message || String(error); }
-        return {networkCalls:sandbox.networkCalls, bodies:sandbox.requestBodies, errors:[...sandbox.runErrors, thrown].filter(Boolean)};
+        return {
+            networkCalls:sandbox.networkCalls,
+            bodies:sandbox.requestBodies,
+            visibleErrors:[...sandbox.runErrors],
+            thrown,
+            errors:[...sandbox.runErrors, thrown].filter(Boolean)
+        };
     }
 
     const validProviders = [
@@ -523,6 +548,49 @@ sandbox.CANVAS_REFERENCE_IMAGE_MAX = 8;
         assert.equal(unavailableModel.networkCalls, 0, `${name} must not request with a provider/model mismatch`);
         assert.match(unavailableModel.errors.join('\n'), /model.*wrong-model.*unavailable.*stored-all/i, `${name} should report the unavailable stored model`);
     }
+
+    const nonCascadeCases = [
+        ['modern image', {id:'normal-modern', type:'generator', providerMode:'fixed', apiProvider:'removed', model:'stored-image'}, (node, opts={}) => controls.runGenerator(node.id, opts)],
+        ['legacy image', {id:'normal-legacy', type:'generator', apiProvider:'removed', model:'stored-image'}, (node, opts={}) => controls.runGeneratorLegacy(node.id, opts)],
+        ['video', {id:'normal-video', type:'video', apiProvider:'removed', model:'stored-video'}, (node, opts={}) => controls.runVideoNode(node.id, opts)]
+    ];
+    for(const [name, node, invoke] of nonCascadeCases){
+        const normalResult = await requestPathResult({...node}, validProviders, target => invoke(target));
+        assert.equal(normalResult.networkCalls, 0, `${name} normal click must stop before every request boundary`);
+        assert.equal(normalResult.thrown, '', `${name} normal click must resolve without an unhandled rejection`);
+        assert.deepEqual(normalResult.visibleErrors, ['API provider "removed" is unavailable for this node.'], `${name} normal click must show exactly one existing UI error`);
+
+        const cascadeResult = await requestPathResult({...node}, validProviders, target => invoke(target, {cascade:true}));
+        assert.equal(cascadeResult.networkCalls, 0, `${name} cascade preflight must stop before every request boundary`);
+        assert.deepEqual(cascadeResult.visibleErrors, [], `${name} cascade preflight must not show a duplicate UI error`);
+        assert.equal(cascadeResult.thrown, 'API provider "removed" is unavailable for this node.', `${name} cascade preflight must propagate the error`);
+    }
+
+    sandbox.trf = (key, values={}) => Object.entries(values).reduce(
+        (text, [field, value]) => text.replaceAll(`{${field}}`, String(value)),
+        i18nSandbox.registered[key].zh
+    );
+    assert.throws(
+        () => controls.resolveCanvasNodeRequest(
+            {type:'generator', providerMode:'fixed', apiProvider:'removed', model:'stored-image'},
+            controls.imageProviderModeOptions()
+        ),
+        error => error.message === 'API \u5e73\u53f0\u201cremoved\u201d\u4e0d\u53ef\u7528\u3002'
+    );
+    assert.throws(
+        () => controls.resolveCanvasNodeRequest(
+            {type:'generator', providerMode:'fixed', apiProvider:'stored-all', model:'wrong-model'},
+            controls.imageProviderModeOptions()
+        ),
+        error => error.message === '\u6a21\u578b\u201cwrong-model\u201d\u5728 API \u5e73\u53f0\u201cstored-all\u201d\u4e2d\u4e0d\u53ef\u7528\u3002'
+    );
+    sandbox.trf = (key, values={}) => Object.entries(values).reduce(
+        (text, [field, value]) => text.replaceAll(`{${field}}`, String(value)),
+        ({
+            'canvas.providerUnavailable':'API provider "{provider}" is unavailable for this node.',
+            'canvas.modelUnavailable':'Model "{model}" is unavailable for provider "{provider}".'
+        })[key] || key
+    );
 
     const explicitDefault = await requestPathResult(
         {id:'default-llm', type:'llm', providerMode:'default', llmProvider:'removed', model:'wrong-model'},
