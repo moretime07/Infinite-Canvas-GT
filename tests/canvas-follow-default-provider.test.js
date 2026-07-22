@@ -205,7 +205,7 @@ const sandbox = {
 const executableNames = [
     'chatApiProviders', 'videoApiProviders', 'providerChatModels', 'providerVideoModels',
     'allChatModels', 'resolveChatModel', 'addLLMNode', 'addVideoNode',
-    'runGenerator', 'runGeneratorLegacy', 'runVideoNode', 'callCanvasLLM',
+    'runGenerator', 'runGeneratorLegacy', 'openRouterVideoReferenceState', 'runVideoNode', 'callCanvasLLM',
     'preferredProviderId', 'resolveChatProviderId', 'resolveImageProviderId', 'resolveVideoProviderId',
     'canvasProviderMode', 'chatProviderModeOptions', 'imageProviderModeOptions', 'videoProviderModeOptions',
     'syncCanvasNodeProvider', 'syncFollowingDefaultCanvasNodes', 'syncDefaultCanvasNodeProvider',

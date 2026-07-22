@@ -12120,6 +12120,88 @@ def volcengine_video_prompt_text(prompt, aspect_ratio="", duration=None):
     suffix_text = " ".join(suffixes)
     return f"{text} {suffix_text}".strip() if text else suffix_text
 
+def openrouter_reference_url(value: str, kind: str) -> str:
+    """Return an OpenRouter-compatible URL for a local or remote media reference."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.startswith(("http://", "https://", "data:")):
+        return text
+    if text.startswith(("/output/", "/assets/")):
+        path = output_file_from_url(text)
+        if not path or not os.path.isfile(path):
+            raise HTTPException(status_code=400, detail=f"参考{kind}不存在或已被删除：{text}")
+        return reference_to_data_url({"url": text})
+    raise HTTPException(status_code=400, detail=f"参考{kind}地址不受支持：{text}")
+
+def build_openrouter_video_request(payload: CanvasVideoRequest):
+    """Build OpenRouter's video request without silently dropping media references."""
+    body = {
+        "prompt": payload.prompt,
+        "model": selected_model(payload.model, "google/veo-3.1-fast"),
+        "duration": payload.duration,
+    }
+    if payload.aspect_ratio:
+        body["aspect_ratio"] = payload.aspect_ratio
+    if payload.size:
+        body["size"] = payload.size
+    elif payload.resolution:
+        body["resolution"] = payload.resolution
+    if payload.generate_audio:
+        body["generate_audio"] = True
+    if payload.seed is not None:
+        body["seed"] = payload.seed
+
+    image_items = []
+    frame_images = []
+    for ref in payload.images[:4]:
+        if not ref.url:
+            continue
+        image_url = openrouter_reference_url(ref.url, "图片")
+        item = {"type": "image_url", "image_url": {"url": image_url}}
+        role = str(ref.role or "").strip().lower()
+        if role in {"first_frame", "last_frame"}:
+            frame_item = dict(item)
+            frame_item["frame_type"] = role
+            frame_images.append(frame_item)
+        else:
+            image_items.append(item)
+
+    video_items = [
+        {"type": "video_url", "video_url": {"url": openrouter_reference_url(value, "视频")}}
+        for value in payload.videos[:3]
+        if str(value or "").strip()
+    ]
+    audio_items = [
+        {"type": "audio_url", "audio_url": {"url": openrouter_reference_url(value, "音频")}}
+        for value in payload.audios[:3]
+        if str(value or "").strip()
+    ]
+
+    if frame_images and (video_items or audio_items):
+        raise HTTPException(
+            status_code=400,
+            detail="OpenRouter 的首尾帧模式会覆盖视频/音频参考。请关闭“首尾帧”，或移除参考视频和音频后重试。",
+        )
+
+    if frame_images:
+        body["frame_images"] = frame_images[:2]
+    elif video_items or audio_items or payload.multimodal:
+        input_references = image_items + video_items + audio_items
+        if input_references:
+            body["input_references"] = input_references
+    elif image_items:
+        first_frame = dict(image_items[0])
+        first_frame["frame_type"] = "first_frame"
+        body["frame_images"] = [first_frame]
+
+    counts = {
+        "image": len(frame_images[:2]) if frame_images else len(image_items),
+        "video": len(video_items),
+        "audio": len(audio_items),
+    }
+    return body, counts
+
 @app.post("/api/canvas-video")
 async def canvas_video(payload: CanvasVideoRequest):
     provider = get_api_provider(payload.provider_id)
@@ -12421,45 +12503,7 @@ async def canvas_video(payload: CanvasVideoRequest):
                     if payload.enable_upsample:
                         body["enable_upsample"] = True
                 elif is_openrouter:
-                    body = {
-                        "prompt": payload.prompt,
-                        "model": selected_model(payload.model, "google/veo-3.1-fast"),
-                        "duration": payload.duration,
-                    }
-                    if payload.aspect_ratio:
-                        body["aspect_ratio"] = payload.aspect_ratio
-                    if payload.size:
-                        body["size"] = payload.size
-                    elif payload.resolution:
-                        body["resolution"] = payload.resolution
-                    if payload.generate_audio:
-                        body["generate_audio"] = True
-                    if payload.seed is not None:
-                        body["seed"] = payload.seed
-                    frame_images = []
-                    input_references = []
-                    for ref in payload.images[:4]:
-                        if not ref.url:
-                            continue
-                        image_url = ref.url if ref.url.startswith(("http://", "https://", "data:")) else reference_to_data_url(ref.dict(), max_size=1536)
-                        if not image_url:
-                            continue
-                        role = str(ref.role or "").strip().lower()
-                        item = {"type": "image_url", "image_url": {"url": image_url}}
-                        if role in {"first_frame", "last_frame"}:
-                            frame_item = dict(item)
-                            frame_item["frame_type"] = role
-                            frame_images.append(frame_item)
-                        elif not payload.multimodal and not frame_images and not input_references:
-                            frame_item = dict(item)
-                            frame_item["frame_type"] = "first_frame"
-                            frame_images.append(frame_item)
-                        else:
-                            input_references.append(item)
-                    if frame_images:
-                        body["frame_images"] = frame_images[:2]
-                    elif input_references:
-                        body["input_references"] = input_references
+                    body, openrouter_reference_counts = build_openrouter_video_request(payload)
                 else:
                     image_payload = []
                     for ref in payload.images[:4]:
@@ -12548,7 +12592,10 @@ async def canvas_video(payload: CanvasVideoRequest):
             if not urls:
                 raise HTTPException(status_code=502, detail=f"视频生成成功但没有返回视频：{result}")
             local_urls = [await save_remote_video_to_output(url) for url in urls]
-            return {"videos": local_urls, "task_id": task_id, "raw": result}
+            response_payload = {"videos": local_urls, "task_id": task_id, "raw": result}
+            if is_openrouter:
+                response_payload["request"] = {"references": openrouter_reference_counts}
+            return response_payload
     except httpx.HTTPStatusError as exc:
         text = exc.response.text
         try:

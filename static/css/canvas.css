@@ -552,6 +552,8 @@ body.studio-theme-dark .rh-prompt-field textarea,
 .gen-settings-row .resolution { flex:1 1 64px; min-width:58px; }
 .gen-settings-row .quality-select { flex:1 1 76px; min-width:68px; }
 .gen-settings-row .field { flex:1; min-width:0; }
+.video-reference-summary { margin:10px 0 2px; padding:8px 10px; border:1px solid var(--line-2); border-radius:10px; color:var(--muted); background:var(--soft); font-size:11px; line-height:1.45; }
+.video-reference-warning { margin-top:5px; color:#d97706; font-weight:700; }
 .gen-settings-row.api-size-row .gen-count-row { margin-left:auto; }
 .setting-title { color:var(--faint); font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.08em; }
 .setting-input { width:100%; height:32px; border:1px solid var(--line-2); border-radius:12px; background:var(--card-solid); color:var(--text); outline:none; padding:0 10px; font-size:12px; font-weight:700; }

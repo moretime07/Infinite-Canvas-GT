@@ -8364,6 +8364,32 @@ function renderGeneratorBody(node){
     bindCascadeButtons(wrap, node.id);
     return wrap;
 }
+function openRouterVideoReferenceState(node, sources){
+    const providers = apiProviders.length ? apiProviders : defaultApiProviders();
+    const provider = providers.find(item => String(item?.id || '') === String(node?.apiProvider || ''));
+    const enabled = Boolean(provider && ProviderDefaults.isOpenRouter(provider));
+    const counts = {image:0, video:0, audio:0};
+    (sources || []).forEach(source => (source?.refs || []).forEach(ref => {
+        const kind = mediaKindForRef(ref);
+        if(Object.prototype.hasOwnProperty.call(counts, kind)) counts[kind] += 1;
+    }));
+    return {
+        enabled,
+        image:counts.image,
+        video:counts.video,
+        audio:counts.audio,
+        conflict:Boolean(enabled && node?.useFrameRoles && (counts.video || counts.audio)),
+    };
+}
+function videoReferenceSummaryHtml(node, sources){
+    const state = openRouterVideoReferenceState(node, sources);
+    if(!state.enabled) return '';
+    const summary = `将提交：图片 ${state.image} · 视频 ${state.video} · 音频 ${state.audio}`;
+    const warning = state.conflict
+        ? '<div class="video-reference-warning">OpenRouter 的首尾帧模式会覆盖视频/音频参考，请关闭“首尾帧”或移除视频/音频。</div>'
+        : '';
+    return `<div class="video-reference-summary"><div>${summary}</div>${warning}</div>`;
+}
 function renderVideoBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'generator-body';
@@ -8403,6 +8429,7 @@ function renderVideoBody(node){
             </div>
             <div class="input-list video-img-list video-audio-list"></div>
         </div>` : ''}
+        ${videoReferenceSummaryHtml(node, mediaInputs)}
         <div class="gen-settings">
             <div class="gen-settings-row">
                 <select class="select-lite video-provider" style="flex:1">${videoProviderOptions(node.apiProvider, node)}</select>
@@ -8470,8 +8497,8 @@ function renderVideoBody(node){
     providerSelect.onchange = e => {
         e.stopPropagation();
         applyVideoProviderSelection(node, e.target.value);
-        modelSelect.innerHTML = videoModelOptions(node.model, node.apiProvider);
         scheduleSave();
+        render();
     };
     modelSelect.onchange = e => { e.stopPropagation(); node.model = e.target.value; scheduleSave(); };
     durationSelect.oninput = e => { e.stopPropagation(); node.duration = Math.max(1, Math.min(60, Number(e.target.value || 5))); scheduleSave(); };
@@ -10234,6 +10261,16 @@ async function runVideoNode(nodeId, opts={}){
     const refs = imageRefsOnly(mediaRefs);
     const videoRefs = videoRefsOnly(mediaRefs);
     const audioRefs = audioRefsOnly(mediaRefs);
+    const openRouterReferenceState = openRouterVideoReferenceState(
+        {...node, apiProvider:requestProvider.providerId},
+        sources
+    );
+    if(openRouterReferenceState.conflict){
+        const message = 'OpenRouter 的首尾帧模式会覆盖视频/音频参考。请关闭“首尾帧”，或移除参考视频和音频后重试。';
+        if(opts.cascade) throw new Error(message);
+        alert(message);
+        return;
+    }
     if(node.useFrameRoles && refs[0]) refs[0] = {...refs[0], role:'first_frame'};
     if(node.useFrameRoles && refs[1]) refs[1] = {...refs[1], role:'last_frame'};
     if(!prompt){ alert(tr('canvas.videoNeedsPrompt')); return; }
