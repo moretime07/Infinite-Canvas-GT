@@ -11817,11 +11817,57 @@ VIDEO_TASK_FAILURE_STATUSES = {
     "CANCELED", "CANCELLED", "TIMEOUT", "TIMEDOUT", "REJECTED", "EXPIRED",
 }
 
+def video_response_error(raw):
+    """Extract an error embedded in an otherwise successful JSON response."""
+    if not isinstance(raw, dict):
+        return "", None
+    nodes = [raw]
+    for key in ("data", "result"):
+        value = raw.get(key)
+        if isinstance(value, dict):
+            nodes.append(value)
+    for node in nodes:
+        error = node.get("error")
+        if not error:
+            continue
+        if isinstance(error, dict):
+            message = error.get("message") or error.get("detail") or error.get("code") or error
+            code = error.get("code") or node.get("code")
+        else:
+            message = error
+            code = node.get("code")
+        return str(message or "").strip(), code
+    return "", None
+
+def raise_for_video_response_error(raw):
+    message, code = video_response_error(raw)
+    if not message:
+        return
+    try:
+        status_code = int(code)
+    except (TypeError, ValueError):
+        match = re.search(r"HTTP\s*([45]\d\d)", message, re.I)
+        status_code = int(match.group(1)) if match else 502
+    if status_code < 400 or status_code > 599:
+        status_code = 502
+    raise HTTPException(status_code=status_code, detail=humanize_video_task_failure(message))
+
 def humanize_video_task_failure(reason) -> str:
     """把上游视频任务的失败原因转成对用户友好的中文提示。
     目前主要处理 veo（Google）的内容安全过滤码。"""
     text = str(reason or "").strip()
     upper = text.upper()
+    if "INPUTVIDEOSENSITIVECONTENTDETECTED" in upper:
+        marker_match = re.search(r"content\[\d+\]", text, re.I)
+        marker = marker_match.group(0) if marker_match else "参考视频"
+        return (
+            f"参考视频被上游内容安全策略拦截（位置：{marker}）。\n\n"
+            "这说明参考视频已经成功传到 Seedance，但画面可能包含敏感信息或受限内容，"
+            "因此上游拒绝生成；不是接口未联通，也不是参考视频没有生效。\n\n"
+            "请移除或更换该参考视频，并确认素材不包含隐私信息、身份证件、裸露/性内容、"
+            "未成年人敏感内容、血腥暴力或其他平台限制内容。也可以先只保留提示词生成一次，"
+            "用来确认是哪个参考素材触发审核。"
+        )
     # veo 知名人物/真人面孔过滤
     if "PROMINENT_PEOPLE_FILTER" in upper or "PROMINENT_PEOPLE" in upper:
         return (
@@ -11869,6 +11915,7 @@ async def wait_for_video_task(client, provider, task_id, submit_url=""):
                 raise last_error
             raise HTTPException(status_code=502, detail=f"视频任务查询失败：{task_id}")
         last_payload = raw
+        raise_for_video_response_error(raw)
         task_data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
         status = str(task_data.get("status") or task_data.get("task_status") or raw.get("status") or raw.get("task_status") or "").upper()
         if status in VIDEO_TASK_SUCCESS_STATUSES:
@@ -12613,10 +12660,12 @@ async def canvas_video(payload: CanvasVideoRequest):
                         f"并确认该平台实际支持视频生成端点。\n\n原始响应：{resp_text}"
                     )
                 ) from last_json_error
+            raise_for_video_response_error(raw)
             task_id = extract_task_id(raw) or raw.get("task_id") or raw.get("id")
             result = raw
             if task_id and not video_output_urls(raw):
                 result = await wait_for_video_task(client, provider, task_id, submit_url)
+            raise_for_video_response_error(result)
             urls = video_output_urls(result)
             if not urls:
                 raise HTTPException(status_code=502, detail=f"视频生成成功但没有返回视频：{result}")
@@ -12632,6 +12681,11 @@ async def canvas_video(payload: CanvasVideoRequest):
         except NameError:
             requested_model = payload.model or ""
         provider_name = provider.get('name') or provider['id']
+        if "inputvideosensitivecontentdetected" in text.lower():
+            raise HTTPException(
+                status_code=exc.response.status_code,
+                detail=humanize_video_task_failure(text),
+            ) from exc
         # 1) 模型名不在上游支持范围 → 从错误信息里抽取合法列表展示
         valid_models_match = re.search(r"not in\s*\[([^\]]+)\]", text)
         if valid_models_match:

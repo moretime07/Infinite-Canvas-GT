@@ -139,6 +139,30 @@ class OpenRouterVideoReferenceTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("不存在", str(ctx.exception.detail))
 
+    def test_sensitive_video_error_payload_is_reported_as_content_rejection(self):
+        raw = {
+            "error": {
+                "message": (
+                    'HTTP 400: {"error":{"code":"InputVideoSensitiveContentDetected",'
+                    '"message":"The input video content[2] may contain sensitive information",'
+                    '"param":"content[2]","type":"BadRequest"}}'
+                ),
+                "code": 400,
+            }
+        }
+
+        with self.assertRaises(HTTPException) as ctx:
+            main.raise_for_video_response_error(raw)
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        detail = str(ctx.exception.detail)
+        self.assertIn("参考视频", detail)
+        self.assertIn("content[2]", detail)
+        self.assertNotIn("没有返回视频", detail)
+
+    def test_success_payload_is_not_mistaken_for_an_error(self):
+        main.raise_for_video_response_error({"id": "job-1", "status": "pending"})
+
 
 if __name__ == "__main__":
     unittest.main()
