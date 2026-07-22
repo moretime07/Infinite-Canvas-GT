@@ -7324,11 +7324,15 @@ async def upload_video_to_temp_sh(path: str, source_url: str) -> Dict[str, str]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Temp.sh 上传异常：{exc}") from exc
 
-async def upload_local_video_to_cloud(ref_url: str, service: str = "auto") -> Dict[str, str]:
+async def upload_local_video_to_cloud(
+    ref_url: str,
+    service: str = "auto",
+    allowed_prefixes=("image/", "video/"),
+) -> Dict[str, str]:
     ref_url = str(ref_url or "").strip()
     if ref_url.startswith("http://") or ref_url.startswith("https://"):
         return {"url": ref_url, "source": ref_url, "service": "existing"}
-    path = local_media_path_for_cloud_upload(ref_url)
+    path = local_media_path_for_cloud_upload(ref_url, allowed_prefixes)
     service = str(service or os.getenv("CLOUD_VIDEO_UPLOAD_SERVICE", "auto") or "auto").strip().lower()
     if service in {"litterbox", "catbox"}:
         return await upload_video_to_litterbox(path, ref_url)
@@ -12121,7 +12125,7 @@ def volcengine_video_prompt_text(prompt, aspect_ratio="", duration=None):
     return f"{text} {suffix_text}".strip() if text else suffix_text
 
 def openrouter_reference_url(value: str, kind: str) -> str:
-    """Return an OpenRouter-compatible URL for a local or remote media reference."""
+    """Return an OpenRouter-compatible image URL."""
     text = str(value or "").strip()
     if not text:
         return ""
@@ -12134,7 +12138,32 @@ def openrouter_reference_url(value: str, kind: str) -> str:
         return reference_to_data_url({"url": text})
     raise HTTPException(status_code=400, detail=f"参考{kind}地址不受支持：{text}")
 
-def build_openrouter_video_request(payload: CanvasVideoRequest):
+async def openrouter_external_reference_url(value: str, kind: str) -> str:
+    """Resolve video/audio references to the public HTTPS URL required by /videos."""
+    text = str(value or "").strip()
+    lower = text.lower()
+    if lower.startswith("https://"):
+        return text
+    if lower.startswith(("http://", "data:")):
+        raise HTTPException(
+            status_code=400,
+            detail=f"OpenRouter 参考{kind}仅支持公网 HTTPS 地址，不能使用 HTTP 或 data URL。",
+        )
+    if text.startswith(("/output/", "/assets/")):
+        path = output_file_from_url(text)
+        if not path or not os.path.isfile(path):
+            raise HTTPException(status_code=400, detail=f"参考{kind}不存在或已被删除：{text}")
+        if kind == "音频":
+            uploaded = await upload_local_video_to_cloud(text, "auto", ("audio/",))
+        else:
+            uploaded = await upload_local_video_to_cloud(text, "auto")
+        url = str(uploaded.get("url") or "").strip()
+        if not url.lower().startswith("https://"):
+            raise HTTPException(status_code=502, detail=f"参考{kind}云端上传没有返回 HTTPS 地址。")
+        return url
+    raise HTTPException(status_code=400, detail=f"参考{kind}地址不受支持：{text}")
+
+async def build_openrouter_video_request(payload: CanvasVideoRequest):
     """Build OpenRouter's video request without silently dropping media references."""
     body = {
         "prompt": payload.prompt,
@@ -12167,22 +12196,22 @@ def build_openrouter_video_request(payload: CanvasVideoRequest):
         else:
             image_items.append(item)
 
-    video_items = [
-        {"type": "video_url", "video_url": {"url": openrouter_reference_url(value, "视频")}}
-        for value in payload.videos[:3]
-        if str(value or "").strip()
-    ]
-    audio_items = [
-        {"type": "audio_url", "audio_url": {"url": openrouter_reference_url(value, "音频")}}
-        for value in payload.audios[:3]
-        if str(value or "").strip()
-    ]
-
-    if frame_images and (video_items or audio_items):
+    raw_videos = [value for value in payload.videos[:3] if str(value or "").strip()]
+    raw_audios = [value for value in payload.audios[:3] if str(value or "").strip()]
+    if frame_images and (raw_videos or raw_audios):
         raise HTTPException(
             status_code=400,
             detail="OpenRouter 的首尾帧模式会覆盖视频/音频参考。请关闭“首尾帧”，或移除参考视频和音频后重试。",
         )
+
+    video_items = []
+    for value in raw_videos:
+        url = await openrouter_external_reference_url(value, "视频")
+        video_items.append({"type": "video_url", "video_url": {"url": url}})
+    audio_items = []
+    for value in raw_audios:
+        url = await openrouter_external_reference_url(value, "音频")
+        audio_items.append({"type": "audio_url", "audio_url": {"url": url}})
 
     if frame_images:
         body["frame_images"] = frame_images[:2]
@@ -12503,7 +12532,7 @@ async def canvas_video(payload: CanvasVideoRequest):
                     if payload.enable_upsample:
                         body["enable_upsample"] = True
                 elif is_openrouter:
-                    body, openrouter_reference_counts = build_openrouter_video_request(payload)
+                    body, openrouter_reference_counts = await build_openrouter_video_request(payload)
                 else:
                     image_payload = []
                     for ref in payload.images[:4]:
