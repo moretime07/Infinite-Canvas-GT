@@ -10496,16 +10496,33 @@ async def runninghub_upload_asset(payload: RunningHubUploadAssetRequest):
         upload_url = runninghub_endpoint_url(provider, "/task/openapi/upload")
         files = {"file": (filename, content, content_type)}
         data = {"apiKey": api_key, "fileType": "input"}
-        try:
+        for attempt in range(2):
             response = await client.post(upload_url, headers=runninghub_app_headers(False, payload.useWallet), data=data, files=files)
-            raw = response.json()
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"上传素材到 RunningHub 失败：{exc}") from exc
-    if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=json.dumps(raw, ensure_ascii=False)[:800])
-    if isinstance(raw, dict) and raw.get("code") in (0, "0") and isinstance(raw.get("data"), dict) and raw["data"].get("fileName"):
-        return {"success": True, "data": {"fileName": raw["data"]["fileName"], "fileType": raw["data"].get("fileType") or content_type}}
-    raise HTTPException(status_code=400, detail=(raw.get("msg") if isinstance(raw, dict) else "") or f"RunningHub 上传失败：{raw}")
+            response_text = str(getattr(response, "text", "") or "").strip()
+            try:
+                raw = response.json()
+            except Exception:
+                preview = response_text[:500]
+                detail = (
+                    f"RunningHub 上传接口返回非 JSON 响应（HTTP {response.status_code}）：{preview}"
+                    if preview
+                    else f"RunningHub 上传接口返回空响应（HTTP {response.status_code}）"
+                )
+                retryable = not preview or response.status_code in (408, 425, 429, 500, 502, 503, 504)
+                if attempt == 0 and retryable:
+                    await asyncio.sleep(1)
+                    continue
+                raise HTTPException(status_code=502, detail=detail)
+            if response.status_code >= 400:
+                detail = json.dumps(raw, ensure_ascii=False)[:800]
+                if attempt == 0 and response.status_code in (408, 425, 429, 500, 502, 503, 504):
+                    await asyncio.sleep(1)
+                    continue
+                raise HTTPException(status_code=response.status_code, detail=detail)
+            if isinstance(raw, dict) and raw.get("code") in (0, "0") and isinstance(raw.get("data"), dict) and raw["data"].get("fileName"):
+                return {"success": True, "data": {"fileName": raw["data"]["fileName"], "fileType": raw["data"].get("fileType") or content_type}}
+            raise HTTPException(status_code=400, detail=(raw.get("msg") if isinstance(raw, dict) else "") or f"RunningHub 上传失败：{raw}")
+    raise HTTPException(status_code=502, detail="RunningHub 上传接口在重试后仍未返回结果")
 
 @app.get("/api/jimeng/status")
 async def jimeng_status():
@@ -10852,6 +10869,11 @@ def volcengine_task_probe_url(base_url: str):
         return f"{base}/contents/generations/tasks/healthcheck_probe_do_not_submit"
     return f"{base}/api/v3/contents/generations/tasks/healthcheck_probe_do_not_submit"
 
+
+def route_probe_succeeded(status_code: int) -> bool:
+    return 200 <= int(status_code or 0) < 500 and int(status_code) not in {404, 405}
+
+
 async def probe_volcengine_task_endpoint(client, base_url: str, api_key: str):
     probe_url = volcengine_task_probe_url(base_url)
     if not probe_url:
@@ -10861,11 +10883,13 @@ async def probe_volcengine_task_endpoint(client, base_url: str, api_key: str):
         raw = response.json() if response.text else {}
     except Exception:
         raw = response.text[:500]
+    if response.status_code in (301, 302, 303, 307, 308):
+        return False, {"status": response.status_code, "message": "方舟任务接口发生跳转，Base URL 可能不是 API 地址", "raw": raw}
     if response.status_code in (401, 403):
         return False, {"status": response.status_code, "message": "方舟 API Key 无效或无权限", "raw": raw}
     if looks_like_html_response(response.text):
         return False, {"status": response.status_code, "message": "任务接口返回 HTML，Base URL 可能不是 API 地址", "raw": raw}
-    if response.status_code < 500:
+    if route_probe_succeeded(response.status_code):
         return True, {"status": response.status_code, "message": "方舟任务查询端点可达", "raw": raw}
     return False, {"status": response.status_code, "message": f"方舟任务接口服务端错误 {response.status_code}", "raw": raw}
 
@@ -10891,11 +10915,13 @@ async def probe_openai_compat_bearer_endpoint(client, base_url: str, api_key: st
         raw = response.json() if response.text else {}
     except Exception:
         raw = response.text[:500]
+    if response.status_code in (301, 302, 303, 307, 308):
+        return False, {"status": response.status_code, "message": "OpenAI 兼容入口发生跳转，Base URL 可能不是 API 地址", "raw": raw}
     if response.status_code in (401, 403):
         return False, {"status": response.status_code, "message": "API Key 无效或无权限", "raw": raw}
     if looks_like_html_response(response.text):
         return False, {"status": response.status_code, "message": "OpenAI 兼容入口返回 HTML，Base URL 可能不是 API 地址", "raw": raw}
-    if response.status_code < 500:
+    if route_probe_succeeded(response.status_code):
         return True, {"status": response.status_code, "message": "OpenAI 兼容 Bearer 鉴权入口可达", "raw": raw}
     return False, {"status": response.status_code, "message": f"OpenAI 兼容入口服务端错误 {response.status_code}", "raw": raw}
 
@@ -11031,6 +11057,55 @@ def apply_agnes_model_defaults(base_url, grouped, ids):
     grouped["video"] = sorted(set(grouped.get("video") or []))
     return grouped, ids
 
+
+OMINILINK_VIDEO_MODELS: tuple[str, ...] = (
+    "gemini-omni-flash-preview",
+    "sora-2",
+    "veo-3.1-generate-001",
+    "veo-3.1-fast-generate-001",
+    "veo-3.1-lite-generate-001",
+    "seedance-2.0",
+    "seedance-2.0-fast",
+    "viduq3",
+    "viduq3-pro",
+    "viduq3-pro-fast",
+    "viduq3-turbo",
+    "viduq3-mix",
+    "kling-v3-omni",
+    "kling-v3",
+    "kling-video-o1",
+    "kling-v2-6",
+    "kling-v2-5-turbo",
+    "kling-v2-1-master",
+    "kling-v2-master",
+)
+
+
+def merge_ominilink_model_catalog(base_url, grouped, ids):
+    if not is_ominilink_api_url(base_url):
+        return grouped, ids
+    merged_ids = sorted(set([*ids, *OMINILINK_VIDEO_MODELS]))
+    merged = {kind: sorted(set(grouped.get(kind) or [])) for kind in ("image", "chat", "video")}
+    merged["video"] = sorted(set([*merged["video"], *OMINILINK_VIDEO_MODELS]))
+    merged["chat"] = sorted(set([*merged["chat"], "gemini-omni-flash-preview"]))
+    return merged, merged_ids
+
+
+def ominilink_catalog_fallback_payload(base_url, status=0, raw=None):
+    grouped, ids = merge_ominilink_model_catalog(base_url, {"image": [], "chat": [], "video": []}, [])
+    return {
+        "status": status,
+        "message": "已加载官方目录兜底，但未验证当前 API Key 的实际模型权限。",
+        "model_count": len(ids),
+        "image_models": grouped["image"],
+        "chat_models": grouped["chat"],
+        "video_models": grouped["video"],
+        "all": ids,
+        "catalog_fallback": True,
+        "connection_verified": False,
+        "raw": raw,
+    }
+
 @app.post("/api/providers/test-connection")
 async def test_provider_connection(payload: TestConnectionPayload):
     """测试请求地址是否可用：调上游 /v1/models。验证通过时同时把模型清单按类别返回，避免再调一次拉取接口。"""
@@ -11082,9 +11157,17 @@ async def test_provider_connection(payload: TestConnectionPayload):
                 endpoint_label = "/v1beta/models" if protocol == "gemini" else "/api/v3/models" if protocol == "volcengine" else "/openapi/v2/models" if protocol == "runninghub" else "/v1/models"
                 return {"ok": False, "status": resp.status_code, "message": f"上游 {endpoint_label} 发生跳转{suffix}，请填写 API Base URL，不要填写网页登录地址"}
             if looks_like_html_response(resp.text):
+                if is_ominilink_api_url(base_url):
+                    fallback = ominilink_catalog_fallback_payload(base_url, resp.status_code, {"models_error": resp.text[:300]})
+                    return {"ok": True, **fallback, "image_request_mode": normalize_image_request_mode(getattr(payload, "image_request_mode", ""))}
                 endpoint_label = "/v1beta/models" if protocol == "gemini" else "/api/v3/models" if protocol == "volcengine" else "/openapi/v2/models" if protocol == "runninghub" else "/v1/models"
                 return {"ok": False, "status": resp.status_code, "message": f"上游 {endpoint_label} 返回网页 HTML，请检查请求地址是否为 API Base URL"}
             if resp.status_code >= 400:
+                if is_ominilink_api_url(base_url) and resp.status_code in {404, 405}:
+                    fallback = ominilink_catalog_fallback_payload(base_url, resp.status_code, {"models_error": resp.text[:300]})
+                    return {"ok": True, **fallback, "image_request_mode": normalize_image_request_mode(getattr(payload, "image_request_mode", ""))}
+                if resp.status_code in (401, 403):
+                    return {"ok": False, "status": resp.status_code, "message": resp.text[:300]}
                 if protocol == "volcengine":
                     detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
                     if detected:
@@ -11098,6 +11181,7 @@ async def test_provider_connection(payload: TestConnectionPayload):
                 return {"ok": False, "status": resp.status_code, "message": resp.text[:300]}
             data = resp.json() if resp.text else {}
             grouped, ids = parse_upstream_models(data, protocol)
+            grouped, ids = merge_ominilink_model_catalog(base_url, grouped, ids)
             grouped, ids = apply_agnes_model_defaults(base_url, grouped, ids)
             grouped, ids, openrouter_video_raw = await merge_openrouter_video_models(client, base_url, api_key, grouped, ids)
             if protocol == "volcengine" and not ids:
@@ -11112,9 +11196,16 @@ async def test_provider_connection(payload: TestConnectionPayload):
                 "chat_models": grouped["chat"],
                 "video_models": grouped["video"],
                 "all": ids,
+                "catalog_fallback": False,
+                "connection_verified": True,
                 "image_request_mode": detect_image_request_mode(base_url, ids) or normalize_image_request_mode(getattr(payload, "image_request_mode", "")),
                 "raw": {"models": data, "openrouter_video_models": openrouter_video_raw} if openrouter_video_raw is not None else data,
             }
+    except httpx.TimeoutException as e:
+        if is_ominilink_api_url(base_url):
+            fallback = ominilink_catalog_fallback_payload(base_url, 0, {"models_error": str(e)[:300]})
+            return {"ok": True, **fallback, "image_request_mode": normalize_image_request_mode(getattr(payload, "image_request_mode", ""))}
+        return {"ok": False, "status": 0, "message": str(e)[:300]}
     except httpx.HTTPError as e:
         if protocol == "volcengine":
             try:
@@ -11288,8 +11379,14 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
                 suffix = f"：{location}" if location else ""
                 raise HTTPException(status_code=400, detail=f"上游 {endpoint_label} 发生跳转{suffix}，请填写 API Base URL，不要填写网页登录地址")
             if looks_like_html_response(resp.text):
+                if is_ominilink_api_url(base_url):
+                    return ominilink_catalog_fallback_payload(base_url, resp.status_code, {"models_error": resp.text[:300]})
                 raise HTTPException(status_code=400, detail=f"上游 {endpoint_label} 返回网页 HTML，请检查请求地址是否为 API Base URL")
             if resp.status_code >= 400:
+                if resp.status_code in (401, 403):
+                    raise HTTPException(status_code=resp.status_code, detail=f"上游 {endpoint_label} 失败：{resp.text[:300]}")
+                if is_ominilink_api_url(base_url) and resp.status_code in {404, 405}:
+                    return ominilink_catalog_fallback_payload(base_url, resp.status_code, {"models_error": resp.text[:300]})
                 if protocol == "volcengine":
                     detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
                     if detected:
@@ -11328,6 +11425,10 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
                         }
                 raise HTTPException(status_code=resp.status_code, detail=f"上游 {endpoint_label} 失败：{resp.text[:300]}")
             raw = resp.json()
+    except httpx.TimeoutException as e:
+        if is_ominilink_api_url(base_url):
+            return ominilink_catalog_fallback_payload(base_url, 0, {"models_error": str(e)[:300]})
+        raise HTTPException(status_code=502, detail=f"请求上游模型列表失败：{e}")
     except httpx.HTTPError as e:
         if protocol == "volcengine":
             try:
@@ -11353,6 +11454,7 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
                 pass
         raise HTTPException(status_code=502, detail=f"请求上游模型列表失败：{e}")
     grouped, ids = parse_upstream_models(raw, protocol)
+    grouped, ids = merge_ominilink_model_catalog(base_url, grouped, ids)
     grouped, ids = apply_agnes_model_defaults(base_url, grouped, ids)
     grouped, ids, openrouter_video_raw = await merge_openrouter_video_models(client, base_url, api_key, grouped, ids)
     if protocol == "volcengine" and not ids:
