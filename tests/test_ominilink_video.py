@@ -1,8 +1,9 @@
+import asyncio
 import os
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import main
 
@@ -48,6 +49,22 @@ class ContextRecordingClient(RecordingClient):
     async def __aexit__(self, *_):
         self.exited = True
         return False
+
+
+class HungRecordingClient(RecordingClient):
+    async def get(self, url, **kwargs):
+        self.calls.append(("GET", url, kwargs))
+        await asyncio.Event().wait()
+
+
+class ExceptionRecordingClient(RecordingClient):
+    def __init__(self, exc):
+        super().__init__([])
+        self.exc = exc
+
+    async def post(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        raise self.exc
 
 
 class OminiLinkVideoRequestTests(unittest.IsolatedAsyncioTestCase):
@@ -401,6 +418,104 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
             expected,
         )
 
+    async def test_nested_completed_uses_opaque_id_and_saves_unique_uris_in_order(self):
+        completed = FakeResponse(
+            200,
+            {
+                "data": {
+                    "id": "550e8400-e29b-41d4-a716-446655440000",
+                    "status": " completed ",
+                    "steps": [{"content": [
+                        {
+                            "type": "video",
+                            "uri": "https://cdn.example.test/first.mp4",
+                        },
+                        {
+                            "type": "video",
+                            "uri": "https://cdn.example.test/first.mp4",
+                        },
+                        {
+                            "type": "video",
+                            "uri": "https://cdn.example.test/second.mp4",
+                        },
+                    ]}],
+                },
+            },
+            "",
+        )
+        client = RecordingClient([completed])
+        save = AsyncMock(side_effect=[
+            "/assets/output/first.mp4",
+            "/assets/output/second.mp4",
+        ])
+
+        with patch.object(main, "save_remote_video_to_output", new=save):
+            result = await main.generate_ominilink_video(
+                main.CanvasVideoRequest(
+                    prompt="go",
+                    model="gemini-omni-flash-preview",
+                    duration=6,
+                ),
+                self.provider,
+                client=client,
+            )
+
+        self.assertEqual(save.await_args_list, [
+            call("https://cdn.example.test/first.mp4"),
+            call("https://cdn.example.test/second.mp4"),
+        ])
+        self.assertEqual(result["videos"], [
+            "/assets/output/first.mp4",
+            "/assets/output/second.mp4",
+        ])
+        self.assertEqual(
+            result["task_id"],
+            "550e8400-e29b-41d4-a716-446655440000",
+        )
+
+    async def test_nested_queued_submission_and_nested_completed_poll(self):
+        submitted = FakeResponse(
+            200,
+            {"data": {"task_id": "opaque-7f0a", "status": " queued "}},
+            "",
+        )
+        completed = FakeResponse(
+            200,
+            {
+                "data": {
+                    "task_id": "opaque-7f0a",
+                    "status": " completed ",
+                    "steps": [{"content": [{
+                        "type": "video",
+                        "uri": "https://cdn.example.test/nested.mp4",
+                    }]}],
+                },
+            },
+            "",
+        )
+        client = RecordingClient([submitted], [completed])
+        save = AsyncMock(return_value="/assets/output/nested.mp4")
+
+        with patch.object(main.asyncio, "sleep", new=AsyncMock()), \
+                patch.object(main, "save_remote_video_to_output", new=save):
+            result = await main.generate_ominilink_video(
+                main.CanvasVideoRequest(
+                    prompt="go",
+                    model="gemini-omni-flash-preview",
+                    duration=6,
+                ),
+                self.provider,
+                client=client,
+            )
+
+        self.assertEqual(client.calls[1][0:2], (
+            "GET",
+            "https://vg-api.aig-ai.com/v1/query/gemini-omni-flash-preview/opaque-7f0a",
+        ))
+        save.assert_awaited_once_with("https://cdn.example.test/nested.mp4")
+        self.assertEqual(result["task_id"], "opaque-7f0a")
+        self.assertEqual(result["videos"], ["/assets/output/nested.mp4"])
+
     async def test_omni_submit_and_get_poll(self):
         submitted = FakeResponse(
             200, {"id": "job-1", "status": "queued"}, '{"id":"job-1"}',
@@ -519,7 +634,14 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_completed_without_video_uri_is_terminal_error(self):
         completed = FakeResponse(
             200,
-            {"id": "job-empty", "status": "completed", "steps": []},
+            {
+                "id": "job-empty",
+                "status": "completed",
+                "steps": [],
+                "prompt": "private prompt must not leak",
+                "signed_url": "https://signed.example.test/private?token=secret",
+                "internal": {"trace": "private-trace"},
+            },
             '{"id":"job-empty","status":"completed"}',
         )
         client = RecordingClient([completed])
@@ -536,7 +658,14 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(raised.exception.status_code, 502)
-        self.assertIn("job-empty", raised.exception.detail)
+        self.assertEqual(
+            raised.exception.detail,
+            "OminiLink 视频任务已完成但没有返回视频 URI"
+            "（任务 ID：job-empty，状态：COMPLETED）",
+        )
+        self.assertNotIn("private prompt", raised.exception.detail)
+        self.assertNotIn("signed.example.test", raised.exception.detail)
+        self.assertNotIn("private-trace", raised.exception.detail)
         self.assertEqual(len(client.calls), 1)
 
     async def test_non_omni_model_uses_basic_body_and_post_query(self):
@@ -596,6 +725,51 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         save.assert_awaited_once_with("https://cdn.example.test/basic.mp4")
         self.assertEqual(result["videos"], ["/assets/output/basic.mp4"])
         self.assertEqual(result["task_id"], "job-2")
+
+    async def test_model_and_nested_task_id_are_url_encoded(self):
+        submitted = FakeResponse(
+            200,
+            {"data": {"id": "job/one ?", "status": "queued"}},
+            "",
+        )
+        completed = FakeResponse(
+            200,
+            {
+                "data": {
+                    "id": "job/one ?",
+                    "status": "completed",
+                    "output_url": "https://cdn.example.test/encoded.mp4",
+                },
+            },
+            "",
+        )
+        client = RecordingClient([submitted, completed])
+        save = AsyncMock(return_value="/assets/output/encoded.mp4")
+
+        with patch.object(main.asyncio, "sleep", new=AsyncMock()), \
+                patch.object(main, "save_remote_video_to_output", new=save):
+            result = await main.generate_ominilink_video(
+                main.CanvasVideoRequest(
+                    prompt="go", model="seedance/model 2", duration=6,
+                ),
+                self.provider,
+                client=client,
+            )
+
+        self.assertEqual(
+            [(method, url) for method, url, _ in client.calls],
+            [
+                (
+                    "POST",
+                    "https://vg-api.aig-ai.com/v1/seedance%2Fmodel%202",
+                ),
+                (
+                    "POST",
+                    "https://vg-api.aig-ai.com/v1/query/seedance%2Fmodel%202/job%2Fone%20%3F",
+                ),
+            ],
+        )
+        self.assertEqual(result["task_id"], "job/one ?")
 
     async def test_non_omni_models_reject_all_reference_media_before_submit(self):
         payloads = [
@@ -660,6 +834,110 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
             "视频生成任务失败：renderer exploded",
         )
 
+    async def test_failure_without_reason_exposes_only_safe_task_context(self):
+        failed = FakeResponse(
+            200,
+            {
+                "data": {
+                    "id": "job-private",
+                    "status": " failed ",
+                    "prompt": "private prompt must not leak",
+                    "signed_url": "https://signed.example.test/private?token=secret",
+                    "internal_fields": {"trace": "private-trace"},
+                },
+            },
+            "",
+        )
+        client = RecordingClient([failed])
+
+        with self.assertRaises(main.HTTPException) as raised:
+            await main.generate_ominilink_video(
+                main.CanvasVideoRequest(
+                    prompt="go",
+                    model="gemini-omni-flash-preview",
+                    duration=6,
+                ),
+                self.provider,
+                client=client,
+            )
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(
+            raised.exception.detail,
+            "OminiLink 视频任务失败"
+            "（任务 ID：job-private，状态：FAILED）",
+        )
+        self.assertNotIn("private prompt", raised.exception.detail)
+        self.assertNotIn("signed.example.test", raised.exception.detail)
+        self.assertNotIn("private-trace", raised.exception.detail)
+
+    async def test_sensitive_explicit_failure_reason_is_redacted(self):
+        failed = FakeResponse(
+            200,
+            {
+                "data": {
+                    "id": "job-redacted",
+                    "status": "failed",
+                    "message": (
+                        "prompt=private prompt; "
+                        "signed_url=https://signed.example.test/private?token=secret"
+                    ),
+                },
+            },
+            "",
+        )
+        client = RecordingClient([failed])
+
+        with self.assertRaises(main.HTTPException) as raised:
+            await main.generate_ominilink_video(
+                main.CanvasVideoRequest(
+                    prompt="go",
+                    model="gemini-omni-flash-preview",
+                    duration=6,
+                ),
+                self.provider,
+                client=client,
+            )
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(
+            raised.exception.detail,
+            "OminiLink 视频任务失败"
+            "（任务 ID：job-redacted，状态：FAILED）",
+        )
+        self.assertNotIn("private prompt", raised.exception.detail)
+        self.assertNotIn("signed.example.test", raised.exception.detail)
+        self.assertNotIn("token", raised.exception.detail)
+
+    async def test_network_error_does_not_echo_signed_url(self):
+        exc = main.httpx.ConnectError(
+            "connect failed: https://signed.example.test/private?token=secret",
+            request=main.httpx.Request(
+                "POST",
+                "https://vg-api.aig-ai.com/v1/gemini-omni-flash-preview",
+            ),
+        )
+        client = ExceptionRecordingClient(exc)
+
+        with self.assertRaises(main.HTTPException) as raised:
+            await main.generate_ominilink_video(
+                main.CanvasVideoRequest(
+                    prompt="go",
+                    model="gemini-omni-flash-preview",
+                    duration=6,
+                ),
+                self.provider,
+                client=client,
+            )
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(
+            raised.exception.detail,
+            "请求 OminiLink 视频接口失败，请稍后重试。",
+        )
+        self.assertNotIn("signed.example.test", raised.exception.detail)
+        self.assertNotIn("token", raised.exception.detail)
+
     async def test_safety_failure_uses_humanized_message(self):
         submitted = FakeResponse(
             200, {"id": "job-safe", "status": "queued"}, "",
@@ -691,16 +969,96 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         submitted = FakeResponse(
             200, {"id": "job-slow", "status": "queued"}, "",
         )
-        queued = FakeResponse(
-            200, {"id": "job-slow", "status": "queued"}, "",
-        )
-        client = RecordingClient([submitted], [queued])
-        fake_time = SimpleNamespace(
-            monotonic=Mock(side_effect=[0.0, 0.0, 2.0]),
-        )
+        client = RecordingClient([submitted])
+        clock = [0.0]
+
+        async def advance_sleep(delay):
+            clock[0] += delay
+
+        fake_time = SimpleNamespace(monotonic=lambda: clock[0])
 
         with patch.object(main, "VIDEO_POLL_TIMEOUT", 1.0), \
                 patch.object(main, "time", fake_time), \
+                patch.object(main.asyncio, "sleep", new=advance_sleep):
+            with self.assertRaises(main.HTTPException) as raised:
+                await main.generate_ominilink_video(
+                    main.CanvasVideoRequest(
+                        prompt="go",
+                        model="gemini-omni-flash-preview",
+                        duration=6,
+                    ),
+                    self.provider,
+                    client=client,
+                )
+
+        self.assertEqual(raised.exception.status_code, 504)
+        self.assertEqual(
+            raised.exception.detail,
+            "OminiLink 视频生成任务超时"
+            "（任务 ID：job-slow，状态：UNKNOWN）",
+        )
+        self.assertEqual(
+            [(method, url) for method, url, _ in client.calls],
+            [("POST", "https://vg-api.aig-ai.com/v1/gemini-omni-flash-preview")],
+        )
+
+    async def test_timeout_after_queued_poll_does_not_echo_payload(self):
+        submitted = FakeResponse(
+            200, {"id": "job-sensitive", "status": "queued"}, "",
+        )
+        queued = FakeResponse(
+            200,
+            {
+                "data": {
+                    "id": "job-sensitive",
+                    "status": " queued ",
+                    "prompt": "private prompt must not leak",
+                    "signed_url": "https://signed.example.test/private?token=secret",
+                    "internal": {"trace": "private-trace"},
+                },
+            },
+            "",
+        )
+        client = RecordingClient([submitted], [queued])
+        clock = [0.0]
+
+        async def advance_sleep(delay):
+            clock[0] += delay
+
+        fake_time = SimpleNamespace(monotonic=lambda: clock[0])
+
+        with patch.object(main, "VIDEO_POLL_TIMEOUT", 3.0), \
+                patch.object(main, "time", fake_time), \
+                patch.object(main.asyncio, "sleep", new=advance_sleep):
+            with self.assertRaises(main.HTTPException) as raised:
+                await main.generate_ominilink_video(
+                    main.CanvasVideoRequest(
+                        prompt="go",
+                        model="gemini-omni-flash-preview",
+                        duration=6,
+                    ),
+                    self.provider,
+                    client=client,
+                )
+
+        self.assertEqual(raised.exception.status_code, 504)
+        self.assertEqual(
+            raised.exception.detail,
+            "OminiLink 视频生成任务超时"
+            "（任务 ID：job-sensitive，状态：QUEUED）",
+        )
+        self.assertNotIn("private prompt", raised.exception.detail)
+        self.assertNotIn("signed.example.test", raised.exception.detail)
+        self.assertNotIn("private-trace", raised.exception.detail)
+        self.assertEqual(len(client.calls), 2)
+
+    async def test_hung_poll_request_is_bounded_by_total_deadline(self):
+        submitted = FakeResponse(
+            200, {"id": "job-hung", "status": "queued"}, "",
+        )
+        client = HungRecordingClient([submitted])
+
+        with patch.object(main, "VIDEO_POLL_TIMEOUT", 0.02), \
                 patch.object(main.asyncio, "sleep", new=AsyncMock()):
             with self.assertRaises(main.HTTPException) as raised:
                 await main.generate_ominilink_video(
@@ -714,14 +1072,76 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(raised.exception.status_code, 504)
-        self.assertIn("job-slow", raised.exception.detail)
         self.assertEqual(
-            [(method, url) for method, url, _ in client.calls],
-            [
-                ("POST", "https://vg-api.aig-ai.com/v1/gemini-omni-flash-preview"),
-                ("GET", "https://vg-api.aig-ai.com/v1/query/gemini-omni-flash-preview/job-slow"),
-            ],
+            raised.exception.detail,
+            "OminiLink 视频生成任务超时"
+            "（任务 ID：job-hung，状态：UNKNOWN）",
         )
+        self.assertEqual(client.calls[1][0], "GET")
+
+    async def test_missing_task_id_error_does_not_echo_payload(self):
+        submitted = FakeResponse(
+            200,
+            {
+                "status": " queued ",
+                "prompt": "private prompt must not leak",
+                "signed_url": "https://signed.example.test/private?token=secret",
+                "internal": {"trace": "private-trace"},
+            },
+            "",
+        )
+        client = RecordingClient([submitted])
+
+        with self.assertRaises(main.HTTPException) as raised:
+            await main.generate_ominilink_video(
+                main.CanvasVideoRequest(
+                    prompt="go",
+                    model="gemini-omni-flash-preview",
+                    duration=6,
+                ),
+                self.provider,
+                client=client,
+            )
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(
+            raised.exception.detail,
+            "OminiLink 视频接口未返回任务 ID 或视频 URI"
+            "（状态：QUEUED）",
+        )
+        self.assertNotIn("private prompt", raised.exception.detail)
+        self.assertNotIn("signed.example.test", raised.exception.detail)
+        self.assertNotIn("private-trace", raised.exception.detail)
+
+    async def test_list_json_error_does_not_echo_payload(self):
+        submitted = FakeResponse(
+            200,
+            [
+                "private prompt must not leak",
+                "https://signed.example.test/private?token=secret",
+            ],
+            "",
+        )
+        client = RecordingClient([submitted])
+
+        with self.assertRaises(main.HTTPException) as raised:
+            await main.generate_ominilink_video(
+                main.CanvasVideoRequest(
+                    prompt="go",
+                    model="gemini-omni-flash-preview",
+                    duration=6,
+                ),
+                self.provider,
+                client=client,
+            )
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(
+            raised.exception.detail,
+            "OminiLink 视频接口返回了无效 JSON 结构",
+        )
+        self.assertNotIn("private prompt", raised.exception.detail)
+        self.assertNotIn("signed.example.test", raised.exception.detail)
 
     async def test_html_submit_response_reports_non_json(self):
         html = FakeResponse(
@@ -744,6 +1164,7 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 502)
         self.assertIn("返回网页而不是 JSON", raised.exception.detail)
+        self.assertNotIn("Portal", raised.exception.detail)
         self.assertEqual(len(client.calls), 1)
 
     async def test_owned_client_is_closed_after_request(self):
@@ -798,6 +1219,30 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         generated.assert_awaited_once_with(payload, self.provider)
         self.assertEqual(result["videos"], ["/assets/output/routed.mp4"])
+
+    async def test_canvas_video_does_not_route_ominilink_lookalike_host(self):
+        payload = main.CanvasVideoRequest(
+            prompt="go",
+            provider_id="lookalike",
+            model="gemini-omni-flash-preview",
+            duration=6,
+        )
+        provider = {
+            "id": "lookalike",
+            "name": "Lookalike",
+            "base_url": "https://api.aig-ai.com.evil.test/v1",
+            "video_base_url": "https://vg-api.aig-ai.com.evil.test/v1",
+        }
+        generated = AsyncMock()
+
+        with patch.object(main, "get_api_provider", return_value=provider), \
+                patch.object(main, "video_api_root", return_value=""), \
+                patch.object(main, "generate_ominilink_video", new=generated):
+            with self.assertRaises(main.HTTPException) as raised:
+                await main.canvas_video(payload)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        generated.assert_not_awaited()
 
 
 if __name__ == "__main__":

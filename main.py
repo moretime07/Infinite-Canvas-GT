@@ -11909,7 +11909,12 @@ def ominilink_video_api_root(provider: dict) -> str:
 
 def ominilink_video_output_urls(raw: dict) -> list[str]:
     urls = []
-    steps = raw.get("steps") if isinstance(raw, dict) else None
+    task_data = (
+        raw.get("data")
+        if isinstance(raw, dict) and isinstance(raw.get("data"), dict)
+        else raw
+    )
+    steps = task_data.get("steps") if isinstance(task_data, dict) else None
     if not isinstance(steps, list):
         return urls
     for step in steps:
@@ -12151,39 +12156,56 @@ def humanize_video_task_failure(reason) -> str:
 
 def _ominilink_response_json(response, task_id="") -> dict:
     response_text = str(getattr(response, "text", "") or "")
+    status_code = int(getattr(response, "status_code", 200) or 200)
     try:
         raw = response.json()
     except Exception as exc:
         if looks_like_html_response(response_text):
-            detail = (
-                f"OminiLink 视频接口返回网页而不是 JSON"
-                f"（HTTP {getattr(response, 'status_code', 0)}）：{response_text[:500]}"
-            )
+            detail = f"OminiLink 视频接口返回网页而不是 JSON（HTTP {status_code}）"
         else:
-            detail = (
-                f"OminiLink 视频接口返回非 JSON 响应"
-                f"（HTTP {getattr(response, 'status_code', 0)}）：{response_text[:500]}"
-            )
+            detail = f"OminiLink 视频接口返回非 JSON 响应（HTTP {status_code}）"
         raise HTTPException(status_code=502, detail=detail) from exc
     if not isinstance(raw, dict):
         raise HTTPException(
             status_code=502,
-            detail=f"OminiLink 视频接口返回了无效 JSON：{task_id or raw}",
+            detail="OminiLink 视频接口返回了无效 JSON 结构",
         )
-    status_code = int(getattr(response, "status_code", 200) or 200)
     if status_code >= 400:
-        message, _ = video_response_error(raw)
-        reason = message or raw.get("message") or raw.get("detail") or response_text or raw
         raise HTTPException(
             status_code=status_code,
-            detail=humanize_video_task_failure(reason),
+            detail=_ominilink_failure_detail(
+                raw,
+                task_id=task_id or _ominilink_task_id(raw),
+                status=_ominilink_task_status(raw) or f"HTTP_{status_code}",
+            ),
         )
-    raise_for_video_response_error(raw)
+    message, code = video_response_error(raw)
+    if message:
+        try:
+            error_status = int(code)
+        except (TypeError, ValueError):
+            error_status = 502
+        if error_status < 400 or error_status > 599:
+            error_status = 502
+        raise HTTPException(
+            status_code=error_status,
+            detail=_ominilink_failure_detail(
+                raw,
+                task_id=task_id or _ominilink_task_id(raw),
+                status=_ominilink_task_status(raw) or f"HTTP_{error_status}",
+            ),
+        )
     return raw
 
 def _ominilink_task_data(raw):
     data = raw.get("data") if isinstance(raw, dict) else None
     return data if isinstance(data, dict) else raw
+
+def _ominilink_task_id(raw) -> str:
+    task_data = _ominilink_task_data(raw)
+    if not isinstance(task_data, dict):
+        return ""
+    return str(task_data.get("task_id") or task_data.get("id") or "").strip()
 
 def _ominilink_task_status(raw) -> str:
     task_data = _ominilink_task_data(raw)
@@ -12195,7 +12217,7 @@ def _ominilink_task_status(raw) -> str:
         or raw.get("status")
         or raw.get("task_status")
         or ""
-    ).upper()
+    ).strip().upper()
 
 def _ominilink_result_urls(raw, model):
     if model == "gemini-omni-flash-preview":
@@ -12205,15 +12227,84 @@ def _ominilink_result_urls(raw, model):
 def _ominilink_failure_reason(raw):
     task_data = _ominilink_task_data(raw)
     if not isinstance(task_data, dict):
-        return str(raw)
+        return ""
     error = task_data.get("error") if isinstance(task_data.get("error"), dict) else {}
-    return (
+    reason = (
         task_data.get("fail_reason")
         or task_data.get("message")
         or error.get("message")
-        or raw.get("error")
-        or raw.get("message")
-        or str(raw)
+        or ""
+    )
+    return reason if isinstance(reason, str) else ""
+
+def _ominilink_safe_task_id(task_id) -> str:
+    value = str(task_id or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,119}", value):
+        return value
+    return ""
+
+def _ominilink_safe_status(status) -> str:
+    value = str(status or "").strip().upper()
+    return value if re.fullmatch(r"[A-Z0-9_-]{1,40}", value) else "UNKNOWN"
+
+def _ominilink_terminal_detail(prefix, task_id="", status="") -> str:
+    parts = []
+    safe_task_id = _ominilink_safe_task_id(task_id)
+    if safe_task_id:
+        parts.append(f"任务 ID：{safe_task_id}")
+    parts.append(f"状态：{_ominilink_safe_status(status)}")
+    return f"{prefix}（{'，'.join(parts)}）"
+
+def _ominilink_safe_humanized_reason(reason) -> str:
+    text = str(reason or "").strip()
+    upper = text.upper()
+    known_codes = (
+        "INPUTIMAGESENSITIVECONTENTDETECTED",
+        "INPUTVIDEOSENSITIVECONTENTDETECTED",
+        "PRIVACYINFORMATION",
+        "PROMINENT_PEOPLE_FILTER",
+        "PROMINENT_PEOPLE",
+        "CONTENT_FILTER",
+        "SAFETY",
+        "POLICY",
+    )
+    matched = next((code for code in known_codes if code in upper), "")
+    if matched:
+        marker_match = re.search(r"content\[\d+\]", text, re.I)
+        safe_reason = f"{matched} {marker_match.group(0)}" if marker_match else matched
+        return humanize_video_task_failure(safe_reason)
+    if (
+        not text
+        or len(text) > 160
+        or "\n" in text
+        or re.search(r"https?://", text, re.I)
+        or re.search(
+            r"\b(prompt|signed(?:_url)?|url|token|secret|authorization|api[_-]?key|internal)\b",
+            text,
+            re.I,
+        )
+    ):
+        return ""
+    return humanize_video_task_failure(text)
+
+def _ominilink_failure_detail(raw, task_id="", status="") -> str:
+    detail = _ominilink_safe_humanized_reason(_ominilink_failure_reason(raw))
+    if detail:
+        return detail
+    return _ominilink_terminal_detail(
+        "OminiLink 视频任务失败",
+        task_id or _ominilink_task_id(raw),
+        status or _ominilink_task_status(raw),
+    )
+
+def _ominilink_timeout_error(task_id, status=""):
+    return HTTPException(
+        status_code=504,
+        detail=_ominilink_terminal_detail(
+            "OminiLink 视频生成任务超时",
+            task_id,
+            status,
+        ),
     )
 
 async def wait_for_ominilink_video_task(client, provider, model, task_id) -> dict:
@@ -12231,44 +12322,60 @@ async def wait_for_ominilink_video_task(client, provider, model, task_id) -> dic
     )
     deadline = time.monotonic() + VIDEO_POLL_TIMEOUT
     delay = max(2.0, IMAGE_POLL_INTERVAL)
-    last_payload = {}
-    while time.monotonic() < deadline:
-        await asyncio.sleep(delay)
-        response = (
-            await client.get(
-                query_url,
-                headers=api_headers(provider=provider, model=model),
-            )
-            if model == "gemini-omni-flash-preview"
-            else await client.post(
-                query_url,
-                headers=api_headers(provider=provider, model=model),
-                json={},
-            )
-        )
+    last_status = ""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _ominilink_timeout_error(task_id, last_status)
+        try:
+            async with asyncio.timeout(remaining):
+                await asyncio.sleep(min(delay, remaining))
+        except TimeoutError as exc:
+            raise _ominilink_timeout_error(task_id, last_status) from exc
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _ominilink_timeout_error(task_id, last_status)
+        try:
+            async with asyncio.timeout(remaining):
+                response = (
+                    await client.get(
+                        query_url,
+                        headers=api_headers(provider=provider, model=model),
+                    )
+                    if model == "gemini-omni-flash-preview"
+                    else await client.post(
+                        query_url,
+                        headers=api_headers(provider=provider, model=model),
+                        json={},
+                    )
+                )
+        except TimeoutError as exc:
+            raise _ominilink_timeout_error(task_id, last_status) from exc
+        if time.monotonic() >= deadline:
+            raise _ominilink_timeout_error(task_id, last_status)
         raw = _ominilink_response_json(response, task_id)
-        last_payload = raw
         status = _ominilink_task_status(raw)
+        last_status = status
         urls = _ominilink_result_urls(raw, model)
         if status in VIDEO_TASK_SUCCESS_STATUSES:
             if urls:
                 return raw
             raise HTTPException(
                 status_code=502,
-                detail=f"OminiLink 视频任务 {task_id} 已完成但没有返回视频 URI",
+                detail=_ominilink_terminal_detail(
+                    "OminiLink 视频任务已完成但没有返回视频 URI",
+                    task_id,
+                    status,
+                ),
             )
         if status in VIDEO_TASK_FAILURE_STATUSES:
             raise HTTPException(
                 status_code=502,
-                detail=humanize_video_task_failure(_ominilink_failure_reason(raw)),
+                detail=_ominilink_failure_detail(raw, task_id, status),
             )
         if urls:
             return raw
         delay = min(delay * 1.6, 12)
-    raise HTTPException(
-        status_code=504,
-        detail=f"OminiLink 视频生成任务超时：{last_payload or task_id}",
-    )
 
 async def generate_ominilink_video(payload, provider, client=None) -> dict:
     api_root = ominilink_video_api_root(provider)
@@ -12303,30 +12410,32 @@ async def generate_ominilink_video(payload, provider, client=None) -> dict:
                 json=body,
             )
             raw = _ominilink_response_json(response)
-            task_id = str(
-                extract_task_id(raw)
-                or raw.get("task_id")
-                or raw.get("id")
-                or ""
-            ).strip()
+            task_id = _ominilink_task_id(raw)
             status = _ominilink_task_status(raw)
             urls = _ominilink_result_urls(raw, model)
             if status in VIDEO_TASK_FAILURE_STATUSES:
                 raise HTTPException(
                     status_code=502,
-                    detail=humanize_video_task_failure(_ominilink_failure_reason(raw)),
+                    detail=_ominilink_failure_detail(raw, task_id, status),
                 )
             if status in VIDEO_TASK_SUCCESS_STATUSES and not urls:
                 raise HTTPException(
                     status_code=502,
-                    detail=f"OminiLink 视频任务 {task_id or '(unknown)'} 已完成但没有返回视频 URI",
+                    detail=_ominilink_terminal_detail(
+                        "OminiLink 视频任务已完成但没有返回视频 URI",
+                        task_id,
+                        status,
+                    ),
                 )
             result = raw
             if not urls:
                 if not task_id:
                     raise HTTPException(
                         status_code=502,
-                        detail=f"OminiLink 视频接口没有返回任务 ID 或视频 URI：{raw}",
+                        detail=_ominilink_terminal_detail(
+                            "OminiLink 视频接口未返回任务 ID 或视频 URI",
+                            status=status,
+                        ),
                     )
                 result = await wait_for_ominilink_video_task(
                     active_client, provider, model, task_id,
@@ -12335,7 +12444,11 @@ async def generate_ominilink_video(payload, provider, client=None) -> dict:
             if not urls:
                 raise HTTPException(
                     status_code=502,
-                    detail=f"OminiLink 视频任务 {task_id or '(unknown)'} 已完成但没有返回视频 URI",
+                    detail=_ominilink_terminal_detail(
+                        "OminiLink 视频任务已完成但没有返回视频 URI",
+                        task_id,
+                        _ominilink_task_status(result),
+                    ),
                 )
             local_urls = [
                 await save_remote_video_to_output(url)
@@ -12345,7 +12458,7 @@ async def generate_ominilink_video(payload, provider, client=None) -> dict:
         except httpx.HTTPError as exc:
             raise HTTPException(
                 status_code=502,
-                detail=f"请求 OminiLink 视频接口失败：{exc}",
+                detail="请求 OminiLink 视频接口失败，请稍后重试。",
             ) from exc
 
     if client is not None:
