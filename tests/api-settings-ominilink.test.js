@@ -4,9 +4,20 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 function fakeElement(){
+    const classes = new Set();
     return {
         style:{},
-        classList:{add(){},remove(){},toggle(){},contains(){return false;}},
+        classList:{
+            add(...names){ names.forEach(name => classes.add(name)); },
+            remove(...names){ names.forEach(name => classes.delete(name)); },
+            toggle(name, force){
+                const next = force === undefined ? !classes.has(name) : Boolean(force);
+                if(next) classes.add(name);
+                else classes.delete(name);
+                return next;
+            },
+            contains(name){ return classes.has(name); }
+        },
         addEventListener(){},
         dispatchEvent(){},
         querySelector(){return fakeElement();},
@@ -57,6 +68,10 @@ async function createState(providerRows){
             return {ok:true,json:async()=>({providers:clone(persistedRows)})};
         }
         if(url === '/api/providers') return {ok:true,json:async()=>({providers:clone(persistedRows)})};
+        if(url.endsWith('/primary')){
+            persistedRows = persistedRows.map(row => ({...row, primary:url.includes(encodeURIComponent(row.id))}));
+            return {ok:true,json:async()=>({providers:clone(persistedRows)})};
+        }
         if(url === '/api/providers/test-connection' || url === '/api/providers/fetch-models' || url === '/api/providers/probe-async'){
             return {ok:true,json:async()=>({
                 ok:true,
@@ -78,15 +93,68 @@ async function createState(providerRows){
     const context = {document,window,fetch,URL,console,setTimeout,clearTimeout,alert(){},confirm(){return true;}};
     context.globalThis = context;
     const sourcePath = path.resolve(__dirname, '..', 'static', 'js', 'api-settings.js');
-    const source = fs.readFileSync(sourcePath, 'utf8') + '\n globalThis.__ominiLinkTest={loadProviders,syncEditor,renderEditor,saveProviders,testConnection,probeAsync,fetchModels,openModelPicker,togglePickerRow,applyModelPicker,providers:()=>providers,isOminiLinkApiUrl,defaultOminiLinkVideoBaseUrl};';
+    const source = fs.readFileSync(sourcePath, 'utf8') + '\n globalThis.__ominiLinkTest={loadProviders,syncEditor,renderEditor,saveProviders,testConnection,probeAsync,fetchModels,openModelPicker,togglePickerRow,applyModelPicker,setPrimaryProvider,providers:()=>providers,isOminiLinkApiUrl,defaultOminiLinkVideoBaseUrl,isNewUserProvider,providerHasPrimaryCredential,providerPrimaryIssue,providerPrimaryControl};';
     vm.runInNewContext(source, context, {filename:sourcePath});
     await context.__ominiLinkTest.loadProviders();
-    return {api:context.__ominiLinkTest,calls,elements};
+    return {api:context.__ominiLinkTest,calls,elements,document};
 }
 
 (async()=>{
     let state;
     let videoOnlyState;
+    for(const entryPoints of [
+        {label:'base-only', base_url:'https://api.aig-ai.com/v1', video_base_url:''},
+        {label:'video-only', base_url:'', video_base_url:'https://vg-api.aig-ai.com/v1'}
+    ]){
+        for(const credentialState of [
+            {label:'keyless', has_key:false, has_wallet_key:false, primaryReady:false},
+            {label:'wallet-only', has_key:false, has_wallet_key:true, primaryReady:false},
+            {label:'standard-key', has_key:true, has_wallet_key:false, primaryReady:true}
+        ]){
+            const renderState = await createState([{
+                id:'runninghub',
+                name:'OminiLink',
+                ...entryPoints,
+                protocol:'runninghub',
+                enabled:true,
+                primary:false,
+                has_key:credentialState.has_key,
+                has_wallet_key:credentialState.has_wallet_key,
+                image_models:[],
+                chat_models:['gemini-omni-flash-preview'],
+                video_models:[]
+            }]);
+            const provider = renderState.api.providers()[0];
+            const contextLabel = `${entryPoints.label} ${credentialState.label}`;
+            assert.equal(renderState.api.isNewUserProvider(provider), false, `${contextLabel} must not inherit RunningHub onboarding`);
+            assert.equal(renderState.elements.get('providerOnboardingCard').hidden, true, `${contextLabel} onboarding must remain hidden`);
+            assert.equal(renderState.elements.get('providerOnboardingCard').innerHTML, '');
+            assert.equal(renderState.document.body.classList.contains('show-provider-onboarding'), false, `${contextLabel} must keep normal editor blocks visible`);
+            assert.equal(renderState.document.body.classList.contains('show-runninghub'), false, `${contextLabel} must not enter RunningHub editor mode`);
+            assert.equal(renderState.elements.get('runninghubConfigBlock').hidden, true, `${contextLabel} must render the normal editor`);
+            assert.equal(renderState.elements.get('runninghubConfigBlock').style.display, 'none');
+            assert.equal(renderState.elements.get('protocolInput').value, 'openai');
+            assert.equal(renderState.elements.get('baseInput').value, entryPoints.base_url);
+            assert.equal(renderState.elements.get('videoBaseInput').value, entryPoints.video_base_url || 'https://vg-api.aig-ai.com/v1');
+            assert.equal(renderState.elements.get('keyInput').placeholder.length > 0, true);
+            assert.equal(renderState.elements.get('keyHint').textContent.length > 0, true);
+            assert.equal(renderState.api.providerHasPrimaryCredential(provider), credentialState.primaryReady, `${contextLabel} readiness must use the standard key`);
+            assert.equal(renderState.api.providerPrimaryIssue(provider) === '', credentialState.primaryReady);
+            const primaryControl = renderState.api.providerPrimaryControl(provider);
+            assert.equal(/ disabled/.test(primaryControl), !credentialState.primaryReady);
+            const providerListMarkup = renderState.elements.get('providerList').innerHTML;
+            assert.match(providerListMarkup, credentialState.primaryReady ? /provider-card-sortable[^"]*has-key/ : /provider-card-sortable[^"]*missing-key/);
+            assert.equal(renderState.elements.get('providerList').innerHTML.includes('provider-card-banner'), false);
+            assert.equal(renderState.elements.get('providerList').innerHTML.includes('provider-protocol-pill">OPENAI'), true);
+            const priorPrimaryCalls = renderState.calls.filter(call => call.url.endsWith('/primary')).length;
+            assert.equal(await renderState.api.setPrimaryProvider(null, 'runninghub'), credentialState.primaryReady);
+            assert.equal(
+                renderState.calls.filter(call => call.url.endsWith('/primary')).length,
+                priorPrimaryCalls + (credentialState.primaryReady ? 1 : 0),
+                `${contextLabel} must enforce readiness before requesting a default-primary change`
+            );
+        }
+    }
     for(const legacyId of ['volcengine', 'runninghub']){
         for(const entryPoints of [
             {label:'base-only', base_url:'https://api.aig-ai.com/v1', video_base_url:''},

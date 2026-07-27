@@ -273,7 +273,7 @@ function visibleProviders(){
     return (providers || []).filter(item => !isProviderTemporarilyHidden(item));
 }
 function providerHasPrimaryCredential(item){
-    if(item?.id === 'runninghub') return item.has_key === true || item.has_wallet_key === true;
+    if(item?.id === 'runninghub' && !isOminiLinkProvider(item)) return item.has_key === true || item.has_wallet_key === true;
     return item?.has_key === true;
 }
 function providerPrimaryIssue(item){
@@ -481,7 +481,7 @@ function volcengineAssetKeyHintText(item){
 function isNewUserProvider(item){
     if(!item) return false;
     if(item.id === 'modelscope') return !item.has_key;
-    if(item.id === 'runninghub') return !item.has_key && !item.has_wallet_key;
+    if(item.id === 'runninghub' && !isOminiLinkProvider(item)) return !item.has_key && !item.has_wallet_key;
     if(item.id === 'lingjing') return !item.has_key;
     return false;
 }
@@ -2210,7 +2210,7 @@ function providerDragAttrs(item){
 function renderProviderList(){
     providerList.innerHTML = sortedProviders().map(item => {
         const active = item.id === selectedId ? 'active' : '';
-        const stateClass = item.enabled === false ? 'is-disabled' : (item.has_key || item.has_wallet_key ? 'has-key' : 'missing-key');
+        const stateClass = item.enabled === false ? 'is-disabled' : (providerHasPrimaryCredential(item) ? 'has-key' : 'missing-key');
         const isOminiLink = isOminiLinkProvider(item);
         const protocolLabel = isOminiLink ? 'OPENAI' : item.id === 'runninghub' ? 'RH' : String(item.protocol || 'openai').toUpperCase();
         if(item.id === 'modelscope'){
