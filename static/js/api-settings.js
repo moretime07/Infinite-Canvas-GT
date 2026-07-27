@@ -7,6 +7,7 @@ const statusEl = document.getElementById('status');
 const nameInput = document.getElementById('nameInput');
 const idInput = document.getElementById('idInput');
 const baseInput = document.getElementById('baseInput');
+const videoBaseInput = document.getElementById('videoBaseInput');
 const protocolInput = document.getElementById('protocolInput');
 const imageRequestModeInput = document.getElementById('imageRequestModeInput');
 const keyInput = document.getElementById('keyInput');
@@ -70,6 +71,12 @@ const RH_DEFAULT_BASE_URL = 'https://www.runninghub.cn';
 const LINGJING_DEFAULT_BASE_URL = 'https://apistudio.vip';
 const LINGJING_REGISTER_URL = 'https://apistudio.vip/register?aff=g1CT';
 const EXAMPLE_BASE_URL = 'https://api.example.com/v1';
+const OMINILINK_API_HOSTS = new Set([
+    'api.aig-ai.com',
+    'vg-api.aig-ai.com',
+    'api.ominilink.ai',
+    'vg-api.ominilink.ai'
+]);
 const JIMENG_DEFAULT_IMAGE_MODELS = ['5.0', '4.6', '4.5', '4.1', '4.0', '3.1', '3.0'];
 const JIMENG_DEFAULT_VIDEO_MODELS = ['seedance2.0fast_vip', 'seedance2.0_vip'];
 const JIMENG_LEGACY_IMAGE_MODELS = new Set(['jimeng-image-2k', 'jimeng-image-4k']);
@@ -703,6 +710,9 @@ function syncEditor(){
     item.name = nameInput.value.trim() || item.id;
     const selectedProtocol = item.id === 'modelscope' ? 'openai' : item.id === 'runninghub' ? 'runninghub' : item.id === 'volcengine' ? 'volcengine' : item.id === 'jimeng' ? 'jimeng' : (protocolInput?.value || 'openai');
     item.base_url = selectedProtocol === 'jimeng' ? '' : baseInput.value.trim();
+    const enteredVideoBaseUrl = videoBaseInput?.value.trim() || '';
+    item.video_base_url = enteredVideoBaseUrl || defaultOminiLinkVideoBaseUrl(item.base_url);
+    if(videoBaseInput && !enteredVideoBaseUrl && item.video_base_url) videoBaseInput.value = item.video_base_url;
     // 固定平台不从协议下拉读取
     item.protocol = selectedProtocol;
     item.image_request_mode = normalizeImageRequestMode(
@@ -2344,6 +2354,7 @@ function renderEditor(){
     clearVerifyResult();
     baseInput.placeholder = EXAMPLE_BASE_URL;
     baseInput.value = item.base_url || '';
+    if(videoBaseInput) videoBaseInput.value = item.video_base_url || defaultOminiLinkVideoBaseUrl(item.base_url);
     if(protocolInput) protocolInput.value = item.id === 'runninghub' ? 'runninghub' : item.id === 'volcengine' ? 'volcengine' : item.id === 'jimeng' ? 'jimeng' : (item.protocol || 'openai');
     if(imageRequestModeInput) imageRequestModeInput.value = normalizeImageRequestMode(item.image_request_mode);
     keyInput.value = '';
@@ -2602,6 +2613,24 @@ function isRunningHubContext(item, baseUrl=''){
         || url.includes('runninghub.cn')
         || url.includes('runninghub.ai');
 }
+function isOminiLinkApiUrl(value){
+    try {
+        const parsed = new URL(String(value || '').trim());
+        return (parsed.protocol === 'http:' || parsed.protocol === 'https:')
+            && OMINILINK_API_HOSTS.has(parsed.hostname.toLowerCase());
+    } catch(_) {
+        return false;
+    }
+}
+function defaultOminiLinkVideoBaseUrl(value){
+    if(!isOminiLinkApiUrl(value)) return '';
+    const parsed = new URL(String(value).trim());
+    const hostname = parsed.hostname.toLowerCase();
+    parsed.hostname = hostname.startsWith('vg-') ? hostname : `vg-${hostname}`;
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString().replace(/\/$/, '');
+}
 function applyDetectedImageRequestMode(mode){
     const item = provider();
     if(!item || !imageRequestModeInput) return false;
@@ -2753,6 +2782,8 @@ async function testConnection(){
     if(!item) return;
     const btn = document.getElementById('testUrlBtn');
     const baseUrl = baseInput.value.trim();
+    const videoBaseUrl = videoBaseInput?.value.trim() || defaultOminiLinkVideoBaseUrl(baseUrl);
+    if(videoBaseInput && !videoBaseInput.value.trim() && videoBaseUrl) videoBaseInput.value = videoBaseUrl;
     const isJimeng = item.id === 'jimeng' || (protocolInput?.value || '') === 'jimeng';
     if(!baseUrl && !isJimeng){ alert('请先填写请求地址'); return; }
     if(btn){ btn.disabled = true; btn.querySelector('span').textContent = tr('api.testingUrl') || '验证中...'; }
@@ -2764,6 +2795,7 @@ async function testConnection(){
             method: 'POST', headers: {'Content-Type':'application/json'},
             body: JSON.stringify({
                 base_url: baseUrl,
+                video_base_url: videoBaseUrl,
                 api_key: apiKey,
                 provider_id: runninghubContext ? 'runninghub' : item.id,
                 protocol: runninghubContext ? 'runninghub' : (protocolInput?.value || 'openai'),
@@ -2798,7 +2830,12 @@ async function testConnection(){
             const runninghubNote = isRunningHubNow
                 ? ` · RunningHub OpenAPI${runninghubModelSourceNote(data)}`
                 : imageModeNote;
-            showVerifyResult(`<span style="color:#15803d;font-size:11px;font-weight:800">✓ 地址验证通过 · 找到 ${data.model_count} 个模型${runninghubNote}</span>${volcengineNote}${jimengNote}`);
+            const sourceNote = data.catalog_fallback
+                ? ' · 官方目录兜底（未验证当前账号权限）'
+                : data.connection_verified === false
+                    ? ' · 未验证当前账号权限'
+                    : '';
+            showVerifyResult(`<span style="color:#15803d;font-size:11px;font-weight:800">✓ 地址验证通过 · 找到 ${data.model_count} 个模型${runninghubNote}${sourceNote}</span>${volcengineNote}${jimengNote}`);
         } else {
             showVerifyResult(`
                 <div style="font-size:11px;font-weight:800;color:#b45309">⚠ 地址验证未通过 (HTTP ${data.status})</div>
@@ -2819,6 +2856,7 @@ async function fetchModels(){
     syncEditor();
     const btn = document.getElementById('fetchModelsBtn');
     const baseUrl = baseInput.value.trim();
+    const videoBaseUrl = videoBaseInput?.value.trim() || defaultOminiLinkVideoBaseUrl(baseUrl);
     const apiKey = currentProviderApiKey(item);
     const isJimeng = item.id === 'jimeng' || (protocolInput?.value || '') === 'jimeng';
     if(!baseUrl && !isJimeng){ alert('请先填写请求地址'); return; }
@@ -2831,6 +2869,7 @@ async function fetchModels(){
             headers:{'Content-Type':'application/json'},
             body:JSON.stringify({
                 base_url:baseUrl,
+                video_base_url:videoBaseUrl,
                 api_key:apiKey,
                 provider_id:runninghubContext ? 'runninghub' : item.id,
                 protocol:runninghubContext ? 'runninghub' : (protocolInput?.value || 'openai'),
@@ -2858,7 +2897,12 @@ async function fetchModels(){
             ? ` · RunningHub OpenAPI${runninghubModelSourceNote(data)}`
             : (detectedProtocol === 'volcengine' || isVolcengineProvider(item)) ? ' · 已识别方舟协议，火山聊天建议改填 ep-... 接入点' : '';
         const imageModeExtra = normalizeImageRequestMode(imageRequestModeInput?.value || item.image_request_mode) === 'openai-json' ? ' · 图片接口已设为 OpenAI JSON' : '';
-        setStatus(`已拉取 ${data.total} 个模型 · 点「选择模型」勾选要导入的${extra}${imageModeExtra}`);
+        const sourceNote = data.catalog_fallback
+            ? ' · 官方目录兜底（未验证当前账号权限）'
+            : data.connection_verified === false
+                ? ' · 未验证当前账号权限'
+                : '';
+        setStatus(`已拉取 ${data.total} 个模型 · 点「选择模型」勾选要导入的${extra}${imageModeExtra}${sourceNote}`);
         openModelPicker();
     } catch(e){
         alert('拉取失败：' + (e.message || e));
@@ -3331,6 +3375,7 @@ async function saveProviders(){
                 id:item.id,
                 name:item.name,
                 base_url:item.base_url,
+                video_base_url:item.video_base_url || '',
                 protocol:(item.id === 'modelscope') ? 'openai' : item.id === 'runninghub' ? 'runninghub' : item.id === 'volcengine' ? 'volcengine' : item.id === 'jimeng' ? 'jimeng' : (item.protocol || 'openai'),
                 image_request_mode:item.image_request_mode || 'openai',
                 image_generation_endpoint:item.image_generation_endpoint || '',
