@@ -52,9 +52,17 @@ class ContextRecordingClient(RecordingClient):
 
 
 class HungRecordingClient(RecordingClient):
+    def __init__(self, post_responses, get_responses=()):
+        super().__init__(post_responses, get_responses)
+        self.cancelled = False
+
     async def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
-        await asyncio.Event().wait()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
 
 
 class ExceptionRecordingClient(RecordingClient):
@@ -801,7 +809,7 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("参考素材", raised.exception.detail)
                 self.assertEqual(client.calls, [])
 
-    async def test_failed_task_uses_humanized_message(self):
+    async def test_arbitrary_failure_reason_is_not_echoed(self):
         submitted = FakeResponse(
             200, {"id": "job-failed", "status": "queued"}, "",
         )
@@ -831,8 +839,10 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 502)
         self.assertEqual(
             raised.exception.detail,
-            "视频生成任务失败：renderer exploded",
+            "OminiLink 视频任务失败"
+            "（任务 ID：job-failed，状态：FAILED）",
         )
+        self.assertNotIn("renderer exploded", raised.exception.detail)
 
     async def test_failure_without_reason_exposes_only_safe_task_context(self):
         failed = FakeResponse(
@@ -909,6 +919,52 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("signed.example.test", raised.exception.detail)
         self.assertNotIn("token", raised.exception.detail)
 
+    async def test_adversarial_failure_reasons_are_never_echoed(self):
+        reasons = [
+            "internal_fields=trace-private",
+            "promptText=private-prompt",
+            "authorizationToken=Bearer-private-token",
+            "api key=sk-private",
+            "signedUrl=https://signed.example.test/private",
+            "sig=bare-signature-value",
+            "query=authorizationToken%3DBearer-private-token",
+            "SAFETY internal_fields=trace-private",
+        ]
+        expected = (
+            "OminiLink 视频任务失败"
+            "（任务 ID：job-adversarial，状态：FAILED）"
+        )
+
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                failed = FakeResponse(
+                    200,
+                    {
+                        "data": {
+                            "id": "job-adversarial",
+                            "status": "failed",
+                            "message": reason,
+                        },
+                    },
+                    "",
+                )
+                client = RecordingClient([failed])
+
+                with self.assertRaises(main.HTTPException) as raised:
+                    await main.generate_ominilink_video(
+                        main.CanvasVideoRequest(
+                            prompt="go",
+                            model="gemini-omni-flash-preview",
+                            duration=6,
+                        ),
+                        self.provider,
+                        client=client,
+                    )
+
+                self.assertEqual(raised.exception.status_code, 502)
+                self.assertEqual(raised.exception.detail, expected)
+                self.assertNotIn(reason, raised.exception.detail)
+
     async def test_network_error_does_not_echo_signed_url(self):
         exc = main.httpx.ConnectError(
             "connect failed: https://signed.example.test/private?token=secret",
@@ -962,8 +1018,12 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(raised.exception.status_code, 502)
-        self.assertIn("视频生成被上游内容安全策略拦截", raised.exception.detail)
-        self.assertIn("SAFETY", raised.exception.detail)
+        self.assertEqual(
+            raised.exception.detail,
+            "视频生成被上游内容安全策略拦截（错误码：SAFETY）。\n\n"
+            "这是 veo 的内容审核规则，提示词或参考图触发了安全过滤。\n"
+            "请调整提示词/参考图后重试，避免涉及真人、暴力、敏感或受限内容。",
+        )
 
     async def test_poll_timeout_raises_504(self):
         submitted = FakeResponse(
@@ -1058,18 +1118,21 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         client = HungRecordingClient([submitted])
 
+        async def invoke():
+            return await main.generate_ominilink_video(
+                main.CanvasVideoRequest(
+                    prompt="go",
+                    model="gemini-omni-flash-preview",
+                    duration=6,
+                ),
+                self.provider,
+                client=client,
+            )
+
         with patch.object(main, "VIDEO_POLL_TIMEOUT", 0.02), \
                 patch.object(main.asyncio, "sleep", new=AsyncMock()):
             with self.assertRaises(main.HTTPException) as raised:
-                await main.generate_ominilink_video(
-                    main.CanvasVideoRequest(
-                        prompt="go",
-                        model="gemini-omni-flash-preview",
-                        duration=6,
-                    ),
-                    self.provider,
-                    client=client,
-                )
+                await asyncio.wait_for(invoke(), timeout=0.5)
 
         self.assertEqual(raised.exception.status_code, 504)
         self.assertEqual(
@@ -1078,6 +1141,47 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
             "（任务 ID：job-hung，状态：UNKNOWN）",
         )
         self.assertEqual(client.calls[1][0], "GET")
+        self.assertTrue(client.cancelled)
+
+    async def test_polling_does_not_require_python_311_asyncio_timeout(self):
+        submitted = FakeResponse(
+            200, {"id": "job-py310", "status": "queued"}, "",
+        )
+        completed = FakeResponse(
+            200,
+            {
+                "data": {
+                    "id": "job-py310",
+                    "status": "completed",
+                    "steps": [{"content": [{
+                        "type": "video",
+                        "uri": "https://cdn.example.test/py310.mp4",
+                    }]}],
+                },
+            },
+            "",
+        )
+        client = RecordingClient([submitted], [completed])
+        save = AsyncMock(return_value="/assets/output/py310.mp4")
+
+        with patch.object(main.asyncio, "timeout", new=None, create=True), \
+                patch.object(main.asyncio, "sleep", new=AsyncMock()), \
+                patch.object(main, "save_remote_video_to_output", new=save):
+            result = await asyncio.wait_for(
+                main.generate_ominilink_video(
+                    main.CanvasVideoRequest(
+                        prompt="go",
+                        model="gemini-omni-flash-preview",
+                        duration=6,
+                    ),
+                    self.provider,
+                    client=client,
+                ),
+                timeout=0.5,
+            )
+
+        self.assertEqual(result["videos"], ["/assets/output/py310.mp4"])
+        self.assertEqual(result["task_id"], "job-py310")
 
     async def test_missing_task_id_error_does_not_echo_payload(self):
         submitted = FakeResponse(
@@ -1163,7 +1267,10 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(raised.exception.status_code, 502)
-        self.assertIn("返回网页而不是 JSON", raised.exception.detail)
+        self.assertEqual(
+            raised.exception.detail,
+            "OminiLink 视频接口返回网页而不是 JSON（HTTP 200）",
+        )
         self.assertNotIn("Portal", raised.exception.detail)
         self.assertEqual(len(client.calls), 1)
 

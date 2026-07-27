@@ -12257,8 +12257,15 @@ def _ominilink_terminal_detail(prefix, task_id="", status="") -> str:
 
 def _ominilink_safe_humanized_reason(reason) -> str:
     text = str(reason or "").strip()
-    upper = text.upper()
-    known_codes = (
+    match = re.fullmatch(
+        r"([A-Za-z][A-Za-z0-9_]*)(?:\s+(content\[\d+\]))?",
+        text,
+        re.I,
+    )
+    if not match:
+        return ""
+    code = match.group(1).upper()
+    known_codes = {
         "INPUTIMAGESENSITIVECONTENTDETECTED",
         "INPUTVIDEOSENSITIVECONTENTDETECTED",
         "PRIVACYINFORMATION",
@@ -12267,25 +12274,14 @@ def _ominilink_safe_humanized_reason(reason) -> str:
         "CONTENT_FILTER",
         "SAFETY",
         "POLICY",
-    )
-    matched = next((code for code in known_codes if code in upper), "")
-    if matched:
-        marker_match = re.search(r"content\[\d+\]", text, re.I)
-        safe_reason = f"{matched} {marker_match.group(0)}" if marker_match else matched
-        return humanize_video_task_failure(safe_reason)
-    if (
-        not text
-        or len(text) > 160
-        or "\n" in text
-        or re.search(r"https?://", text, re.I)
-        or re.search(
-            r"\b(prompt|signed(?:_url)?|url|token|secret|authorization|api[_-]?key|internal)\b",
-            text,
-            re.I,
-        )
-    ):
+    }
+    if code not in known_codes:
         return ""
-    return humanize_video_task_failure(text)
+    marker = match.group(2)
+    if marker and code != "INPUTVIDEOSENSITIVECONTENTDETECTED":
+        return ""
+    safe_reason = f"{code} {marker}" if marker else code
+    return humanize_video_task_failure(safe_reason)
 
 def _ominilink_failure_detail(raw, task_id="", status="") -> str:
     detail = _ominilink_safe_humanized_reason(_ominilink_failure_reason(raw))
@@ -12328,28 +12324,30 @@ async def wait_for_ominilink_video_task(client, provider, model, task_id) -> dic
         if remaining <= 0:
             raise _ominilink_timeout_error(task_id, last_status)
         try:
-            async with asyncio.timeout(remaining):
-                await asyncio.sleep(min(delay, remaining))
-        except TimeoutError as exc:
+            await asyncio.wait_for(
+                asyncio.sleep(min(delay, remaining)),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError as exc:
             raise _ominilink_timeout_error(task_id, last_status) from exc
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise _ominilink_timeout_error(task_id, last_status)
         try:
-            async with asyncio.timeout(remaining):
-                response = (
-                    await client.get(
-                        query_url,
-                        headers=api_headers(provider=provider, model=model),
-                    )
-                    if model == "gemini-omni-flash-preview"
-                    else await client.post(
-                        query_url,
-                        headers=api_headers(provider=provider, model=model),
-                        json={},
-                    )
+            request = (
+                client.get(
+                    query_url,
+                    headers=api_headers(provider=provider, model=model),
                 )
-        except TimeoutError as exc:
+                if model == "gemini-omni-flash-preview"
+                else client.post(
+                    query_url,
+                    headers=api_headers(provider=provider, model=model),
+                    json={},
+                )
+            )
+            response = await asyncio.wait_for(request, timeout=remaining)
+        except asyncio.TimeoutError as exc:
             raise _ominilink_timeout_error(task_id, last_status) from exc
         if time.monotonic() >= deadline:
             raise _ominilink_timeout_error(task_id, last_status)
