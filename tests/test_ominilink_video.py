@@ -79,10 +79,21 @@ class ExceptionRecordingClient(RecordingClient):
 
 
 class DownloadResponse:
-    def __init__(self, status_code=200, content=b"video", headers=None):
+    def __init__(self, status_code=200, content=b"video", headers=None, chunks=None):
         self.status_code = status_code
         self.content = content
         self.headers = headers or {"Content-Type": "video/mp4"}
+        self.chunks = list(chunks) if chunks is not None else [content]
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+    async def aiter_bytes(self):
+        for chunk in self.chunks:
+            yield chunk
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -100,7 +111,13 @@ class DownloadClient:
         self.calls = []
 
     async def get(self, url, **kwargs):
-        self.calls.append((url, kwargs))
+        self.calls.append(("GET", url, kwargs))
+        if self.exc:
+            raise self.exc
+        return next(self.responses)
+
+    def stream(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
         if self.exc:
             raise self.exc
         return next(self.responses)
@@ -335,6 +352,39 @@ class OminiLinkVideoRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 400)
         self.assertIn("HTTPS", raised.exception.detail)
 
+    def test_public_https_uri_rejects_non_unicast_and_mapped_special_addresses(self):
+        unsafe_literals = (
+            "https://0.0.0.0/media.mp4",
+            "https://10.0.0.1/media.mp4",
+            "https://127.0.0.1/media.mp4",
+            "https://169.254.1.1/media.mp4",
+            "https://224.0.0.1/media.mp4",
+            "https://240.0.0.1/media.mp4",
+            "https://[::]/media.mp4",
+            "https://[::1]/media.mp4",
+            "https://[fc00::1]/media.mp4",
+            "https://[fe80::1]/media.mp4",
+            "https://[ff02::1]/media.mp4",
+            "https://[64:ff9b:1::1]/media.mp4",
+            "https://[::ffff:127.0.0.1]/media.mp4",
+            "https://[::ffff:10.0.0.1]/media.mp4",
+        )
+        for value in unsafe_literals:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                main.ominilink_public_https_uri(value)
+
+        for resolved in ("224.0.0.1", "ff02::1", "64:ff9b:1::1", "::ffff:127.0.0.1"):
+            with self.subTest(resolved=resolved), self.assertRaises(ValueError):
+                main.ominilink_public_https_uri(
+                    "https://cdn.example.test/media.mp4",
+                    resolver=lambda _host, address=resolved: [address],
+                )
+
+        self.assertEqual(
+            main.ominilink_public_https_uri("https://[2001:4860:4860::8888]/media.mp4"),
+            "https://[2001:4860:4860::8888]/media.mp4",
+        )
+
     async def test_video_edit_rejects_an_unresolvable_local_reference(self):
         payload = main.CanvasVideoRequest(
             prompt="edit", model="gemini-omni-flash-preview",
@@ -491,8 +541,19 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_result_downloader_saves_public_https_video_as_local_asset(self):
         target = os.path.join(tempfile.gettempdir(), "ominilink-result.mp4")
         client = DownloadClient([DownloadResponse(content=b"durable-video")])
+        replace_calls = []
+        real_replace = os.replace
+
+        def record_atomic_replace(source, destination):
+            self.assertFalse(os.path.exists(destination))
+            replace_calls.append((source, destination))
+            real_replace(source, destination)
+
+        if os.path.exists(target):
+            os.unlink(target)
         with patch.object(main, "output_path_for", return_value=target), \
-                patch.object(main, "output_url_for", return_value="/assets/output/ominilink-result.mp4"):
+                patch.object(main, "output_url_for", return_value="/assets/output/ominilink-result.mp4"), \
+                patch.object(main.os, "replace", side_effect=record_atomic_replace):
             result = await main.save_ominilink_video_to_output(
                 "https://cdn.example.test/result.mp4?token=secret",
                 client=client,
@@ -502,10 +563,77 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result, "/assets/output/ominilink-result.mp4")
             with open(target, "rb") as handle:
                 self.assertEqual(handle.read(), b"durable-video")
-            self.assertFalse(client.calls[0][1].get("follow_redirects", True))
+            self.assertEqual(client.calls[0][0], "GET")
+            self.assertEqual(client.calls[0][1], "https://93.184.216.34/result.mp4?token=secret")
+            self.assertEqual(client.calls[0][2]["headers"]["Host"], "cdn.example.test")
+            self.assertEqual(client.calls[0][2]["extensions"]["sni_hostname"], "cdn.example.test")
+            self.assertFalse(client.calls[0][2].get("follow_redirects", True))
+            self.assertEqual(len(replace_calls), 1)
+            self.assertTrue(replace_calls[0][0].startswith(f"{target}.part-"))
+            self.assertEqual(replace_calls[0][1], target)
+            self.assertFalse(any(name.startswith("ominilink-result.mp4.part-") for name in os.listdir(tempfile.gettempdir())))
         finally:
             if os.path.exists(target):
                 os.unlink(target)
+
+    async def test_result_downloader_pins_and_revalidates_every_redirect_hop(self):
+        target = os.path.join(tempfile.gettempdir(), "ominilink-redirect-result.mp4")
+        client = DownloadClient([
+            DownloadResponse(302, headers={"Location": "https://media.example.test:8443/final.mp4?key=opaque"}),
+            DownloadResponse(content=b"redirected-video"),
+        ])
+        resolved_hosts = []
+
+        def resolver(host):
+            resolved_hosts.append(host)
+            return {
+                "cdn.example.test": ["93.184.216.34"],
+                "media.example.test": ["1.1.1.1"],
+            }[host]
+
+        with patch.object(main, "output_path_for", return_value=target), \
+                patch.object(main, "output_url_for", return_value="/assets/output/ominilink-redirect-result.mp4"):
+            result = await main.save_ominilink_video_to_output(
+                "https://cdn.example.test/start.mp4",
+                client=client,
+                resolver=resolver,
+            )
+        try:
+            self.assertEqual(result, "/assets/output/ominilink-redirect-result.mp4")
+            self.assertEqual(resolved_hosts, ["cdn.example.test", "media.example.test"])
+            self.assertEqual(
+                [(method, url) for method, url, _kwargs in client.calls],
+                [
+                    ("GET", "https://93.184.216.34/start.mp4"),
+                    ("GET", "https://1.1.1.1:8443/final.mp4?key=opaque"),
+                ],
+            )
+            self.assertEqual(client.calls[0][2]["headers"]["Host"], "cdn.example.test")
+            self.assertEqual(client.calls[0][2]["extensions"]["sni_hostname"], "cdn.example.test")
+            self.assertEqual(client.calls[1][2]["headers"]["Host"], "media.example.test:8443")
+            self.assertEqual(client.calls[1][2]["extensions"]["sni_hostname"], "media.example.test")
+        finally:
+            if os.path.exists(target):
+                os.unlink(target)
+
+    async def test_result_downloader_bounds_stream_and_removes_partial_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, "bounded.mp4")
+            client = DownloadClient([
+                DownloadResponse(content=b"", chunks=[b"1234", b"56"]),
+            ])
+            with patch.object(main, "OMINILINK_RESULT_MAX_BYTES", 5), \
+                    patch.object(main, "output_path_for", return_value=target):
+                with self.assertRaises(main.HTTPException) as raised:
+                    await main.save_ominilink_video_to_output(
+                        "https://cdn.example.test/bounded.mp4",
+                        client=client,
+                        resolver=lambda _host: ["93.184.216.34"],
+                    )
+
+            self.assertEqual(raised.exception.status_code, 502)
+            self.assertFalse(os.path.exists(target))
+            self.assertEqual(os.listdir(directory), [])
 
     async def test_result_downloader_rejects_private_initial_and_redirect_hosts(self):
         with self.assertRaises(main.HTTPException) as raised:

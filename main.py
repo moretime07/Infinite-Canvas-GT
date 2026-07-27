@@ -7505,59 +7505,91 @@ async def save_remote_video_to_output(url, prefix="video_", category="output"):
             pass
         return url
 
+OMINILINK_RESULT_MAX_BYTES = 512 * 1024 * 1024
+
 async def save_ominilink_video_to_output(url, prefix="video_", category="output", client=None, resolver=None):
     """Download an OminiLink result only after SSRF-safe validation at every hop."""
     video_exts = {".mp4", ".webm", ".mov", ".m4v", ".avi", ".mkv", ".flv"}
-    path = ""
-
-    def safe_url(value):
-        try:
-            return ominilink_public_https_uri(value, resolver=resolver)
-        except ValueError as exc:
-            raise HTTPException(status_code=502, detail="OminiLink 视频结果下载地址不安全。") from exc
+    temp_path = ""
 
     async def download(active_client):
-        nonlocal path
-        current = safe_url(url)
-        for _ in range(4):
-            response = await active_client.get(current, follow_redirects=False)
-            status_code = int(getattr(response, "status_code", 0) or 0)
-            if 300 <= status_code < 400:
-                location = str((getattr(response, "headers", {}) or {}).get("Location") or "").strip()
-                if not location:
+        nonlocal temp_path
+        current = str(url or "").strip()
+        redirects = 0
+        while True:
+            try:
+                logical_url, pinned_url, logical_authority, sni_hostname = ominilink_pinned_https_request(
+                    current,
+                    resolver=resolver,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=502, detail="OminiLink 视频结果下载地址不安全。") from exc
+            async with active_client.stream(
+                "GET",
+                pinned_url,
+                headers={"Host": logical_authority},
+                extensions={"sni_hostname": sni_hostname},
+                follow_redirects=False,
+            ) as response:
+                status_code = int(getattr(response, "status_code", 0) or 0)
+                if 300 <= status_code < 400:
+                    location = str((getattr(response, "headers", {}) or {}).get("Location") or "").strip()
+                    if not location or redirects >= 3:
+                        raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
+                    redirects += 1
+                    current = urllib.parse.urljoin(logical_url, location)
+                    continue
+                response.raise_for_status()
+                headers = getattr(response, "headers", {}) or {}
+                content_type = str(headers.get("Content-Type") or "").lower()
+                if "text/html" in content_type or "application/json" in content_type:
                     raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
-                current = safe_url(urllib.parse.urljoin(current, location))
-                continue
-            response.raise_for_status()
-            content_type = str((getattr(response, "headers", {}) or {}).get("Content-Type") or "").lower()
-            if "text/html" in content_type or "application/json" in content_type:
-                raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
-            clean_ext = os.path.splitext(urllib.parse.urlsplit(current).path)[1].lower()
-            stem = f"{prefix}{uuid.uuid4().hex[:10]}"
-            filename = f"{stem}{clean_ext if clean_ext in video_exts else '.mp4'}"
-            path = output_path_for(filename, category)
-            with open(path, "wb") as handle:
-                handle.write(response.content)
-            if os.path.getsize(path) <= 0:
-                raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
-            return output_url_for(filename, category)
-        raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
+                content_length = str(headers.get("Content-Length") or "").strip()
+                if content_length:
+                    try:
+                        if int(content_length) > OMINILINK_RESULT_MAX_BYTES:
+                            raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
+                    except ValueError:
+                        pass
+                clean_ext = os.path.splitext(urllib.parse.urlsplit(logical_url).path)[1].lower()
+                stem = f"{prefix}{uuid.uuid4().hex[:10]}"
+                filename = f"{stem}{clean_ext if clean_ext in video_exts else '.mp4'}"
+                path = output_path_for(filename, category)
+                temp_path = f"{path}.part-{uuid.uuid4().hex[:10]}"
+                total = 0
+                with open(temp_path, "xb") as handle:
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > OMINILINK_RESULT_MAX_BYTES:
+                            raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
+                        handle.write(chunk)
+                if total <= 0:
+                    raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
+                os.replace(temp_path, path)
+                temp_path = ""
+                return output_url_for(filename, category)
 
     try:
         if client is not None:
             return await download(client)
         timeout = httpx.Timeout(connect=20.0, read=VIDEO_POLL_TIMEOUT, write=60.0, pool=20.0)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as owned_client:
+        limits = httpx.Limits(max_connections=1, max_keepalive_connections=0)
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=False,
+            limits=limits,
+            trust_env=False,
+        ) as owned_client:
             return await download(owned_client)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。") from exc
     finally:
-        if path:
+        if temp_path:
             try:
-                if os.path.exists(path) and os.path.getsize(path) <= 0:
-                    os.remove(path)
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
             except OSError:
                 pass
 
@@ -12121,7 +12153,24 @@ def _ominilink_public_host_addresses(host: str, resolver=None) -> list[str]:
                 addresses.append(str(candidate))
     return addresses
 
-def ominilink_public_https_uri(value: str, resolver=None) -> str:
+def _ominilink_public_ip_address(value):
+    address = ipaddress.ip_address(str(value))
+    mapped = getattr(address, "ipv4_mapped", None)
+    candidates = (address, mapped) if mapped is not None else (address,)
+    for candidate in candidates:
+        if (
+            candidate.is_private
+            or candidate.is_loopback
+            or candidate.is_link_local
+            or candidate.is_multicast
+            or candidate.is_reserved
+            or candidate.is_unspecified
+            or not candidate.is_global
+        ):
+            raise ValueError("non-public host")
+    return address
+
+def _ominilink_public_https_target(value: str, resolver=None):
     text = str(value or "").strip()
     try:
         parsed = urllib.parse.urlsplit(text)
@@ -12142,23 +12191,46 @@ def ominilink_public_https_uri(value: str, resolver=None) -> str:
     ):
         raise ValueError("unsafe URL")
     try:
-        literal = ipaddress.ip_address(host)
+        ascii_host = host.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError("invalid host") from exc
+    try:
+        literal = ipaddress.ip_address(ascii_host)
     except ValueError:
         literal = None
     try:
-        addresses = [str(literal)] if literal is not None else _ominilink_public_host_addresses(host, resolver)
+        addresses = [str(literal)] if literal is not None else _ominilink_public_host_addresses(ascii_host, resolver)
     except (OSError, socket.gaierror, TypeError, ValueError) as exc:
         raise ValueError("unresolvable host") from exc
     if not addresses:
         raise ValueError("unresolvable host")
     try:
-        if any(not ipaddress.ip_address(address).is_global for address in addresses):
-            raise ValueError("non-public host")
+        public_addresses = [str(_ominilink_public_ip_address(address)) for address in addresses]
     except ValueError as exc:
         if str(exc) == "non-public host":
             raise
         raise ValueError("invalid resolved address") from exc
-    return text
+    return text, parsed, ascii_host, public_addresses
+
+def ominilink_public_https_uri(value: str, resolver=None) -> str:
+    return _ominilink_public_https_target(value, resolver=resolver)[0]
+
+def ominilink_pinned_https_request(value: str, resolver=None) -> tuple[str, str, str, str]:
+    logical_url, parsed, logical_host, addresses = _ominilink_public_https_target(value, resolver=resolver)
+    pinned_address = ipaddress.ip_address(addresses[0])
+    pinned_host = f"[{pinned_address}]" if pinned_address.version == 6 else str(pinned_address)
+    port = parsed.port
+    pinned_authority = f"{pinned_host}:{port}" if port is not None else pinned_host
+    logical_host_header = f"[{logical_host}]" if ":" in logical_host else logical_host
+    logical_authority = f"{logical_host_header}:{port}" if port is not None else logical_host_header
+    pinned_url = urllib.parse.urlunsplit((
+        "https",
+        pinned_authority,
+        parsed.path or "/",
+        parsed.query,
+        "",
+    ))
+    return logical_url, pinned_url, logical_authority, logical_host
 
 def _ominilink_inline_media_error() -> HTTPException:
     return HTTPException(

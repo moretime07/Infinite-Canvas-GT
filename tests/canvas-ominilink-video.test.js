@@ -92,7 +92,6 @@ vm.runInContext([
     productionFunction('omniFlashSafePublicHttpsUri'),
     productionFunction('omniFlashCanonicalMediaRef'),
     productionFunction('omniFlashVideoValidationError'),
-    productionFunction('createCanvasVideoTask'),
     productionFunction('runVideoNode'),
     'this.controls = {isOminiLinkProvider, omniFlashSafePublicHttpsUri, omniFlashCanonicalMediaRef, omniFlashVideoValidationError, videoProviderOptions, videoModelOptions, runVideoNode};'
 ].join('\n'), sandbox);
@@ -109,11 +108,23 @@ for(const url of [
 ]) assert.equal(controls.isOminiLinkProvider({base_url:url}), false, `${url} must be rejected`);
 assert.equal(controls.isOminiLinkProvider({video_base_url:'https://vg-api.aig-ai.com/v1'}), true);
 assert.equal(controls.omniFlashSafePublicHttpsUri('https://cdn.example.test/reference.mp4'), true);
+assert.equal(controls.omniFlashSafePublicHttpsUri('https://[2001:4860:4860::8888]/reference.mp4'), true);
 for(const value of [
     'http://cdn.example.test/reference.mp4',
     'https://user:pass@cdn.example.test/reference.mp4',
+    'https://0.0.0.0/reference.mp4',
+    'https://10.0.0.1/reference.mp4',
     'https://127.0.0.1/reference.mp4',
+    'https://169.254.1.1/reference.mp4',
+    'https://240.0.0.1/reference.mp4',
+    'https://[::]/reference.mp4',
     'https://[::1]/reference.mp4',
+    'https://[fc00::1]/reference.mp4',
+    'https://[fe80::1]/reference.mp4',
+    'https://224.0.0.1/reference.mp4',
+    'https://[ff02::1]/reference.mp4',
+    'https://[64:ff9b:1::1]/reference.mp4',
+    'https://[::ffff:127.0.0.1]/reference.mp4',
     'https://localhost/reference.mp4',
     'https://media.local/reference.mp4'
 ]) assert.equal(controls.omniFlashSafePublicHttpsUri(value), false, `${value} must be rejected before a task request`);
@@ -143,7 +154,7 @@ async function runCase({providerId='orange', duration=6, refs=[], manualVideo=''
 (async () => {
     const valid = await runCase({duration:'6'});
     assert.equal(valid.fetchCalls.length, 1, 'valid OminiLink input must reach the real task fetch boundary once');
-    assert.equal(valid.fetchCalls[0].url, '/api/canvas-video-tasks');
+    assert.equal(valid.fetchCalls[0].url, '/api/canvas-video');
     assert.equal(valid.fetchCalls[0].body.provider_id, 'orange');
     assert.equal(valid.fetchCalls[0].body.model, 'gemini-omni-flash-preview');
     assert.equal(valid.fetchCalls[0].body.duration, 6, 'the serialized duration must be normalized once');
@@ -197,8 +208,7 @@ async function runCase({providerId='orange', duration=6, refs=[], manualVideo=''
     assert.match(cascade.thrown, /\u89c6\u9891\u65f6\u957f.*3.*10/);
 
     const runVideoNode = productionFunction('runVideoNode');
-    const createCanvasVideoTask = productionFunction('createCanvasVideoTask');
-    assert.match(createCanvasVideoTask, /body:JSON\.stringify\(payload\)/, 'the validated canonical payload must be handed directly to fetch');
-    assert.ok(runVideoNode.indexOf('omniFlashVideoValidationError(') < runVideoNode.indexOf('createCanvasVideoTask(requestPayload'));
+    assert.match(runVideoNode, /cascadeFetch\('\/api\/canvas-video',[\s\S]*body:JSON\.stringify\(requestPayload\)/, 'the validated canonical payload must be handed directly to the committed video endpoint');
+    assert.ok(runVideoNode.indexOf('omniFlashVideoValidationError(') < runVideoNode.indexOf("cascadeFetch('/api/canvas-video'"));
     console.log('canvas OminiLink Omni Flash tests passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });

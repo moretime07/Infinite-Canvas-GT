@@ -686,16 +686,23 @@ function omniFlashSafePublicHttpsUri(value){
         const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
         if(parsed.protocol !== 'https:' || parsed.username || parsed.password || !host) return false;
         if(host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return false;
-        if(host.includes(':')) return host !== '::1' && !/^f[cd][0-9a-f:]*$/i.test(host) && !/^fe[89ab][0-9a-f:]*$/i.test(host);
+        if(host.includes(':')) return /^[23][0-9a-f]{0,3}:/i.test(host);
         const octets = host.split('.');
         if(octets.length !== 4 || !octets.every(part => /^\d+$/.test(part))) return true;
         const values = octets.map(Number);
         if(values.some(part => part < 0 || part > 255)) return false;
-        const [a, b] = values;
-        return a !== 0 && a !== 10 && a !== 127 && a !== 169 && b !== 254
+        const [a, b, c] = values;
+        return a !== 0 && a !== 10 && a !== 127
+            && !(a === 169 && b === 254)
             && !(a === 172 && b >= 16 && b <= 31)
             && !(a === 192 && b === 168)
             && !(a === 100 && b >= 64 && b <= 127)
+            && !(a === 192 && b === 0 && c === 0)
+            && !(a === 192 && b === 0 && c === 2)
+            && !(a === 192 && b === 88 && c === 99)
+            && !(a === 198 && (b === 18 || b === 19))
+            && !(a === 198 && b === 51 && c === 100)
+            && !(a === 203 && b === 0 && c === 113)
             && a < 224;
     } catch(_) {
         return false;

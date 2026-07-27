@@ -206,6 +206,7 @@ const executableNames = [
     'chatApiProviders', 'videoApiProviders', 'providerChatModels', 'providerVideoModels',
     'allChatModels', 'resolveChatModel', 'addLLMNode', 'addVideoNode',
     'runGenerator', 'runGeneratorLegacy', 'openRouterVideoReferenceState', 'runVideoNode', 'callCanvasLLM',
+    'isOminiLinkProvider', 'omniFlashSafePublicHttpsUri', 'omniFlashCanonicalMediaRef', 'omniFlashVideoValidationError',
     'preferredProviderId', 'resolveChatProviderId', 'resolveImageProviderId', 'resolveVideoProviderId',
     'canvasProviderMode', 'chatProviderModeOptions', 'imageProviderModeOptions', 'videoProviderModeOptions',
     'syncCanvasNodeProvider', 'syncFollowingDefaultCanvasNodes', 'syncDefaultCanvasNodeProvider',
