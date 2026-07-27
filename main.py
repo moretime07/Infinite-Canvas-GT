@@ -11911,16 +11911,32 @@ def split_data_url(value: str) -> tuple[str, str]:
     match = re.fullmatch(r"data:([^;,]+);base64,(.+)", str(value or ""), re.S)
     if not match:
         raise HTTPException(status_code=400, detail="参考素材必须能转换为 base64 数据")
-    return match.group(1).lower(), re.sub(r"\s+", "", match.group(2))
+    data = re.sub(r"\s+", "", match.group(2))
+    try:
+        decoded = base64.b64decode(data, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="参考素材包含无效的 base64 数据") from exc
+    if not decoded:
+        raise HTTPException(status_code=400, detail="参考素材包含空的 base64 数据")
+    return match.group(1).lower(), base64.b64encode(decoded).decode("ascii")
 
 def ominilink_video_content_item(value: str) -> dict:
     text = str(value or "").strip()
     if text.startswith("data:"):
         mime_type, data = split_data_url(text)
+        if not mime_type.startswith("video/"):
+            raise HTTPException(status_code=400, detail="Omni Flash 参考视频必须使用 video/* 媒体类型。")
     else:
+        if text.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="Omni Flash 参考视频不支持 HTTP(S) URL，请使用本地画布视频。")
         path = local_media_path_for_cloud_upload(text, ("video/",))
-        with open(path, "rb") as handle:
-            data = base64.b64encode(handle.read()).decode("ascii")
+        if not path or not os.path.isfile(path):
+            raise HTTPException(status_code=400, detail="Omni Flash 本地参考视频不存在或无法安全读取。")
+        try:
+            with open(path, "rb") as handle:
+                data = base64.b64encode(handle.read()).decode("ascii")
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail="Omni Flash 本地参考视频无法读取。") from exc
         mime_type = content_type_for_path(path)
     return {"type": "video", "data": data, "mime_type": mime_type}
 
@@ -11944,6 +11960,8 @@ async def build_ominilink_omni_request(payload: CanvasVideoRequest) -> dict:
     if images:
         image_data_url = reference_to_data_url({"url": images[0].url}, max_size=1536)
         mime_type, data = split_data_url(image_data_url)
+        if not mime_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="Omni Flash 参考图片必须使用 image/* 媒体类型。")
         content.append({"type": "image", "data": data, "mime_type": mime_type})
         task = "image_to_video"
     elif videos:

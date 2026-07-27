@@ -61,6 +61,40 @@ class OminiLinkVideoRequestTests(unittest.IsolatedAsyncioTestCase):
             {"type": "image", "data": "aGVsbG8=", "mime_type": "image/png"},
         ])
 
+    async def test_image_to_video_rejects_invalid_base64_locally(self):
+        for reference_url in (
+            "data:image/png;base64,%%%",
+            "data:image/png;base64,aGVsbG8=%%%",
+        ):
+            with self.subTest(reference_url=reference_url):
+                payload = main.CanvasVideoRequest(
+                    prompt="move", model="gemini-omni-flash-preview",
+                    images=[main.AIReference(url=reference_url)],
+                )
+
+                with self.assertRaises(main.HTTPException) as raised:
+                    await main.build_ominilink_omni_request(payload)
+
+                self.assertEqual(raised.exception.status_code, 400)
+                self.assertIn("base64", raised.exception.detail)
+
+    async def test_image_to_video_rejects_non_image_mimes(self):
+        for reference_url in (
+            "data:video/mp4;base64,dmlkZW8=",
+            "data:text/plain;base64,dGV4dA==",
+        ):
+            with self.subTest(reference_url=reference_url):
+                payload = main.CanvasVideoRequest(
+                    prompt="move", model="gemini-omni-flash-preview",
+                    images=[main.AIReference(url=reference_url)],
+                )
+
+                with self.assertRaises(main.HTTPException) as raised:
+                    await main.build_ominilink_omni_request(payload)
+
+                self.assertEqual(raised.exception.status_code, 400)
+                self.assertIn("图片", raised.exception.detail)
+
     async def test_video_edit_contains_data_url_media(self):
         payload = main.CanvasVideoRequest(
             prompt="edit", model="gemini-omni-flash-preview",
@@ -74,6 +108,48 @@ class OminiLinkVideoRequestTests(unittest.IsolatedAsyncioTestCase):
             {"type": "text", "text": "edit"},
             {"type": "video", "data": "dmlkZW8=", "mime_type": "video/mp4"},
         ])
+
+    async def test_video_edit_rejects_non_video_mimes(self):
+        for reference_url in (
+            "data:image/png;base64,aGVsbG8=",
+            "data:text/plain;base64,dGV4dA==",
+        ):
+            with self.subTest(reference_url=reference_url):
+                payload = main.CanvasVideoRequest(
+                    prompt="edit", model="gemini-omni-flash-preview",
+                    videos=[reference_url],
+                )
+
+                with self.assertRaises(main.HTTPException) as raised:
+                    await main.build_ominilink_omni_request(payload)
+
+                self.assertEqual(raised.exception.status_code, 400)
+                self.assertIn("视频", raised.exception.detail)
+
+    async def test_video_edit_rejects_http_references_locally(self):
+        payload = main.CanvasVideoRequest(
+            prompt="edit", model="gemini-omni-flash-preview",
+            videos=["https://cdn.example.test/clip.mp4"],
+        )
+
+        with self.assertRaises(main.HTTPException) as raised:
+            await main.build_ominilink_omni_request(payload)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("HTTP", raised.exception.detail)
+
+    async def test_video_edit_rejects_an_unresolvable_local_reference(self):
+        payload = main.CanvasVideoRequest(
+            prompt="edit", model="gemini-omni-flash-preview",
+            videos=["/assets/input/missing.mp4"],
+        )
+
+        with patch.object(main, "local_media_path_for_cloud_upload", return_value=""):
+            with self.assertRaises(main.HTTPException) as raised:
+                await main.build_ominilink_omni_request(payload)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("本地", raised.exception.detail)
 
     async def test_video_edit_encodes_a_local_asset(self):
         handle = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
