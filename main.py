@@ -1186,6 +1186,32 @@ def runninghub_openapi_url(provider, path=""):
     base = runninghub_openapi_base_url(provider)
     return f"{base}/{path}" if path else base
 
+OMINILINK_API_HOSTS = {
+    "api.aig-ai.com",
+    "vg-api.aig-ai.com",
+    "api.ominilink.ai",
+    "vg-api.ominilink.ai",
+}
+
+
+def is_ominilink_api_url(value: str) -> bool:
+    parsed = urllib.parse.urlsplit(str(value or "").strip())
+    return parsed.scheme in {"http", "https"} and (parsed.hostname or "").lower() in OMINILINK_API_HOSTS
+
+
+def normalize_ominilink_urls(base_url: str, video_base_url: str = "") -> tuple[str, str]:
+    base = str(base_url or "").strip().rstrip("/")
+    video = str(video_base_url or "").strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(base)
+    host = (parsed.hostname or "").lower()
+    if host not in OMINILINK_API_HOSTS:
+        return base, video
+    suffix = parsed.path.rstrip("/") or "/v1"
+    root_host = host.removeprefix("vg-")
+    chat = urllib.parse.urlunsplit((parsed.scheme, root_host, suffix, "", ""))
+    derived_video = urllib.parse.urlunsplit((parsed.scheme, f"vg-{root_host}", suffix, "", ""))
+    return chat.rstrip("/"), (video or derived_video).rstrip("/")
+
 def normalize_provider(item):
     provider_id = str(item.get("id") or "").strip().lower()
     if not PROVIDER_ID_RE.fullmatch(provider_id):
@@ -1194,6 +1220,10 @@ def normalize_provider(item):
     base_url = str(item.get("base_url") or "").strip().rstrip("/")
     if base_url and not re.match(r"^https?://", base_url):
         raise HTTPException(status_code=400, detail=f"{name} 的 Base URL 需要以 http:// 或 https:// 开头")
+    video_base_url = str(item.get("video_base_url") or "").strip().rstrip("/")
+    if video_base_url and not re.match(r"^https?://", video_base_url):
+        raise HTTPException(status_code=400, detail=f"{name} video Base URL must start with http:// or https://")
+    base_url, video_base_url = normalize_ominilink_urls(base_url, video_base_url)
     protocol = str(item.get("protocol") or "openai").strip().lower()
     if protocol not in SUPPORTED_PROVIDER_PROTOCOLS:
         protocol = "openai"
@@ -1217,6 +1247,7 @@ def normalize_provider(item):
         "id": provider_id,
         "name": name,
         "base_url": base_url,
+        "video_base_url": video_base_url,
         "protocol": protocol,
         "image_request_mode": image_request_mode,
         "image_generation_endpoint": image_generation_endpoint,
@@ -2515,6 +2546,7 @@ class ApiProviderPayload(BaseModel):
     id: str = ""
     name: str = ""
     base_url: str = ""
+    video_base_url: str = ""
     protocol: str = "openai"
     image_request_mode: str = "openai"
     image_generation_endpoint: str = ""
