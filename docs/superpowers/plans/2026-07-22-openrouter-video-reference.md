@@ -192,4 +192,3 @@ Open a disposable Infinite Canvas, connect one local image and one local MP4 to 
 - [ ] **Step 3: Verify secrets and cleanup**
 
 Confirm `API/.env` and `data/api_providers.json` remain ignored, remove the disposable canvas, and confirm only pre-existing runtime HTML changes remain uncommitted.
-

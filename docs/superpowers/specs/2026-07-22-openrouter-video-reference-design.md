@@ -88,4 +88,3 @@ Automated tests must run without contacting OpenRouter and cover:
 8. Existing OpenRouter image, provider-default, canvas, and export test suites remain green.
 
 Browser acceptance uses a disposable canvas and does not click the generation button. It verifies that a connected local video is counted in the OpenRouter preflight line and that no paid request is made.
-

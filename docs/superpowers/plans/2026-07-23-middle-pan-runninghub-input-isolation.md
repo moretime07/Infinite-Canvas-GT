@@ -243,4 +243,3 @@ Verify:
 - left blank click clears selection;
 - a RunningHub node with one connected image serializes unused supported image slots as `None`;
 - no paid generation is submitted.
-
