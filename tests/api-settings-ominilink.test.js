@@ -52,10 +52,10 @@ async function createState(providerRows){
                 ok:true,
                 total:19,
                 model_count:19,
-                all:['gemini-omni-flash-preview'],
+                all:['gemini-omni-flash-preview', 'gemini-omni-flash-preview', 'chat-only', 'video-only'],
                 image_models:[],
-                chat_models:['gemini-omni-flash-preview'],
-                video_models:['gemini-omni-flash-preview'],
+                chat_models:['gemini-omni-flash-preview', 'chat-only'],
+                video_models:['gemini-omni-flash-preview', 'video-only'],
                 catalog_fallback:true,
                 connection_verified:false
             })};
@@ -65,7 +65,7 @@ async function createState(providerRows){
     const context = {document,window,fetch,URL,console,setTimeout,clearTimeout,alert(){},confirm(){return true;}};
     context.globalThis = context;
     const sourcePath = path.resolve(__dirname, '..', 'static', 'js', 'api-settings.js');
-    const source = fs.readFileSync(sourcePath, 'utf8') + '\n globalThis.__ominiLinkTest={loadProviders,syncEditor,renderEditor,saveProviders,testConnection,fetchModels,isOminiLinkApiUrl,defaultOminiLinkVideoBaseUrl};';
+    const source = fs.readFileSync(sourcePath, 'utf8') + '\n globalThis.__ominiLinkTest={loadProviders,syncEditor,renderEditor,saveProviders,testConnection,fetchModels,openModelPicker,togglePickerRow,applyModelPicker,providers:()=>providers,isOminiLinkApiUrl,defaultOminiLinkVideoBaseUrl};';
     vm.runInNewContext(source, context, {filename:sourcePath});
     await context.__ominiLinkTest.loadProviders();
     return {api:context.__ominiLinkTest,calls,elements};
@@ -82,8 +82,8 @@ async function createState(providerRows){
         primary:true,
         has_key:true,
         image_models:[],
-        chat_models:['gemini-omni-flash-preview'],
-        video_models:['gemini-omni-flash-preview']
+        chat_models:[],
+        video_models:[]
     }]);
 
     assert.equal(state.api.isOminiLinkApiUrl('https://api.aig-ai.com/v1'), true);
@@ -117,6 +117,29 @@ async function createState(providerRows){
     assert.match(fetchStatus, /官方目录兜底/);
     assert.match(fetchStatus, /未验证当前账号权限/);
     assert.doesNotMatch(fetchStatus, /地址验证通过|API Key 验证通过/);
+    // This fails if the picker reduces a backend-reported chat+video model to one category.
+    state.api.togglePickerRow('gemini-omni-flash-preview');
+    state.api.togglePickerRow('chat-only');
+    state.api.togglePickerRow('video-only');
+    state.api.applyModelPicker();
+
+    state.api.openModelPicker();
+    state.api.togglePickerRow('gemini-omni-flash-preview');
+    state.api.applyModelPicker();
+    const deselectedProvider = state.api.providers()[0];
+    assert.ok(!deselectedProvider.chat_models.includes('gemini-omni-flash-preview'));
+    assert.ok(!deselectedProvider.video_models.includes('gemini-omni-flash-preview'));
+
+    state.api.openModelPicker();
+    state.api.togglePickerRow('gemini-omni-flash-preview');
+    state.api.applyModelPicker();
+    assert.equal(await state.api.saveProviders(), true);
+    const pickerSaveBody = JSON.parse(state.calls.filter(call => call.url === '/api/providers' && call.options.method === 'PUT').at(-1).options.body)[0];
+    assert.deepEqual(Array.from(pickerSaveBody.chat_models), ['gemini-omni-flash-preview', 'chat-only']);
+    assert.deepEqual(Array.from(pickerSaveBody.video_models), ['gemini-omni-flash-preview', 'video-only']);
+    assert.equal(pickerSaveBody.chat_models.filter(id => id === 'gemini-omni-flash-preview').length, 1);
+    assert.equal(pickerSaveBody.video_models.filter(id => id === 'gemini-omni-flash-preview').length, 1);
+    assert.ok(!JSON.stringify(pickerSaveBody).includes('secret-value'));
     console.log('api-settings-ominilink tests passed');
 })().catch(error => {
     console.error(error);

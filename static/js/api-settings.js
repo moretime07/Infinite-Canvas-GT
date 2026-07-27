@@ -2917,17 +2917,23 @@ async function fetchModels(){
 }
 
 // —— 模型选择器浮层 ——
-// 每个模型只归一类（根据用户已配置 或 关键字猜测）；勾选 = 纳入该分类
-let pickerState = { category: {}, selected: {} };
+// category drives the single-column UI; capabilities preserves every backend-reported use.
+let pickerState = { category: {}, capabilities: {}, selected: {} };
 let pickerVisibleIds = [];
 function openModelPicker(){
     const item = provider();
     if(!item || !lastFetchedAll.length){ alert('没有拉取到模型'); return; }
     const existing = { image: new Set(item.image_models||[]), chat: new Set(item.chat_models||[]), video: new Set(item.video_models||[]) };
     const allIds = new Set([...lastFetchedAll, ...(item.image_models||[]), ...(item.chat_models||[]), ...(item.video_models||[])]);
-    pickerState = { category: {}, selected: {} };
+    pickerState = { category: {}, capabilities: {}, selected: {} };
     allIds.forEach(id => {
-        // 类别归属：用户已配置 > 关键字建议 > 默认 chat
+        const capabilities = new Set();
+        if(existing.image.has(id) || lastFetchedSuggestion?.image?.has(id)) capabilities.add('image');
+        if(existing.chat.has(id) || lastFetchedSuggestion?.chat?.has(id)) capabilities.add('chat');
+        if(existing.video.has(id) || lastFetchedSuggestion?.video?.has(id)) capabilities.add('video');
+        if(!capabilities.size) capabilities.add('chat');
+        pickerState.capabilities[id] = [...capabilities];
+        // 类别归属只用于 picker 展示；保存时会保留完整能力集合。
         let cat;
         if(existing.image.has(id)) cat = 'image';
         else if(existing.video.has(id)) cat = 'video';
@@ -3010,14 +3016,14 @@ function applyModelPicker(){
     const image = [], chat = [], video = [];
     Object.entries(pickerState.selected).forEach(([id, sel]) => {
         if(!sel) return;
-        const cat = pickerState.category[id];
-        if(cat === 'image') image.push(id);
-        else if(cat === 'video') video.push(id);
-        else chat.push(id);
+        const capabilities = pickerState.capabilities[id] || [pickerState.category[id] || 'chat'];
+        if(capabilities.includes('image')) image.push(id);
+        if(capabilities.includes('chat')) chat.push(id);
+        if(capabilities.includes('video')) video.push(id);
     });
-    item.image_models = image;
-    item.chat_models = chat;
-    item.video_models = video;
+    item.image_models = unique(image);
+    item.chat_models = unique(chat);
+    item.video_models = unique(video);
     renderModels('image'); renderModels('chat'); renderModels('video');
     renderMsLoras();
     setStatus(`已应用 · 生图 ${image.length} / LLM ${chat.length} / 视频 ${video.length}，点保存生效`);
