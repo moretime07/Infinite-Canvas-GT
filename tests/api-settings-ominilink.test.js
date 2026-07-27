@@ -57,9 +57,12 @@ async function createState(providerRows){
             return {ok:true,json:async()=>({providers:clone(persistedRows)})};
         }
         if(url === '/api/providers') return {ok:true,json:async()=>({providers:clone(persistedRows)})};
-        if(url === '/api/providers/test-connection' || url === '/api/providers/fetch-models'){
+        if(url === '/api/providers/test-connection' || url === '/api/providers/fetch-models' || url === '/api/providers/probe-async'){
             return {ok:true,json:async()=>({
                 ok:true,
+                protocol:'openai',
+                status_code:200,
+                raw:{},
                 total:19,
                 model_count:19,
                 all:['gemini-omni-flash-preview', 'gemini-omni-flash-preview', 'chat-only', 'video-only'],
@@ -75,7 +78,7 @@ async function createState(providerRows){
     const context = {document,window,fetch,URL,console,setTimeout,clearTimeout,alert(){},confirm(){return true;}};
     context.globalThis = context;
     const sourcePath = path.resolve(__dirname, '..', 'static', 'js', 'api-settings.js');
-    const source = fs.readFileSync(sourcePath, 'utf8') + '\n globalThis.__ominiLinkTest={loadProviders,syncEditor,renderEditor,saveProviders,testConnection,fetchModels,openModelPicker,togglePickerRow,applyModelPicker,providers:()=>providers,isOminiLinkApiUrl,defaultOminiLinkVideoBaseUrl};';
+    const source = fs.readFileSync(sourcePath, 'utf8') + '\n globalThis.__ominiLinkTest={loadProviders,syncEditor,renderEditor,saveProviders,testConnection,probeAsync,fetchModels,openModelPicker,togglePickerRow,applyModelPicker,providers:()=>providers,isOminiLinkApiUrl,defaultOminiLinkVideoBaseUrl};';
     vm.runInNewContext(source, context, {filename:sourcePath});
     await context.__ominiLinkTest.loadProviders();
     return {api:context.__ominiLinkTest,calls,elements};
@@ -83,32 +86,62 @@ async function createState(providerRows){
 
 (async()=>{
     let state;
+    let videoOnlyState;
     for(const legacyId of ['volcengine', 'runninghub']){
-        const legacyState = await createState([{
-            id:legacyId,
-            name:'OminiLink',
-            base_url:'https://api.aig-ai.com/v1',
-            video_base_url:'',
-            protocol:legacyId,
-            enabled:true,
-            primary:true,
-            has_key:true,
-            image_models:[],
-            chat_models:[],
-            video_models:[]
-        }]);
-        legacyState.elements.get('baseInput').value = 'https://api.aig-ai.com/v1';
-        legacyState.elements.get('videoBaseInput').value = 'https://vg-api.aig-ai.com/v1';
-        assert.equal(await legacyState.api.saveProviders(), true);
-        const saved = JSON.parse(legacyState.calls.find(call => call.url === '/api/providers' && call.options.method === 'PUT').options.body)[0];
-        assert.equal(saved.protocol, 'openai', `${legacyId} must not override an exact OminiLink host`);
-        assert.equal(saved.video_base_url, 'https://vg-api.aig-ai.com/v1');
-        assert.ok(!Object.hasOwn(saved, 'api_key'));
-        await legacyState.api.loadProviders();
-        assert.equal(legacyState.api.providers()[0].protocol, 'openai');
-        assert.equal(legacyState.elements.get('protocolInput').value, 'openai');
-        if(legacyId === 'volcengine') state = legacyState;
+        for(const entryPoints of [
+            {label:'base-only', base_url:'https://api.aig-ai.com/v1', video_base_url:''},
+            {label:'video-only', base_url:'', video_base_url:'https://vg-api.aig-ai.com/v1'}
+        ]){
+            const legacyState = await createState([{
+                id:legacyId,
+                name:'OminiLink',
+                ...entryPoints,
+                protocol:legacyId,
+                enabled:true,
+                primary:true,
+                has_key:true,
+                image_models:[],
+                chat_models:[],
+                video_models:[]
+            }]);
+            legacyState.elements.get('baseInput').value = entryPoints.base_url;
+            legacyState.elements.get('videoBaseInput').value = entryPoints.video_base_url;
+            assert.equal(await legacyState.api.saveProviders(), true);
+            const saved = JSON.parse(legacyState.calls.find(call => call.url === '/api/providers' && call.options.method === 'PUT').options.body)[0];
+            assert.equal(saved.protocol, 'openai', `${legacyId} ${entryPoints.label} must remain OpenAI-compatible`);
+            assert.equal(saved.base_url, entryPoints.base_url);
+            assert.equal(saved.video_base_url, 'https://vg-api.aig-ai.com/v1');
+            assert.ok(!Object.hasOwn(saved, 'api_key'));
+            await legacyState.api.loadProviders();
+            assert.equal(legacyState.api.providers()[0].protocol, 'openai');
+            assert.equal(legacyState.elements.get('protocolInput').value, 'openai');
+            const providerListMarkup = legacyState.elements.get('providerList').innerHTML;
+            assert.match(providerListMarkup, /provider-protocol-pill">OPENAI</);
+            assert.doesNotMatch(providerListMarkup, /provider-protocol-pill">(?:RH|Ark)</);
+            if(legacyId === 'volcengine' && entryPoints.label === 'base-only') state = legacyState;
+            if(legacyId === 'runninghub' && entryPoints.label === 'video-only') videoOnlyState = legacyState;
+        }
     }
+
+    let validationCalls = videoOnlyState.calls.filter(call => call.url === '/api/providers/test-connection').length;
+    await videoOnlyState.api.testConnection();
+    const newValidationCalls = videoOnlyState.calls.filter(call => call.url === '/api/providers/test-connection');
+    assert.equal(newValidationCalls.length, validationCalls + 1, 'video-only config must reach address validation');
+    const videoOnlyValidation = JSON.parse(newValidationCalls.at(-1).options.body);
+    assert.equal(videoOnlyValidation.base_url, '');
+    assert.equal(videoOnlyValidation.video_base_url, 'https://vg-api.aig-ai.com/v1');
+    assert.equal(videoOnlyValidation.protocol, 'openai');
+    assert.ok(!videoOnlyValidation.api_key);
+
+    const probeCalls = videoOnlyState.calls.filter(call => call.url === '/api/providers/probe-async').length;
+    await videoOnlyState.api.probeAsync();
+    const newProbeCalls = videoOnlyState.calls.filter(call => call.url === '/api/providers/probe-async');
+    assert.equal(newProbeCalls.length, probeCalls + 1, 'video-only config must reach protocol probing');
+    const videoOnlyProbe = JSON.parse(newProbeCalls.at(-1).options.body);
+    assert.equal(videoOnlyProbe.base_url, '');
+    assert.equal(videoOnlyProbe.video_base_url, 'https://vg-api.aig-ai.com/v1');
+    assert.equal(videoOnlyProbe.protocol, 'openai');
+    assert.ok(!videoOnlyProbe.api_key);
 
     assert.equal(state.api.isOminiLinkApiUrl('https://api.aig-ai.com/v1'), true);
     assert.equal(state.api.isOminiLinkApiUrl('https://portal.ominilink.ai/'), false);

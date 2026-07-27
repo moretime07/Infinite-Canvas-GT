@@ -708,7 +708,7 @@ function syncEditor(){
     item.id = nextId;
     if(oldId !== item.id) selectedId = item.id;
     item.name = nameInput.value.trim() || item.id;
-    const selectedProtocol = effectiveProviderProtocol(item, baseInput.value.trim(), protocolInput?.value);
+    const selectedProtocol = effectiveProviderProtocol(item, baseInput.value.trim(), protocolInput?.value, videoBaseInput?.value.trim());
     item.base_url = selectedProtocol === 'jimeng' ? '' : baseInput.value.trim();
     const enteredVideoBaseUrl = videoBaseInput?.value.trim() || '';
     item.video_base_url = enteredVideoBaseUrl || defaultOminiLinkVideoBaseUrl(item.base_url);
@@ -761,7 +761,7 @@ function updateProtocolFromInput(){
     if(keyInput) keyInput.value = savedKey;
 }
 function isVolcengineProvider(item){
-    return !isOminiLinkApiUrl(item?.base_url) && String(item?.protocol || '').toLowerCase() === 'volcengine';
+    return !isOminiLinkProvider(item) && String(item?.protocol || '').toLowerCase() === 'volcengine';
 }
 function handleRhPasteInput(value){
     const parsed = parseRunningHubRunRef(value);
@@ -2211,7 +2211,8 @@ function renderProviderList(){
     providerList.innerHTML = sortedProviders().map(item => {
         const active = item.id === selectedId ? 'active' : '';
         const stateClass = item.enabled === false ? 'is-disabled' : (item.has_key || item.has_wallet_key ? 'has-key' : 'missing-key');
-        const protocolLabel = item.id === 'runninghub' ? 'RH' : String(item.protocol || 'openai').toUpperCase();
+        const isOminiLink = isOminiLinkProvider(item);
+        const protocolLabel = isOminiLink ? 'OPENAI' : item.id === 'runninghub' ? 'RH' : String(item.protocol || 'openai').toUpperCase();
         if(item.id === 'modelscope'){
             return `
                 <div class="provider-card-shell">
@@ -2230,7 +2231,7 @@ function renderProviderList(){
                 </div>
             `;
         }
-        if(item.id === 'runninghub'){
+        if(item.id === 'runninghub' && !isOminiLink){
             return `
                 <div class="provider-card-shell">
                 <button class="provider-card provider-card-banner ${active} ${stateClass}" type="button" onclick="selectProvider('${escapeHtml(item.id)}')">
@@ -2248,7 +2249,7 @@ function renderProviderList(){
                 </div>
             `;
         }
-        if(item.id === 'volcengine'){
+        if(item.id === 'volcengine' && !isOminiLink){
             return `
                 <div class="provider-card-shell">
                 <button class="provider-card provider-card-banner ${active} ${stateClass}" type="button" onclick="selectProvider('${escapeHtml(item.id)}')">
@@ -2347,7 +2348,7 @@ function handleProviderDragEnd(){
 function renderEditor(){
     const item = provider();
     if(!item) return;
-    const isOminiLink = isOminiLinkApiUrl(item.base_url);
+    const isOminiLink = isOminiLinkProvider(item);
     editorTitle.textContent = item.name || item.id;
     nameInput.value = item.name || '';
     idInput.value = item.id || '';
@@ -2595,7 +2596,7 @@ async function loadJimengHelp(){
     }
 }
 function currentProviderApiKey(item){
-    if(item?.id === 'runninghub' && !isOminiLinkApiUrl(baseInput?.value || item.base_url)){
+    if(item?.id === 'runninghub' && !isOminiLinkProvider(item, baseInput?.value, videoBaseInput?.value)){
         return rhWalletKeyInput?.value.trim() || rhFreeKeyInput?.value.trim() || '';
     }
     return keyInput.value.trim();
@@ -2609,7 +2610,7 @@ function imageRequestModeLabel(mode){
 function isRunningHubContext(item, baseUrl=''){
     const protocol = String(protocolInput?.value || item?.protocol || '').trim().toLowerCase();
     const url = String(baseUrl || baseInput?.value || item?.base_url || '').trim().toLowerCase();
-    if(isOminiLinkApiUrl(url)) return false;
+    if(isOminiLinkProvider(item, url, videoBaseInput?.value)) return false;
     return item?.id === 'runninghub'
         || protocol === 'runninghub'
         || url.includes('runninghub.cn')
@@ -2624,8 +2625,11 @@ function isOminiLinkApiUrl(value){
         return false;
     }
 }
-function effectiveProviderProtocol(item, baseUrl=item?.base_url, requestedProtocol=item?.protocol){
-    if(isOminiLinkApiUrl(baseUrl)) return 'openai';
+function isOminiLinkProvider(item, baseUrl=item?.base_url, videoBaseUrl=item?.video_base_url){
+    return isOminiLinkApiUrl(baseUrl) || isOminiLinkApiUrl(videoBaseUrl);
+}
+function effectiveProviderProtocol(item, baseUrl=item?.base_url, requestedProtocol=item?.protocol, videoBaseUrl=item?.video_base_url){
+    if(isOminiLinkProvider(item, baseUrl, videoBaseUrl)) return 'openai';
     if(item?.id === 'modelscope') return 'openai';
     if(item?.id === 'runninghub') return 'runninghub';
     if(item?.id === 'volcengine') return 'volcengine';
@@ -2702,18 +2706,20 @@ async function probeAsync(){
     if(!item) return;
     const btn = document.getElementById('probeAsyncBtn');
     const baseUrl = baseInput.value.trim();
-    if(!baseUrl){ alert('请先填写请求地址'); return; }
+    const videoBaseUrl = videoBaseInput?.value.trim() || defaultOminiLinkVideoBaseUrl(baseUrl);
+    if(!baseUrl && !videoBaseUrl){ alert('请先填写请求地址'); return; }
     if(btn){ btn.disabled = true; btn.querySelector('span').textContent = '检测中...'; }
     showVerifyResult(`<span style="color:var(--muted);font-size:11px;font-weight:700">正在检测协议类型...</span>`);
     try {
         const apiKey = currentProviderApiKey(item);
-        const currentProtocol = String(protocolInput?.value || item.protocol || 'openai').toLowerCase();
+        const currentProtocol = effectiveProviderProtocol(item, baseUrl, protocolInput?.value, videoBaseUrl);
         if(isRunningHubContext(item, baseUrl)){
             const data = await fetch('/api/providers/test-connection', {
                 method:'POST',
                 headers:{'Content-Type':'application/json'},
                 body:JSON.stringify({
                     base_url:baseUrl,
+                    video_base_url:videoBaseUrl,
                     api_key:apiKey,
                     provider_id:'runninghub',
                     protocol:'runninghub',
@@ -2740,6 +2746,7 @@ async function probeAsync(){
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
                 base_url: baseUrl,
+                video_base_url: videoBaseUrl,
                 api_key: apiKey,
                 provider_id: item.id,
                 protocol: currentProtocol,
@@ -2796,7 +2803,7 @@ async function testConnection(){
     const videoBaseUrl = videoBaseInput?.value.trim() || defaultOminiLinkVideoBaseUrl(baseUrl);
     if(videoBaseInput && !videoBaseInput.value.trim() && videoBaseUrl) videoBaseInput.value = videoBaseUrl;
     const isJimeng = item.id === 'jimeng' || (protocolInput?.value || '') === 'jimeng';
-    if(!baseUrl && !isJimeng){ alert('请先填写请求地址'); return; }
+    if(!baseUrl && !videoBaseUrl && !isJimeng){ alert('请先填写请求地址'); return; }
     if(btn){ btn.disabled = true; btn.querySelector('span').textContent = tr('api.testingUrl') || '验证中...'; }
     showVerifyResult(`<span style="color:var(--muted);font-size:11px;font-weight:700">验证中...</span>`);
     try {
@@ -2809,7 +2816,7 @@ async function testConnection(){
                 video_base_url: videoBaseUrl,
                 api_key: apiKey,
                 provider_id: runninghubContext ? 'runninghub' : item.id,
-                protocol: runninghubContext ? 'runninghub' : (protocolInput?.value || 'openai'),
+                protocol: runninghubContext ? 'runninghub' : effectiveProviderProtocol(item, baseUrl, protocolInput?.value, videoBaseUrl),
                 image_request_mode: imageRequestModeInput?.value || item.image_request_mode || 'openai'
             })
         }).then(async r => {
@@ -2874,7 +2881,7 @@ async function fetchModels(){
     const videoBaseUrl = videoBaseInput?.value.trim() || defaultOminiLinkVideoBaseUrl(baseUrl);
     const apiKey = currentProviderApiKey(item);
     const isJimeng = item.id === 'jimeng' || (protocolInput?.value || '') === 'jimeng';
-    if(!baseUrl && !isJimeng){ alert('请先填写请求地址'); return; }
+    if(!baseUrl && !videoBaseUrl && !isJimeng){ alert('请先填写请求地址'); return; }
     if(btn){ btn.disabled = true; btn.querySelector('span').textContent = tr('api.fetchingModels') || '拉取中...'; }
     setStatus(tr('api.fetchingModels') || '正在从上游拉取模型列表...');
     try {
@@ -2887,7 +2894,7 @@ async function fetchModels(){
                 video_base_url:videoBaseUrl,
                 api_key:apiKey,
                 provider_id:runninghubContext ? 'runninghub' : item.id,
-                protocol:runninghubContext ? 'runninghub' : (protocolInput?.value || 'openai'),
+                protocol:runninghubContext ? 'runninghub' : effectiveProviderProtocol(item, baseUrl, protocolInput?.value, videoBaseUrl),
                 image_request_mode:imageRequestModeInput?.value || item.image_request_mode || 'openai'
             })
         }).then(async r => {
@@ -2908,7 +2915,7 @@ async function fetchModels(){
         // 启用「选择模型」按钮，并 statusbar 显示已拉取数量
         const openBtn = document.getElementById('openPickerBtn');
         if(openBtn){ openBtn.disabled = false; openBtn.style.opacity = '1'; }
-        const extra = (runninghubContext || detectedProtocol === 'runninghub' || item.id === 'runninghub')
+        const extra = (runninghubContext || detectedProtocol === 'runninghub')
             ? ` · RunningHub OpenAPI${runninghubModelSourceNote(data)}`
             : (detectedProtocol === 'volcengine' || isVolcengineProvider(item)) ? ' · 已识别方舟协议，火山聊天建议改填 ep-... 接入点' : '';
         const imageModeExtra = normalizeImageRequestMode(imageRequestModeInput?.value || item.image_request_mode) === 'openai-json' ? ' · 图片接口已设为 OpenAI JSON' : '';
@@ -3355,7 +3362,7 @@ async function saveProviders(){
         );
         if(item.id === 'jimeng') item.base_url = '';
         if(item.id === 'jimeng') item.video_models = unique([...(item.video_models || []).filter(model => !JIMENG_LEGACY_VIDEO_MODELS.has(String(model || '').trim())), ...JIMENG_DEFAULT_VIDEO_MODELS]);
-        if(item.id === 'runninghub'){
+        if(item.id === 'runninghub' && !isOminiLinkProvider(item)){
             item.base_url = item.base_url || RH_DEFAULT_BASE_URL;
             item.image_models = unique(item.image_models || []);
             item.chat_models = unique(item.chat_models || []);
