@@ -10496,33 +10496,16 @@ async def runninghub_upload_asset(payload: RunningHubUploadAssetRequest):
         upload_url = runninghub_endpoint_url(provider, "/task/openapi/upload")
         files = {"file": (filename, content, content_type)}
         data = {"apiKey": api_key, "fileType": "input"}
-        for attempt in range(2):
+        try:
             response = await client.post(upload_url, headers=runninghub_app_headers(False, payload.useWallet), data=data, files=files)
-            response_text = str(getattr(response, "text", "") or "").strip()
-            try:
-                raw = response.json()
-            except Exception:
-                preview = response_text[:500]
-                detail = (
-                    f"RunningHub 上传接口返回非 JSON 响应（HTTP {response.status_code}）：{preview}"
-                    if preview
-                    else f"RunningHub 上传接口返回空响应（HTTP {response.status_code}）"
-                )
-                retryable = not preview or response.status_code in (408, 425, 429, 500, 502, 503, 504)
-                if attempt == 0 and retryable:
-                    await asyncio.sleep(1)
-                    continue
-                raise HTTPException(status_code=502, detail=detail)
-            if response.status_code >= 400:
-                detail = json.dumps(raw, ensure_ascii=False)[:800]
-                if attempt == 0 and response.status_code in (408, 425, 429, 500, 502, 503, 504):
-                    await asyncio.sleep(1)
-                    continue
-                raise HTTPException(status_code=response.status_code, detail=detail)
-            if isinstance(raw, dict) and raw.get("code") in (0, "0") and isinstance(raw.get("data"), dict) and raw["data"].get("fileName"):
-                return {"success": True, "data": {"fileName": raw["data"]["fileName"], "fileType": raw["data"].get("fileType") or content_type}}
-            raise HTTPException(status_code=400, detail=(raw.get("msg") if isinstance(raw, dict) else "") or f"RunningHub 上传失败：{raw}")
-    raise HTTPException(status_code=502, detail="RunningHub 上传接口在重试后仍未返回结果")
+            raw = response.json()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"上传素材到 RunningHub 失败：{exc}") from exc
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=json.dumps(raw, ensure_ascii=False)[:800])
+    if isinstance(raw, dict) and raw.get("code") in (0, "0") and isinstance(raw.get("data"), dict) and raw["data"].get("fileName"):
+        return {"success": True, "data": {"fileName": raw["data"]["fileName"], "fileType": raw["data"].get("fileType") or content_type}}
+    raise HTTPException(status_code=400, detail=(raw.get("msg") if isinstance(raw, dict) else "") or f"RunningHub 上传失败：{raw}")
 
 @app.get("/api/jimeng/status")
 async def jimeng_status():
