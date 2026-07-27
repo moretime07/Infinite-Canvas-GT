@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -892,7 +893,9 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {
             "videos": ["/assets/output/v.mp4"],
             "task_id": "job-1",
-            "raw": completed._payload,
+            "model": "gemini-omni-flash-preview",
+            "provider_id": "orange",
+            "status": "COMPLETED",
         })
 
     async def test_gemini_model_override_still_uses_bearer_for_submit_and_poll(self):
@@ -1042,6 +1045,55 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         save.assert_awaited_once_with("https://cdn.example.test/now.mp4")
         self.assertEqual(result["videos"], ["/assets/output/now.mp4"])
         self.assertEqual(result["task_id"], "job-now")
+
+    async def test_success_response_serializes_only_local_media_and_safe_metadata(self):
+        signed_uri = (
+            "https://signed-upstream.example.test/private/result.mp4"
+            "?token=private-success-token&signature=opaque"
+        )
+        completed = FakeResponse(
+            200,
+            {
+                "id": "job-redacted-success",
+                "status": "completed",
+                "steps": [{"content": [{
+                    "type": "video",
+                    "uri": signed_uri,
+                }]}],
+                "prompt": "private prompt must not leak",
+                "internal": {"trace": "private-success-trace"},
+            },
+            '{"id":"job-redacted-success","status":"completed"}',
+        )
+        client = RecordingClient([completed])
+        save = AsyncMock(return_value="/assets/output/safe-result.mp4")
+
+        with patch.object(main, "save_ominilink_video_to_output", new=save):
+            result = await main.generate_ominilink_video(
+                main.CanvasVideoRequest(
+                    prompt="go",
+                    model="gemini-omni-flash-preview",
+                    duration=6,
+                ),
+                self.provider,
+                client=client,
+            )
+
+        self.assertEqual(result, {
+            "videos": ["/assets/output/safe-result.mp4"],
+            "task_id": "job-redacted-success",
+            "model": "gemini-omni-flash-preview",
+            "provider_id": "orange",
+            "status": "COMPLETED",
+        })
+        serialized = json.dumps(result, ensure_ascii=False, sort_keys=True)
+        self.assertNotIn("raw", result)
+        self.assertNotIn("signed-upstream.example.test", serialized)
+        self.assertNotIn("private-success-token", serialized)
+        self.assertNotIn("signature=opaque", serialized)
+        self.assertNotIn(signed_uri, serialized)
+        self.assertNotIn("private prompt must not leak", serialized)
+        self.assertNotIn("private-success-trace", serialized)
 
     async def test_completed_without_video_uri_is_terminal_error(self):
         completed = FakeResponse(

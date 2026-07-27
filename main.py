@@ -12805,7 +12805,13 @@ async def generate_ominilink_video(payload, provider, client=None) -> dict:
             ]
             if any(not str(local_url or "").startswith(("/output/", "/assets/")) for local_url in local_urls):
                 raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
-            return {"videos": local_urls, "task_id": task_id, "raw": result}
+            return {
+                "videos": local_urls,
+                "task_id": _ominilink_task_id(result) or task_id,
+                "model": model,
+                "provider_id": str(provider.get("id") or payload.provider_id or "").strip(),
+                "status": _ominilink_safe_status(_ominilink_task_status(result)),
+            }
         except httpx.HTTPError as exc:
             raise HTTPException(
                 status_code=502,
