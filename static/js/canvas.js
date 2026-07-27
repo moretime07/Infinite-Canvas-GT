@@ -10348,25 +10348,7 @@ async function runVideoNode(nodeId, opts={}){
         const result = await cascadeFetch('/api/canvas-video', {
             method:'POST',
             headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({
-                prompt,
-                provider_id:requestProvider.providerId,
-                model:requestProvider.model,
-                duration:Number(node.duration || 5),
-                aspect_ratio:node.aspectRatio || '16:9',
-                resolution:node.resolution || '',
-                images:refs,
-                videos:manualVideoUrlForNode(node)
-                    ? [manualVideoUrlForNode(node)]
-                    : videoRefs.map(ref => tempShUploadedUrlForNode(node, ref.url)),
-                audios:audioRefs.map(ref => ref.url).filter(Boolean),
-                enhance_prompt:Boolean(node.enhancePrompt),
-                enable_upsample:Boolean(node.enableUpsample),
-                watermark:Boolean(node.watermark),
-                camerafixed:Boolean(node.cameraFixed),
-                generate_audio:Boolean(node.generateAudio),
-                multimodal:Boolean(node.multimodal)
-            })
+            body:JSON.stringify(requestPayload)
         }, {cascadeTargetId}).then(async r => { if(!r.ok) throw new Error(await responseErrorMessage(r, tr('canvas.videoFailed'))); return r.json(); });
         const meta = collectRunMeta(out, pendingId);
         if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
