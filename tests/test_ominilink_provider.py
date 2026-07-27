@@ -61,6 +61,23 @@ class RouteClient:
 
 
 class OminiLinkProviderTests(unittest.TestCase):
+    def test_legacy_transport_helpers_defer_to_ominilink_authority(self):
+        runninghub = {
+            "id": "runninghub",
+            "protocol": "runninghub",
+            "base_url": "https://api.runninghub.cn",
+            "video_base_url": "https://vg-api.ominilink.ai/v1",
+        }
+        volcengine = {
+            "id": "volcengine",
+            "protocol": "volcengine",
+            "base_url": "https://ark.cn-beijing.volces.com",
+            "video_base_url": "https://vg-api.aig-ai.com/v1",
+        }
+
+        self.assertFalse(main.is_runninghub_provider(runninghub))
+        self.assertFalse(main.is_volcengine_provider(volcengine))
+
     def test_exact_api_hosts_are_recognized(self):
         for url in (
             "https://api.aig-ai.com/v1",
@@ -112,10 +129,36 @@ class OminiLinkProviderTests(unittest.TestCase):
 
 
 class OminiLinkProviderEndpointTests(unittest.IsolatedAsyncioTestCase):
+    def test_default_merge_keeps_ominilink_protocol_authoritative(self):
+        providers = [
+            main.normalize_provider({
+                "id": "runninghub",
+                "name": "Legacy RunningHub",
+                "base_url": "https://api.runninghub.cn",
+                "video_base_url": "https://vg-api.ominilink.ai/v1",
+                "protocol": "runninghub",
+            }),
+            main.normalize_provider({
+                "id": "volcengine",
+                "name": "Legacy Volcengine",
+                "base_url": "https://ark.cn-beijing.volces.com",
+                "video_base_url": "https://vg-api.aig-ai.com/v1",
+                "protocol": "volcengine",
+            }),
+        ]
+
+        with patch.object(main, "load_static_runninghub_provider", return_value=None):
+            merged = main.merge_default_api_providers(providers)
+
+        protocols = {item["id"]: item["protocol"] for item in merged}
+        self.assertEqual(protocols["runninghub"], "openai")
+        self.assertEqual(protocols["volcengine"], "openai")
+
     async def test_save_endpoint_persists_and_returns_openai_for_exact_hosts(self):
         cases = (
             ("volcengine", "https://api.aig-ai.com/v1", ""),
             ("volcengine", "https://vg-api.aig-ai.com/v1", ""),
+            ("volcengine", "https://example.test/v1", "https://vg-api.aig-ai.com/v1"),
             ("runninghub", "https://api.ominilink.ai/v1", ""),
             ("runninghub", "https://example.test/v1", "https://vg-api.ominilink.ai/v1"),
         )
@@ -146,6 +189,16 @@ class OminiLinkProviderEndpointTests(unittest.IsolatedAsyncioTestCase):
 
 
 class OminiLinkDiscoveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_probe_payload_retains_video_base_url(self):
+        payload = main.TestConnectionPayload(
+            base_url="",
+            video_base_url="https://vg-api.aig-ai.com/v1",
+            provider_id="runninghub",
+            protocol="runninghub",
+        )
+
+        self.assertEqual(getattr(payload, "video_base_url", None), "https://vg-api.aig-ai.com/v1")
+
     def test_route_probe_rate_limit_is_not_success(self):
         self.assertFalse(main.route_probe_succeeded(429))
 
@@ -214,6 +267,92 @@ class OminiLinkDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [(method, url) for method, url, _ in client.calls],
             [("GET", f"{base_url}/models")],
+        )
+
+    async def test_probe_async_legacy_ids_use_only_ominilink_routes(self):
+        cases = (
+            (
+                "runninghub",
+                "https://api.aig-ai.com/v1",
+                "",
+                "https://api.aig-ai.com/v1",
+            ),
+            (
+                "runninghub",
+                "",
+                "https://vg-api.ominilink.ai/v1",
+                "https://api.ominilink.ai/v1",
+            ),
+            (
+                "volcengine",
+                "",
+                "https://vg-api.aig-ai.com/v1",
+                "https://api.aig-ai.com/v1",
+            ),
+        )
+        for provider_id, base_url, video_base_url, probe_base in cases:
+            with self.subTest(provider_id=provider_id, base_url=base_url, video_base_url=video_base_url):
+                client = RouteClient({
+                    ("GET", f"{probe_base}/models"): FakeResponse(
+                        404, {"error": "not found"}, '{"error":"not found"}'
+                    ),
+                    ("POST", f"{probe_base}/chat/completions"): FakeResponse(
+                        400,
+                        {"error": {"message": "messages required"}},
+                        '{"error":{"message":"messages required"}}',
+                    ),
+                })
+                payload = main.TestConnectionPayload(
+                    base_url=base_url,
+                    video_base_url=video_base_url,
+                    api_key="redacted-key",
+                    provider_id=provider_id,
+                    protocol=provider_id,
+                )
+
+                with patch.object(main.httpx, "AsyncClient", return_value=client):
+                    try:
+                        result = await main.probe_async_endpoint(payload)
+                    except main.HTTPException as exc:
+                        self.fail(f"video URL authority was not accepted: {exc.detail}")
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["protocol"], "openai")
+                self.assertEqual(
+                    [(method, url) for method, url, _ in client.calls],
+                    [
+                        ("GET", f"{probe_base}/models"),
+                        ("POST", f"{probe_base}/chat/completions"),
+                    ],
+                )
+
+    async def test_fetch_models_payload_uses_video_base_url_chat_host(self):
+        probe_base = "https://api.aig-ai.com/v1"
+        client = RouteClient({
+            ("GET", f"{probe_base}/models"): FakeResponse(
+                200,
+                {"data": [{"id": "upstream-chat"}]},
+                '{"data":[{"id":"upstream-chat"}]}',
+            ),
+        })
+        payload = main.TestConnectionPayload(
+            base_url="",
+            video_base_url="https://vg-api.aig-ai.com/v1",
+            api_key="redacted-key",
+            provider_id="runninghub",
+            protocol="runninghub",
+        )
+
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            try:
+                result = await main.fetch_upstream_models_from_payload(payload)
+            except main.HTTPException as exc:
+                self.fail(f"video URL authority was not accepted: {exc.detail}")
+
+        self.assertTrue(result.get("connection_verified", False))
+        self.assertEqual(
+            [(method, url) for method, url, _ in client.calls],
+            [("GET", f"{probe_base}/models")],
         )
 
     async def test_ark_404_is_not_route_success(self):
@@ -480,3 +619,46 @@ class OminiLinkDiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 429)
         self.assertEqual(len(client.calls), 1)
+
+
+class OminiLinkVideoRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_canvas_video_legacy_ids_route_to_ominilink(self):
+        cases = (
+            {
+                "id": "runninghub",
+                "name": "Legacy RunningHub",
+                "protocol": "runninghub",
+                "base_url": "https://api.aig-ai.com/v1",
+                "video_base_url": "https://vg-api.aig-ai.com/v1",
+            },
+            {
+                "id": "runninghub",
+                "name": "Legacy RunningHub Video Only",
+                "protocol": "runninghub",
+                "base_url": "https://api.runninghub.cn",
+                "video_base_url": "https://vg-api.ominilink.ai/v1",
+            },
+            {
+                "id": "volcengine",
+                "name": "Legacy Volcengine Video Only",
+                "protocol": "volcengine",
+                "base_url": "https://ark.cn-beijing.volces.com",
+                "video_base_url": "https://vg-api.aig-ai.com/v1",
+            },
+        )
+        for provider in cases:
+            with self.subTest(provider_id=provider["id"], video_base_url=provider["video_base_url"]):
+                payload = main.CanvasVideoRequest(
+                    prompt="route me",
+                    provider_id=provider["id"],
+                    model="gemini-omni-flash-preview",
+                )
+                ominilink = AsyncMock(return_value={"transport": "ominilink"})
+                runninghub = AsyncMock(return_value={"transport": "runninghub"})
+
+                with patch.object(main, "get_api_provider", return_value=provider), patch.object(
+                    main, "generate_ominilink_video", new=ominilink
+                ), patch.object(main, "generate_runninghub_video", new=runninghub):
+                    result = await main.canvas_video(payload)
+
+                self.assertEqual(result, {"transport": "ominilink"})

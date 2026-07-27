@@ -846,7 +846,7 @@ def merge_default_api_providers(providers):
         else:
             if not current.get("base_url"):
                 current["base_url"] = rh_default["base_url"]
-            if not current.get("protocol") or current.get("protocol") == "openai":
+            if (not current.get("protocol") or current.get("protocol") == "openai") and not is_ominilink_provider_config(current):
                 current["protocol"] = "runninghub"
             current["image_models"] = model_list_from_values(current.get("image_models") or [])
             current["chat_models"] = model_list_from_values(current.get("chat_models") or [])
@@ -874,7 +874,8 @@ def merge_default_api_providers(providers):
         else:
             if not current.get("base_url"):
                 current["base_url"] = volc_default["base_url"]
-            current["protocol"] = "volcengine"
+            if not is_ominilink_provider_config(current):
+                current["protocol"] = "volcengine"
             current["volcengine_project_name"] = str(current.get("volcengine_project_name") or VOLCENGINE_DEFAULT_PROJECT_NAME).strip() or VOLCENGINE_DEFAULT_PROJECT_NAME
             current["volcengine_region"] = str(current.get("volcengine_region") or VOLCENGINE_DEFAULT_REGION).strip() or VOLCENGINE_DEFAULT_REGION
     lingjing_default = next((d for d in default_api_providers() if d["id"] == "lingjing"), None)
@@ -1201,6 +1202,18 @@ def is_ominilink_api_url(value: str) -> bool:
     return parsed.scheme in {"http", "https"} and (parsed.hostname or "").lower() in OMINILINK_API_HOSTS
 
 
+def _provider_config_url(provider, field: str) -> str:
+    value = provider.get(field) if isinstance(provider, dict) else getattr(provider, field, "")
+    return str(value or "").strip().rstrip("/")
+
+
+def is_ominilink_provider_config(provider) -> bool:
+    return any(
+        is_ominilink_api_url(_provider_config_url(provider, field))
+        for field in ("base_url", "video_base_url")
+    )
+
+
 def normalize_ominilink_urls(base_url: str, video_base_url: str = "") -> tuple[str, str]:
     base = str(base_url or "").strip().rstrip("/")
     video = str(video_base_url or "").strip().rstrip("/")
@@ -1214,7 +1227,18 @@ def normalize_ominilink_urls(base_url: str, video_base_url: str = "") -> tuple[s
     derived_video = urllib.parse.urlunsplit((parsed.scheme, f"vg-{root_host}", suffix, "", ""))
     return chat.rstrip("/"), (video or derived_video).rstrip("/")
 
+
+def ominilink_chat_api_url(provider) -> str:
+    base_url = _provider_config_url(provider, "base_url")
+    video_base_url = _provider_config_url(provider, "video_base_url")
+    authoritative_url = base_url if is_ominilink_api_url(base_url) else video_base_url
+    if not is_ominilink_api_url(authoritative_url):
+        return ""
+    chat_url, _ = normalize_ominilink_urls(authoritative_url)
+    return chat_url
+
 def normalize_provider(item):
+    ominilink_config = is_ominilink_provider_config(item)
     provider_id = str(item.get("id") or "").strip().lower()
     if not PROVIDER_ID_RE.fullmatch(provider_id):
         raise HTTPException(status_code=400, detail=f"API 平台 ID 不合法：{provider_id or '(empty)'}")
@@ -1245,7 +1269,7 @@ def normalize_provider(item):
     if provider_id == "runninghub":
         protocol = "runninghub"
         base_url = base_url or RUNNINGHUB_DEFAULT_BASE_URL
-    if is_ominilink_api_url(base_url) or is_ominilink_api_url(video_base_url):
+    if ominilink_config:
         protocol = "openai"
     return {
         "id": provider_id,
@@ -3873,6 +3897,8 @@ def images_api_unsupported(response):
     return "images api is not supported" in text or "not supported for this platform" in text
 
 def provider_protocol(provider):
+    if is_ominilink_provider_config(provider):
+        return "openai"
     return str((provider or {}).get("protocol") or "openai").strip().lower()
 
 # 单模型可覆盖的协议（仅 OpenAI / Gemini，二者可共用同一站点的 Base URL + Key）
@@ -3893,7 +3919,7 @@ def normalize_model_protocols(value):
 
 def effective_protocol(provider, model=""):
     """返回某模型实际生效的协议：优先单模型覆盖，否则用平台全局协议。"""
-    if is_ominilink_api_url((provider or {}).get("base_url")):
+    if is_ominilink_provider_config(provider):
         return "openai"
     base = provider_protocol(provider)
     pid = str((provider or {}).get("id") or "").strip().lower()
@@ -3932,6 +3958,8 @@ def is_volcengine_provider(provider):
     return provider_protocol(provider) == "volcengine"
 
 def is_runninghub_provider(provider):
+    if is_ominilink_provider_config(provider):
+        return False
     return provider_protocol(provider) == "runninghub" or str((provider or {}).get("id") or "").strip().lower() == "runninghub"
 
 def is_jimeng_provider(provider):
@@ -10862,7 +10890,7 @@ async def save_providers(payload: List[ApiProviderPayload]):
             provider["protocol"] = "runninghub"
         if provider["id"] == "volcengine":
             provider["protocol"] = "volcengine"
-        if is_ominilink_api_url(provider.get("base_url")) or is_ominilink_api_url(provider.get("video_base_url")):
+        if is_ominilink_provider_config(provider):
             provider["protocol"] = "openai"
     if not providers:
         raise HTTPException(status_code=400, detail="至少保留一个 API 平台")
@@ -10900,6 +10928,7 @@ async def get_global_token():
 
 class TestConnectionPayload(BaseModel):
     base_url: str = ""
+    video_base_url: str = ""
     api_key: str = ""
     provider_id: str = ""
     protocol: str = "openai"
@@ -10907,7 +10936,7 @@ class TestConnectionPayload(BaseModel):
 
 def protocol_from_payload(payload):
     base_url = str(getattr(payload, "base_url", "") or "").strip()
-    if is_ominilink_api_url(base_url):
+    if is_ominilink_provider_config(payload):
         return "openai"
     provider_id = str(getattr(payload, "provider_id", "") or "").strip().lower()
     if provider_id == "volcengine":
@@ -10929,7 +10958,7 @@ def api_key_from_payload(payload, protocol: str = ""):
     if explicit:
         return explicit
     if provider_id:
-        if provider_id == "runninghub":
+        if provider_id == "runninghub" and not is_ominilink_provider_config(payload):
             value = os.getenv(runninghub_wallet_key_env(), "")
             if value:
                 return value
@@ -10939,6 +10968,12 @@ def api_key_from_payload(payload, protocol: str = ""):
     if protocol == "volcengine":
         return volcengine_provider_api_key("")
     return ""
+
+
+def provider_probe_base_url(payload) -> str:
+    if is_ominilink_provider_config(payload):
+        return ominilink_chat_api_url(payload)
+    return _provider_config_url(payload, "base_url")
 
 def upstream_models_url(base_url: str, protocol: str):
     if protocol == "gemini":
@@ -11251,7 +11286,7 @@ async def test_provider_connection(payload: TestConnectionPayload):
             "protocol": "runninghub",
             "raw": payload_models.get("raw"),
         }
-    base_url = (payload.base_url or "").strip().rstrip("/")
+    base_url = provider_probe_base_url(payload)
     if not base_url:
         raise HTTPException(status_code=400, detail="请先填写请求地址")
     if not re.match(r"^https?://", base_url):
@@ -11335,15 +11370,14 @@ async def test_provider_connection(payload: TestConnectionPayload):
 async def probe_async_endpoint(payload: TestConnectionPayload):
     """验证异步协议：用假 task_id 请求 GET /v1/tasks/{fake_id}。
     收到 400 Invalid task ID = 端点存在且 Key 有效；401/403 = Key 无效；404/连接失败 = 不支持异步端点。"""
-    base_url = (payload.base_url or "").strip().rstrip("/")
+    base_url = provider_probe_base_url(payload)
     if not base_url:
         raise HTTPException(status_code=400, detail="请先填写请求地址")
     protocol = protocol_from_payload(payload)
     api_key = api_key_from_payload(payload, protocol)
     if not api_key:
         raise HTTPException(status_code=400, detail="请先填写或保存 API Key")
-    if is_ominilink_api_url(base_url):
-        base_url, _ = normalize_ominilink_urls(base_url)
+    if is_ominilink_provider_config(payload):
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 openai_ok, openai_probe = await probe_openai_models_endpoint(client, base_url, api_key)
@@ -11670,7 +11704,7 @@ async def fetch_upstream_models_from_payload(payload: TestConnectionPayload):
     """按页面当前表单值拉取模型，支持新增平台未保存时直接使用临时 Base URL / Key。"""
     protocol = protocol_from_payload(payload)
     api_key = api_key_from_payload(payload, protocol)
-    return await fetch_models_from_upstream(payload.base_url, api_key, protocol, payload.image_request_mode)
+    return await fetch_models_from_upstream(provider_probe_base_url(payload), api_key, protocol, payload.image_request_mode)
 
 @app.get("/api/providers/{provider_id}/fetch-models")
 async def fetch_upstream_models(provider_id: str):
@@ -13215,6 +13249,8 @@ async def build_openrouter_video_request(payload: CanvasVideoRequest):
 @app.post("/api/canvas-video")
 async def canvas_video(payload: CanvasVideoRequest):
     provider = get_api_provider(payload.provider_id)
+    if is_ominilink_provider_config(provider):
+        return await generate_ominilink_video(payload, provider)
     if is_jimeng_provider(provider):
         return await generate_jimeng_video(payload, provider)
     if is_runninghub_provider(provider):
@@ -13226,8 +13262,6 @@ async def canvas_video(payload: CanvasVideoRequest):
         except httpx.HTTPError as exc:
             log_net_error(f"视频(RunningHub) 网络/TLS错误 model={payload.model}", exc)
             raise HTTPException(status_code=502, detail=f"请求 RunningHub 视频接口失败：{exc}") from exc
-    if is_ominilink_api_url(provider.get("base_url")) or is_ominilink_api_url(provider.get("video_base_url")):
-        return await generate_ominilink_video(payload, provider)
     base_url = video_api_root(provider)
     if not base_url:
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider['id']} 未配置 Base URL")
