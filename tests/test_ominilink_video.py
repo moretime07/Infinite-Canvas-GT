@@ -95,6 +95,23 @@ class OminiLinkVideoRequestTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(raised.exception.status_code, 400)
                 self.assertIn("图片", raised.exception.detail)
 
+    async def test_image_to_video_rejects_invalid_image_mime_syntax(self):
+        for reference_url in (
+            "data:image/;base64,YQ==",
+            "data:image/pn g;base64,YQ==",
+        ):
+            with self.subTest(reference_url=reference_url):
+                payload = main.CanvasVideoRequest(
+                    prompt="move", model="gemini-omni-flash-preview",
+                    images=[main.AIReference(url=reference_url)],
+                )
+
+                with self.assertRaises(main.HTTPException) as raised:
+                    await main.build_ominilink_omni_request(payload)
+
+                self.assertEqual(raised.exception.status_code, 400)
+                self.assertIn("MIME", raised.exception.detail)
+
     async def test_video_edit_contains_data_url_media(self):
         payload = main.CanvasVideoRequest(
             prompt="edit", model="gemini-omni-flash-preview",
@@ -125,6 +142,36 @@ class OminiLinkVideoRequestTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(raised.exception.status_code, 400)
                 self.assertIn("视频", raised.exception.detail)
+
+    async def test_video_edit_rejects_invalid_video_mime_syntax(self):
+        for reference_url in (
+            "data:video/;base64,YQ==",
+            "data:video/mp 4;base64,YQ==",
+        ):
+            with self.subTest(reference_url=reference_url):
+                payload = main.CanvasVideoRequest(
+                    prompt="edit", model="gemini-omni-flash-preview",
+                    videos=[reference_url],
+                )
+
+                with self.assertRaises(main.HTTPException) as raised:
+                    await main.build_ominilink_omni_request(payload)
+
+                self.assertEqual(raised.exception.status_code, 400)
+                self.assertIn("MIME", raised.exception.detail)
+
+    async def test_media_mime_tokens_allow_plus_period_and_hyphen(self):
+        image_body = await main.build_ominilink_omni_request(main.CanvasVideoRequest(
+            prompt="move", model="gemini-omni-flash-preview",
+            images=[main.AIReference(url="data:image/vnd.example+json.test-base64;base64,YQ==")],
+        ))
+        video_body = await main.build_ominilink_omni_request(main.CanvasVideoRequest(
+            prompt="edit", model="gemini-omni-flash-preview",
+            videos=["data:video/vnd.example+json.test-base64;base64,YQ=="],
+        ))
+
+        self.assertEqual(image_body["input"][0]["content"][1]["mime_type"], "image/vnd.example+json.test-base64")
+        self.assertEqual(video_body["input"][0]["content"][1]["mime_type"], "video/vnd.example+json.test-base64")
 
     async def test_video_edit_rejects_http_references_locally(self):
         payload = main.CanvasVideoRequest(

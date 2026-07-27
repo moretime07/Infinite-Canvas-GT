@@ -11911,6 +11911,9 @@ def split_data_url(value: str) -> tuple[str, str]:
     match = re.fullmatch(r"data:([^;,]+);base64,(.+)", str(value or ""), re.S)
     if not match:
         raise HTTPException(status_code=400, detail="参考素材必须能转换为 base64 数据")
+    mime_type = match.group(1).lower()
+    if not re.fullmatch(r"[-!#$%&'*+.\^_`|~0-9A-Za-z]+/[-!#$%&'*+.\^_`|~0-9A-Za-z]+", mime_type):
+        raise HTTPException(status_code=400, detail="参考素材包含无效的 MIME 类型")
     data = re.sub(r"\s+", "", match.group(2))
     try:
         decoded = base64.b64decode(data, validate=True)
@@ -11918,7 +11921,7 @@ def split_data_url(value: str) -> tuple[str, str]:
         raise HTTPException(status_code=400, detail="参考素材包含无效的 base64 数据") from exc
     if not decoded:
         raise HTTPException(status_code=400, detail="参考素材包含空的 base64 数据")
-    return match.group(1).lower(), base64.b64encode(decoded).decode("ascii")
+    return mime_type, base64.b64encode(decoded).decode("ascii")
 
 def ominilink_video_content_item(value: str) -> dict:
     text = str(value or "").strip()
