@@ -665,6 +665,35 @@ function isRunningHubProvider(provider){
     const name = String(provider?.name || '').trim().toLowerCase();
     return id === 'runninghub' || protocol === 'runninghub' || name === 'runninghub' || id === 'rh';
 }
+function isOminiLinkProvider(provider){
+    const approvedHosts = new Set([
+        'api.aig-ai.com',
+        'vg-api.aig-ai.com',
+        'api.ominilink.ai',
+        'vg-api.ominilink.ai'
+    ]);
+    return [provider?.base_url, provider?.video_base_url].some(value => {
+        try {
+            return approvedHosts.has(new URL(String(value || '')).hostname.toLowerCase());
+        } catch(_) {
+            return false;
+        }
+    });
+}
+function omniFlashVideoValidationError(node, mediaRefs){
+    if(String(node?.model || '').trim() !== 'gemini-omni-flash-preview') return '';
+    const refs = Array.isArray(mediaRefs) ? mediaRefs : [];
+    const imageCount = refs.filter(ref => mediaKindForRef(ref) === 'image').length;
+    const videoCount = refs.filter(ref => mediaKindForRef(ref) === 'video').length;
+    const audioCount = refs.filter(ref => mediaKindForRef(ref) === 'audio').length;
+    const duration = Number(node?.duration);
+    if(duration < 3 || duration > 10) return 'Omni Flash 视频时长必须在 3 到 10 秒之间。';
+    if(audioCount) return 'Omni Flash 不支持音频参考，请移除音频后重试。';
+    if(imageCount && videoCount) return 'Omni Flash 不能同时提交图片和视频参考。';
+    if(imageCount > 1) return 'Omni Flash 图片生视频只支持一张参考图。';
+    if(videoCount > 1) return 'Omni Flash 视频编辑只支持一个参考视频。';
+    return '';
+}
 function normalizeProviderId(value){
     return String(value || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-').slice(0, 40);
 }
@@ -10261,6 +10290,14 @@ async function runVideoNode(nodeId, opts={}){
     const refs = imageRefsOnly(mediaRefs);
     const videoRefs = videoRefsOnly(mediaRefs);
     const audioRefs = audioRefsOnly(mediaRefs);
+    const omniValidationError = typeof omniFlashVideoValidationError === 'function'
+        ? omniFlashVideoValidationError({...node, model:requestProvider.model}, mediaRefs)
+        : '';
+    if(omniValidationError){
+        if(opts.cascade) throw new Error(omniValidationError);
+        alert(omniValidationError);
+        return;
+    }
     const openRouterReferenceState = openRouterVideoReferenceState(
         {...node, apiProvider:requestProvider.providerId},
         sources
