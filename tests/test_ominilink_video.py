@@ -33,7 +33,10 @@ class RecordingClient:
 
     async def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
-        return next(self.get_responses)
+        response = next(self.get_responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class ContextRecordingClient(RecordingClient):
@@ -426,6 +429,19 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
             expected,
         )
 
+    def test_video_headers_always_use_provider_bearer_key(self):
+        provider = {
+            **self.provider,
+            "protocol": "gemini",
+            "model_protocols": {"gemini-omni-flash-preview": "gemini"},
+        }
+
+        self.assertEqual(main.ominilink_video_headers(provider), {
+            "Accept": "application/json",
+            "Authorization": "Bearer test-key",
+            "Content-Type": "application/json",
+        })
+
     async def test_nested_completed_uses_opaque_id_and_saves_unique_uris_in_order(self):
         completed = FakeResponse(
             200,
@@ -603,6 +619,119 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
             "task_id": "job-1",
             "raw": completed._payload,
         })
+
+    async def test_gemini_model_override_still_uses_bearer_for_submit_and_poll(self):
+        rejected = FakeResponse(200, {"id": "job-auth", "status": "failed"}, "")
+        completed = FakeResponse(200, {
+            "id": "job-auth",
+            "status": "completed",
+            "steps": [{"content": [{
+                "type": "video", "uri": "https://cdn.example.test/auth.mp4",
+            }]}],
+        }, "")
+        provider = {
+            **self.provider,
+            "protocol": "gemini",
+            "model_protocols": {"gemini-omni-flash-preview": "gemini"},
+        }
+        submit_client = RecordingClient([rejected])
+        poll_client = RecordingClient([], [completed])
+
+        with self.assertRaises(main.HTTPException):
+            await main.generate_ominilink_video(
+                main.CanvasVideoRequest(prompt="go", model="gemini-omni-flash-preview"),
+                provider,
+                client=submit_client,
+            )
+        with patch.object(main.asyncio, "sleep", new=AsyncMock()):
+            await main.wait_for_ominilink_video_task(
+                poll_client, provider, "gemini-omni-flash-preview", "job-auth",
+            )
+
+        for _, _, kwargs in [*submit_client.calls, *poll_client.calls]:
+            self.assertEqual(kwargs["headers"]["Authorization"], "Bearer test-key")
+            self.assertNotIn("x-goog-api-key", kwargs["headers"])
+
+    async def test_poll_retries_transient_timeout_then_completes(self):
+        submitted = FakeResponse(200, {"id": "job-retry", "status": "queued"}, "")
+        completed = FakeResponse(200, {
+            "id": "job-retry",
+            "status": "completed",
+            "steps": [{"content": [{
+                "type": "video", "uri": "https://cdn.example.test/retry.mp4",
+            }]}],
+        }, "")
+        client = RecordingClient([], [main.httpx.TimeoutException("transient"), completed])
+
+        with patch.object(main.asyncio, "sleep", new=AsyncMock()):
+            result = await main.wait_for_ominilink_video_task(
+                client, self.provider, "gemini-omni-flash-preview", "job-retry",
+            )
+
+        self.assertEqual(main._ominilink_task_status(result), "COMPLETED")
+        self.assertEqual([method for method, _, _ in client.calls], ["GET", "GET"])
+
+    async def test_repeated_poll_timeouts_end_at_the_existing_deadline(self):
+        submitted = FakeResponse(200, {"id": "job-timeouts", "status": "queued"}, "")
+        client = RecordingClient(
+            [submitted],
+            [main.httpx.TimeoutException("one"), main.httpx.ReadTimeout("two")],
+        )
+        clock = [0.0]
+
+        async def advance_sleep(delay):
+            clock[0] += delay
+
+        with patch.object(main, "VIDEO_POLL_TIMEOUT", 10.0), \
+                patch.object(main, "time", SimpleNamespace(monotonic=lambda: clock[0])), \
+                patch.object(main.asyncio, "sleep", new=advance_sleep):
+            with self.assertRaises(main.HTTPException) as raised:
+                await main.generate_ominilink_video(
+                    main.CanvasVideoRequest(prompt="go", model="gemini-omni-flash-preview"),
+                    self.provider,
+                    client=client,
+                )
+
+        self.assertEqual(raised.exception.status_code, 504)
+        self.assertEqual([method for method, _, _ in client.calls], ["POST", "GET", "GET"])
+
+    async def test_poll_rate_limit_stops_without_retrying(self):
+        submitted = FakeResponse(200, {"id": "job-rate-limit", "status": "queued"}, "")
+        rate_limited = FakeResponse(429, text="private token=do-not-echo")
+        client = RecordingClient([submitted], [rate_limited])
+
+        with patch.object(main.asyncio, "sleep", new=AsyncMock()):
+            with self.assertRaises(main.HTTPException) as raised:
+                await main.generate_ominilink_video(
+                    main.CanvasVideoRequest(prompt="go", model="gemini-omni-flash-preview"),
+                    self.provider,
+                    client=client,
+                )
+
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertNotIn("private token", raised.exception.detail)
+        self.assertEqual([method for method, _, _ in client.calls], ["POST", "GET"])
+
+    def test_non_json_http_errors_map_without_echoing_response_body(self):
+        for status_code in (401, 403, 404, 405, 429):
+            with self.subTest(status_code=status_code):
+                response = FakeResponse(
+                    status_code,
+                    text="private prompt and https://signed.example.test/?token=secret",
+                )
+                with self.assertRaises(main.HTTPException) as raised:
+                    main._ominilink_response_json(response, "job-safe")
+
+                self.assertEqual(raised.exception.status_code, status_code)
+                self.assertIn(f"HTTP {status_code}", raised.exception.detail)
+                self.assertNotIn("private prompt", raised.exception.detail)
+                self.assertNotIn("signed.example.test", raised.exception.detail)
+
+    def test_malformed_success_response_remains_bad_gateway(self):
+        with self.assertRaises(main.HTTPException) as raised:
+            main._ominilink_response_json(FakeResponse(200, text="not-json"), "job-safe")
+
+        self.assertEqual(raised.exception.status_code, 502)
 
     async def test_immediate_completed_response_skips_poll(self):
         completed = FakeResponse(

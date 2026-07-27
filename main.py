@@ -1243,6 +1243,8 @@ def normalize_provider(item):
     if provider_id == "runninghub":
         protocol = "runninghub"
         base_url = base_url or RUNNINGHUB_DEFAULT_BASE_URL
+    if is_ominilink_api_url(base_url):
+        protocol = "openai"
     return {
         "id": provider_id,
         "name": name,
@@ -3889,6 +3891,8 @@ def normalize_model_protocols(value):
 
 def effective_protocol(provider, model=""):
     """返回某模型实际生效的协议：优先单模型覆盖，否则用平台全局协议。"""
+    if is_ominilink_api_url((provider or {}).get("base_url")):
+        return "openai"
     base = provider_protocol(provider)
     pid = str((provider or {}).get("id") or "").strip().lower()
     if pid in FIXED_PROTOCOL_PROVIDER_IDS:
@@ -10810,6 +10814,9 @@ class TestConnectionPayload(BaseModel):
     image_request_mode: str = "openai"
 
 def protocol_from_payload(payload):
+    base_url = str(getattr(payload, "base_url", "") or "").strip()
+    if is_ominilink_api_url(base_url):
+        return "openai"
     provider_id = str(getattr(payload, "provider_id", "") or "").strip().lower()
     if provider_id == "volcengine":
         return "volcengine"
@@ -10817,7 +10824,7 @@ def protocol_from_payload(payload):
         return "runninghub"
     if provider_id == "jimeng":
         return "jimeng"
-    base_url = str(getattr(payload, "base_url", "") or "").strip().lower()
+    base_url = base_url.lower()
     if "runninghub.cn" in base_url or "runninghub.ai" in base_url:
         return "runninghub"
     protocol = str(getattr(payload, "protocol", "") or "openai").strip().lower()
@@ -11098,6 +11105,9 @@ def merge_ominilink_model_catalog(base_url, grouped, ids):
     merged = {kind: sorted(set(grouped.get(kind) or [])) for kind in ("image", "chat", "video")}
     merged["video"] = sorted(set([*merged["video"], *OMINILINK_VIDEO_MODELS]))
     merged["chat"] = sorted(set([*merged["chat"], "gemini-omni-flash-preview"]))
+    video_only = set(OMINILINK_VIDEO_MODELS) - {"gemini-omni-flash-preview"}
+    for kind in ("image", "chat"):
+        merged[kind] = [model for model in merged[kind] if model not in video_only]
     return merged, merged_ids
 
 
@@ -11184,7 +11194,7 @@ async def test_provider_connection(payload: TestConnectionPayload):
                     if detected:
                         message = f"{probe.get('message') or '方舟任务接口可达'}；但 /api/v3/models 不可用。请按实际方舟控制台模型名称手动填写视频模型。"
                         return volcengine_default_model_payload(status=probe.get("status") or resp.status_code, message=message, raw={"models_error": resp.text[:300], **(probe.get("raw") or {})})
-                elif protocol == "openai":
+                elif protocol == "openai" and not is_ominilink_api_url(base_url):
                     detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
                     if detected:
                         message = f"{probe.get('message') or '检测到方舟/Ark 兼容入口'}；OpenAI /v1/models 不可用，已自动切换为方舟协议。请按实际方舟控制台模型名称手动填写视频模型。"
@@ -11360,6 +11370,8 @@ async def probe_async_endpoint(payload: TestConnectionPayload):
 async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str = "openai", image_request_mode: str = "openai"):
     """从上游模型列表端点拉取模型，并按名称做轻量分类。"""
     protocol = protocol if protocol in SUPPORTED_PROVIDER_PROTOCOLS else "openai"
+    if is_ominilink_api_url(base_url):
+        protocol = "openai"
     if protocol == "jimeng":
         return {
             "total": len(JIMENG_DEFAULT_IMAGE_MODELS) + len(JIMENG_DEFAULT_VIDEO_MODELS),
@@ -11416,7 +11428,7 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
                             "message": payload["message"],
                             "raw": payload["raw"],
                         }
-                elif protocol == "openai":
+                elif protocol == "openai" and not is_ominilink_api_url(base_url):
                     detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
                     if detected:
                         payload = volcengine_default_model_payload(
@@ -11909,6 +11921,24 @@ def video_api_root(provider):
 def ominilink_video_api_root(provider: dict) -> str:
     return str(provider.get("video_base_url") or video_api_root(provider) or "").rstrip("/")
 
+
+def ominilink_video_headers(provider: dict, json_body=True) -> dict:
+    provider_id = str((provider or {}).get("id") or "").strip().lower()
+    provider_name = str((provider or {}).get("name") or provider_id).strip() or provider_id
+    api_key = provider_env_key_value(provider_id)
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail=f"未配置 {provider_name} 的 API Key，请在 API 平台管理中填写。",
+        )
+    headers = {
+        "Accept": "application/json",
+        "Authorization": bearer_auth_value(api_key),
+    }
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
+
 def ominilink_video_output_urls(raw: dict) -> list[str]:
     urls = []
     task_data = (
@@ -12162,6 +12192,18 @@ def _ominilink_response_json(response, task_id="") -> dict:
     try:
         raw = response.json()
     except Exception as exc:
+        if status_code in {401, 403, 404, 405, 429}:
+            detail = {
+                401: "OminiLink 视频接口认证失败",
+                403: "OminiLink 视频接口拒绝访问",
+                404: "OminiLink 视频接口不存在",
+                405: "OminiLink 视频接口不支持该请求方法",
+                429: "OminiLink 视频接口请求过于频繁，请稍后重试",
+            }[status_code]
+            raise HTTPException(
+                status_code=status_code,
+                detail=f"{detail}（HTTP {status_code}）",
+            ) from exc
         if looks_like_html_response(response_text):
             detail = f"OminiLink 视频接口返回网页而不是 JSON（HTTP {status_code}）"
         else:
@@ -12321,6 +12363,7 @@ async def wait_for_ominilink_video_task(client, provider, model, task_id) -> dic
     deadline = time.monotonic() + VIDEO_POLL_TIMEOUT
     delay = max(2.0, IMAGE_POLL_INTERVAL)
     last_status = ""
+    headers = ominilink_video_headers(provider)
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -12339,18 +12382,36 @@ async def wait_for_ominilink_video_task(client, provider, model, task_id) -> dic
             request = (
                 client.get(
                     query_url,
-                    headers=api_headers(provider=provider, model=model),
+                    headers=headers,
                 )
                 if model == "gemini-omni-flash-preview"
                 else client.post(
                     query_url,
-                    headers=api_headers(provider=provider, model=model),
+                    headers=headers,
                     json={},
                 )
             )
             response = await asyncio.wait_for(request, timeout=remaining)
         except asyncio.TimeoutError as exc:
             raise _ominilink_timeout_error(task_id, last_status) from exc
+        except asyncio.CancelledError:
+            raise
+        except (httpx.TimeoutException, httpx.TransportError):
+            if time.monotonic() >= deadline:
+                raise _ominilink_timeout_error(task_id, last_status)
+            delay = min(delay * 1.6, 12)
+            continue
+        except httpx.HTTPStatusError as exc:
+            status_code = int(getattr(exc.response, "status_code", 502) or 502)
+            raise HTTPException(
+                status_code=status_code if 400 <= status_code <= 599 else 502,
+                detail=f"OminiLink 视频接口请求失败（HTTP {status_code}）",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="请求 OminiLink 视频接口失败，请稍后重试。",
+            ) from exc
         if time.monotonic() >= deadline:
             raise _ominilink_timeout_error(task_id, last_status)
         raw = _ominilink_response_json(response, task_id)
@@ -12406,7 +12467,7 @@ async def generate_ominilink_video(payload, provider, client=None) -> dict:
         try:
             response = await active_client.post(
                 submit_url,
-                headers=api_headers(provider=provider, model=model),
+                headers=ominilink_video_headers(provider),
                 json=body,
             )
             raw = _ominilink_response_json(response)

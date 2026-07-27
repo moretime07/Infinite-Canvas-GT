@@ -77,6 +77,19 @@ class OminiLinkProviderTests(unittest.TestCase):
         })
         self.assertEqual(provider["video_base_url"], "https://video-proxy.example.test/v1")
 
+    def test_exact_host_forces_openai_protocol_over_legacy_ark_setting(self):
+        provider = main.normalize_provider({
+            "id": "orange",
+            "base_url": "https://api.ominilink.ai/v1",
+            "protocol": "volcengine",
+        })
+
+        self.assertEqual(provider["protocol"], "openai")
+        payload = main.TestConnectionPayload(
+            base_url="https://api.ominilink.ai/v1", protocol="volcengine",
+        )
+        self.assertEqual(main.protocol_from_payload(payload), "openai")
+
 
 class OminiLinkDiscoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_ark_404_is_not_route_success(self):
@@ -120,6 +133,17 @@ class OminiLinkDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("gemini-omni-flash-preview", grouped["chat"])
         self.assertIn("gemini-omni-flash-preview", grouped["video"])
         self.assertEqual(ids, sorted(set(ids)))
+
+    def test_catalog_keeps_video_only_models_out_of_chat_and_image(self):
+        grouped, _ = main.merge_ominilink_model_catalog(
+            "https://api.aig-ai.com/v1",
+            {"image": ["viduq3-pro"], "chat": ["viduq3-pro"], "video": []},
+            ["viduq3-pro"],
+        )
+
+        self.assertNotIn("viduq3-pro", grouped["image"])
+        self.assertNotIn("viduq3-pro", grouped["chat"])
+        self.assertIn("viduq3-pro", grouped["video"])
 
     def test_catalog_leaves_non_ominilink_hosts_unchanged(self):
         grouped = {"image": [], "chat": ["upstream-chat"], "video": []}
@@ -303,3 +327,32 @@ class OminiLinkDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                     "https://api.aig-ai.com/v1", "secret", "openai"
                 )
         self.assertEqual(raised.exception.status_code, 401)
+
+    async def test_legacy_ark_protocol_uses_openai_models_route_without_ark_probe(self):
+        client = FakeClient([
+            FakeResponse(200, {"data": [{"id": "upstream-chat"}]}, '{"data":[{"id":"upstream-chat"}]}'),
+        ])
+
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            result = await main.fetch_models_from_upstream(
+                "https://api.aig-ai.com/v1", "redacted-key", "volcengine"
+            )
+
+        self.assertTrue(result["connection_verified"])
+        self.assertEqual([(method, url) for method, url, _ in client.calls], [
+            ("GET", "https://api.aig-ai.com/v1/models"),
+        ])
+
+    async def test_rate_limit_is_not_reclassified_as_successful_ark_detection(self):
+        client = FakeClient([
+            FakeResponse(429, {"error": "rate limited"}, '{"error":"rate limited"}'),
+        ])
+
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            with self.assertRaises(main.HTTPException) as raised:
+                await main.fetch_models_from_upstream(
+                    "https://api.aig-ai.com/v1", "redacted-key", "volcengine"
+                )
+
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertEqual(len(client.calls), 1)
