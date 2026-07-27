@@ -11907,6 +11907,34 @@ def video_api_root(provider):
 def ominilink_video_api_root(provider: dict) -> str:
     return str(provider.get("video_base_url") or video_api_root(provider) or "").rstrip("/")
 
+def ominilink_video_output_urls(raw: dict) -> list[str]:
+    urls = []
+    steps = raw.get("steps") if isinstance(raw, dict) else None
+    if not isinstance(steps, list):
+        return urls
+    for step in steps:
+        content = step.get("content") if isinstance(step, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "video":
+                continue
+            uri = item.get("uri")
+            if isinstance(uri, str) and uri.startswith(("http://", "https://")) and uri not in urls:
+                urls.append(uri)
+    return urls
+
+def ominilink_video_size(aspect_ratio: str, resolution: str = "") -> str:
+    return {
+        "16:9": "1280x720",
+        "9:16": "720x1280",
+        "1:1": "720x720",
+        "4:3": "960x720",
+        "3:4": "720x960",
+        "21:9": "1680x720",
+        "9:21": "720x1680",
+    }.get(str(aspect_ratio or "").strip(), "1280x720")
+
 def split_data_url(value: str) -> tuple[str, str]:
     match = re.fullmatch(r"data:([^;,]+);base64,(.+)", str(value or ""), re.S)
     if not match:
@@ -12120,6 +12148,210 @@ def humanize_video_task_failure(reason) -> str:
             "请调整提示词/参考图后重试，避免涉及真人、暴力、敏感或受限内容。"
         )
     return f"视频生成任务失败：{text}"
+
+def _ominilink_response_json(response, task_id="") -> dict:
+    response_text = str(getattr(response, "text", "") or "")
+    try:
+        raw = response.json()
+    except Exception as exc:
+        if looks_like_html_response(response_text):
+            detail = (
+                f"OminiLink 视频接口返回网页而不是 JSON"
+                f"（HTTP {getattr(response, 'status_code', 0)}）：{response_text[:500]}"
+            )
+        else:
+            detail = (
+                f"OminiLink 视频接口返回非 JSON 响应"
+                f"（HTTP {getattr(response, 'status_code', 0)}）：{response_text[:500]}"
+            )
+        raise HTTPException(status_code=502, detail=detail) from exc
+    if not isinstance(raw, dict):
+        raise HTTPException(
+            status_code=502,
+            detail=f"OminiLink 视频接口返回了无效 JSON：{task_id or raw}",
+        )
+    status_code = int(getattr(response, "status_code", 200) or 200)
+    if status_code >= 400:
+        message, _ = video_response_error(raw)
+        reason = message or raw.get("message") or raw.get("detail") or response_text or raw
+        raise HTTPException(
+            status_code=status_code,
+            detail=humanize_video_task_failure(reason),
+        )
+    raise_for_video_response_error(raw)
+    return raw
+
+def _ominilink_task_data(raw):
+    data = raw.get("data") if isinstance(raw, dict) else None
+    return data if isinstance(data, dict) else raw
+
+def _ominilink_task_status(raw) -> str:
+    task_data = _ominilink_task_data(raw)
+    if not isinstance(task_data, dict):
+        return ""
+    return str(
+        task_data.get("status")
+        or task_data.get("task_status")
+        or raw.get("status")
+        or raw.get("task_status")
+        or ""
+    ).upper()
+
+def _ominilink_result_urls(raw, model):
+    if model == "gemini-omni-flash-preview":
+        return ominilink_video_output_urls(raw)
+    return video_output_urls(raw)
+
+def _ominilink_failure_reason(raw):
+    task_data = _ominilink_task_data(raw)
+    if not isinstance(task_data, dict):
+        return str(raw)
+    error = task_data.get("error") if isinstance(task_data.get("error"), dict) else {}
+    return (
+        task_data.get("fail_reason")
+        or task_data.get("message")
+        or error.get("message")
+        or raw.get("error")
+        or raw.get("message")
+        or str(raw)
+    )
+
+async def wait_for_ominilink_video_task(client, provider, model, task_id) -> dict:
+    api_root = ominilink_video_api_root(provider)
+    if not api_root:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{provider.get('name') or provider['id']} 未配置视频 Base URL",
+        )
+    model = selected_model(model, "gemini-omni-flash-preview")
+    task_id = str(task_id or "").strip()
+    query_url = (
+        f"{api_root}/query/"
+        f"{urllib.parse.quote(model, safe='')}/{urllib.parse.quote(task_id, safe='')}"
+    )
+    deadline = time.monotonic() + VIDEO_POLL_TIMEOUT
+    delay = max(2.0, IMAGE_POLL_INTERVAL)
+    last_payload = {}
+    while time.monotonic() < deadline:
+        await asyncio.sleep(delay)
+        response = (
+            await client.get(
+                query_url,
+                headers=api_headers(provider=provider, model=model),
+            )
+            if model == "gemini-omni-flash-preview"
+            else await client.post(
+                query_url,
+                headers=api_headers(provider=provider, model=model),
+                json={},
+            )
+        )
+        raw = _ominilink_response_json(response, task_id)
+        last_payload = raw
+        status = _ominilink_task_status(raw)
+        urls = _ominilink_result_urls(raw, model)
+        if status in VIDEO_TASK_SUCCESS_STATUSES:
+            if urls:
+                return raw
+            raise HTTPException(
+                status_code=502,
+                detail=f"OminiLink 视频任务 {task_id} 已完成但没有返回视频 URI",
+            )
+        if status in VIDEO_TASK_FAILURE_STATUSES:
+            raise HTTPException(
+                status_code=502,
+                detail=humanize_video_task_failure(_ominilink_failure_reason(raw)),
+            )
+        if urls:
+            return raw
+        delay = min(delay * 1.6, 12)
+    raise HTTPException(
+        status_code=504,
+        detail=f"OminiLink 视频生成任务超时：{last_payload or task_id}",
+    )
+
+async def generate_ominilink_video(payload, provider, client=None) -> dict:
+    api_root = ominilink_video_api_root(provider)
+    if not api_root:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{provider.get('name') or provider['id']} 未配置视频 Base URL",
+        )
+    model = selected_model(payload.model, "gemini-omni-flash-preview")
+    is_omni = model == "gemini-omni-flash-preview"
+    if not is_omni and (payload.images or payload.videos or payload.audios):
+        raise HTTPException(
+            status_code=400,
+            detail="OminiLink 非 Omni Flash 视频模型不支持参考素材。",
+        )
+    body = (
+        await build_ominilink_omni_request(payload)
+        if is_omni
+        else {
+            "prompt": payload.prompt,
+            "size": ominilink_video_size(payload.aspect_ratio, payload.resolution),
+            "seconds": str(payload.duration),
+        }
+    )
+    submit_url = f"{api_root}/{urllib.parse.quote(model, safe='')}"
+
+    async def execute(active_client):
+        try:
+            response = await active_client.post(
+                submit_url,
+                headers=api_headers(provider=provider, model=model),
+                json=body,
+            )
+            raw = _ominilink_response_json(response)
+            task_id = str(
+                extract_task_id(raw)
+                or raw.get("task_id")
+                or raw.get("id")
+                or ""
+            ).strip()
+            status = _ominilink_task_status(raw)
+            urls = _ominilink_result_urls(raw, model)
+            if status in VIDEO_TASK_FAILURE_STATUSES:
+                raise HTTPException(
+                    status_code=502,
+                    detail=humanize_video_task_failure(_ominilink_failure_reason(raw)),
+                )
+            if status in VIDEO_TASK_SUCCESS_STATUSES and not urls:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"OminiLink 视频任务 {task_id or '(unknown)'} 已完成但没有返回视频 URI",
+                )
+            result = raw
+            if not urls:
+                if not task_id:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"OminiLink 视频接口没有返回任务 ID 或视频 URI：{raw}",
+                    )
+                result = await wait_for_ominilink_video_task(
+                    active_client, provider, model, task_id,
+                )
+                urls = _ominilink_result_urls(result, model)
+            if not urls:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"OminiLink 视频任务 {task_id or '(unknown)'} 已完成但没有返回视频 URI",
+                )
+            local_urls = [
+                await save_remote_video_to_output(url)
+                for url in urls
+            ]
+            return {"videos": local_urls, "task_id": task_id, "raw": result}
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"请求 OminiLink 视频接口失败：{exc}",
+            ) from exc
+
+    if client is not None:
+        return await execute(client)
+    async with httpx.AsyncClient(timeout=VIDEO_POLL_TIMEOUT) as owned_client:
+        return await execute(owned_client)
 
 async def wait_for_video_task(client, provider, task_id, submit_url=""):
     base_url = video_api_root(provider)
@@ -12524,6 +12756,8 @@ async def canvas_video(payload: CanvasVideoRequest):
         except httpx.HTTPError as exc:
             log_net_error(f"视频(RunningHub) 网络/TLS错误 model={payload.model}", exc)
             raise HTTPException(status_code=502, detail=f"请求 RunningHub 视频接口失败：{exc}") from exc
+    if is_ominilink_api_url(provider.get("base_url")) or is_ominilink_api_url(provider.get("video_base_url")):
+        return await generate_ominilink_video(payload, provider)
     base_url = video_api_root(provider)
     if not base_url:
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider['id']} 未配置 Base URL")
