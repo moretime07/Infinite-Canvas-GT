@@ -142,6 +142,28 @@ class OminiLinkDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["connection_verified"])
         self.assertEqual(len(client.calls), 1)
 
+    async def test_fetch_models_405_uses_unverified_catalog_with_total(self):
+        client = FakeClient([
+            FakeResponse(405, {"error": "method not allowed"}, '{"error":"method not allowed"}'),
+        ])
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            result = await main.fetch_models_from_upstream(
+                "https://api.aig-ai.com/v1", "secret", "openai"
+            )
+        self.assertTrue(result["catalog_fallback"])
+        self.assertFalse(result["connection_verified"])
+        self.assertEqual(result["total"], 19)
+
+    async def test_fetch_models_html_uses_unverified_catalog(self):
+        client = FakeClient([FakeResponse(200, text="<html>login</html>")])
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            result = await main.fetch_models_from_upstream(
+                "https://api.aig-ai.com/v1", "secret", "openai"
+            )
+        self.assertTrue(result["catalog_fallback"])
+        self.assertFalse(result["connection_verified"])
+        self.assertEqual(result["total"], 19)
+
     async def test_fetch_models_timeout_uses_unverified_catalog(self):
         client = FakeClient([main.httpx.TimeoutException("timeout")])
         with patch.object(main.httpx, "AsyncClient", return_value=client):
@@ -164,6 +186,112 @@ class OminiLinkDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["catalog_fallback"])
         self.assertFalse(result["connection_verified"])
         self.assertIn("未验证当前 API Key 的实际模型权限", result["message"])
+
+    async def test_connection_405_uses_unverified_catalog(self):
+        client = FakeClient([
+            FakeResponse(405, {"error": "method not allowed"}, '{"error":"method not allowed"}'),
+        ])
+        payload = main.TestConnectionPayload(
+            base_url="https://api.aig-ai.com/v1", api_key="secret", protocol="openai"
+        )
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            result = await main.test_provider_connection(payload)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["catalog_fallback"])
+        self.assertFalse(result["connection_verified"])
+
+    async def test_connection_html_uses_unverified_catalog(self):
+        client = FakeClient([FakeResponse(200, text="<html>login</html>")])
+        payload = main.TestConnectionPayload(
+            base_url="https://api.aig-ai.com/v1", api_key="secret", protocol="openai"
+        )
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            result = await main.test_provider_connection(payload)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["catalog_fallback"])
+        self.assertFalse(result["connection_verified"])
+
+    async def test_connection_timeout_uses_unverified_catalog(self):
+        client = FakeClient([main.httpx.TimeoutException("timeout")])
+        payload = main.TestConnectionPayload(
+            base_url="https://api.aig-ai.com/v1", api_key="secret", protocol="openai"
+        )
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            result = await main.test_provider_connection(payload)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["catalog_fallback"])
+        self.assertFalse(result["connection_verified"])
+
+    async def test_html_auth_failures_never_use_catalog_fallback(self):
+        for status_code in (401, 403):
+            with self.subTest(entry="connection", status_code=status_code):
+                client = FakeClient([FakeResponse(status_code, text="<html>login</html>")])
+                payload = main.TestConnectionPayload(
+                    base_url="https://api.aig-ai.com/v1", api_key="secret", protocol="openai"
+                )
+                with patch.object(main.httpx, "AsyncClient", return_value=client):
+                    result = await main.test_provider_connection(payload)
+                self.assertFalse(result["ok"])
+                self.assertFalse(result.get("catalog_fallback", False))
+                self.assertFalse(result.get("connection_verified", False))
+                self.assertEqual(result["status"], status_code)
+
+            with self.subTest(entry="fetch", status_code=status_code):
+                client = FakeClient([FakeResponse(status_code, text="<html>login</html>")])
+                with patch.object(main.httpx, "AsyncClient", return_value=client):
+                    with self.assertRaises(main.HTTPException) as raised:
+                        await main.fetch_models_from_upstream(
+                            "https://api.aig-ai.com/v1", "secret", "openai"
+                        )
+                self.assertEqual(raised.exception.status_code, status_code)
+
+    async def test_successful_model_lists_merge_catalog_in_both_entries(self):
+        model_list = {"data": [{"id": "upstream-chat"}]}
+        fetch_client = FakeClient([FakeResponse(200, model_list, '{"data":[{"id":"upstream-chat"}]}')])
+        with patch.object(main.httpx, "AsyncClient", return_value=fetch_client):
+            fetched = await main.fetch_models_from_upstream(
+                "https://api.aig-ai.com/v1", "secret", "openai"
+            )
+        self.assertIn("gemini-omni-flash-preview", fetched["chat_models"])
+        self.assertIn("gemini-omni-flash-preview", fetched["video_models"])
+        self.assertFalse(fetched["catalog_fallback"])
+        self.assertTrue(fetched["connection_verified"])
+
+        connection_client = FakeClient([FakeResponse(200, model_list, '{"data":[{"id":"upstream-chat"}]}')])
+        payload = main.TestConnectionPayload(
+            base_url="https://api.aig-ai.com/v1", api_key="secret", protocol="openai"
+        )
+        with patch.object(main.httpx, "AsyncClient", return_value=connection_client):
+            connected = await main.test_provider_connection(payload)
+        self.assertIn("gemini-omni-flash-preview", connected["chat_models"])
+        self.assertIn("gemini-omni-flash-preview", connected["video_models"])
+        self.assertFalse(connected["catalog_fallback"])
+        self.assertTrue(connected["connection_verified"])
+
+    async def test_unknown_and_lookalike_hosts_fail_in_both_entries(self):
+        for base_url in ("https://api.example.test/v1", "https://aig-ai.com.evil.test/v1"):
+            with self.subTest(entry="connection", base_url=base_url):
+                client = FakeClient([
+                    FakeResponse(404, {"error": "not found"}, '{"error":"not found"}'),
+                    FakeResponse(404, {"error": "not found"}, '{"error":"not found"}'),
+                    FakeResponse(404, {"error": "not found"}, '{"error":"not found"}'),
+                ])
+                payload = main.TestConnectionPayload(base_url=base_url, api_key="secret", protocol="openai")
+                with patch.object(main.httpx, "AsyncClient", return_value=client):
+                    result = await main.test_provider_connection(payload)
+                self.assertFalse(result["ok"])
+                self.assertFalse(result.get("catalog_fallback", False))
+
+            with self.subTest(entry="fetch", base_url=base_url):
+                client = FakeClient([
+                    FakeResponse(404, {"error": "not found"}, '{"error":"not found"}'),
+                    FakeResponse(404, {"error": "not found"}, '{"error":"not found"}'),
+                    FakeResponse(404, {"error": "not found"}, '{"error":"not found"}'),
+                ])
+                with patch.object(main.httpx, "AsyncClient", return_value=client):
+                    with self.assertRaises(main.HTTPException) as raised:
+                        await main.fetch_models_from_upstream(base_url, "secret", "openai")
+                self.assertEqual(raised.exception.status_code, 404)
 
     async def test_fetch_models_401_never_uses_catalog_fallback(self):
         client = FakeClient([

@@ -11096,6 +11096,7 @@ def ominilink_catalog_fallback_payload(base_url, status=0, raw=None):
     return {
         "status": status,
         "message": "已加载官方目录兜底，但未验证当前 API Key 的实际模型权限。",
+        "total": len(ids),
         "model_count": len(ids),
         "image_models": grouped["image"],
         "chat_models": grouped["chat"],
@@ -11156,6 +11157,8 @@ async def test_provider_connection(payload: TestConnectionPayload):
                 suffix = f"：{location}" if location else ""
                 endpoint_label = "/v1beta/models" if protocol == "gemini" else "/api/v3/models" if protocol == "volcengine" else "/openapi/v2/models" if protocol == "runninghub" else "/v1/models"
                 return {"ok": False, "status": resp.status_code, "message": f"上游 {endpoint_label} 发生跳转{suffix}，请填写 API Base URL，不要填写网页登录地址"}
+            if resp.status_code in (401, 403):
+                return {"ok": False, "status": resp.status_code, "message": resp.text[:300], "catalog_fallback": False, "connection_verified": False}
             if looks_like_html_response(resp.text):
                 if is_ominilink_api_url(base_url):
                     fallback = ominilink_catalog_fallback_payload(base_url, resp.status_code, {"models_error": resp.text[:300]})
@@ -11166,8 +11169,6 @@ async def test_provider_connection(payload: TestConnectionPayload):
                 if is_ominilink_api_url(base_url) and resp.status_code in {404, 405}:
                     fallback = ominilink_catalog_fallback_payload(base_url, resp.status_code, {"models_error": resp.text[:300]})
                     return {"ok": True, **fallback, "image_request_mode": normalize_image_request_mode(getattr(payload, "image_request_mode", ""))}
-                if resp.status_code in (401, 403):
-                    return {"ok": False, "status": resp.status_code, "message": resp.text[:300]}
                 if protocol == "volcengine":
                     detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
                     if detected:
@@ -11378,13 +11379,13 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
                 location = resp.headers.get("Location") or resp.headers.get("location") or ""
                 suffix = f"：{location}" if location else ""
                 raise HTTPException(status_code=400, detail=f"上游 {endpoint_label} 发生跳转{suffix}，请填写 API Base URL，不要填写网页登录地址")
+            if resp.status_code in (401, 403):
+                raise HTTPException(status_code=resp.status_code, detail=f"上游 {endpoint_label} 失败：{resp.text[:300]}")
             if looks_like_html_response(resp.text):
                 if is_ominilink_api_url(base_url):
                     return ominilink_catalog_fallback_payload(base_url, resp.status_code, {"models_error": resp.text[:300]})
                 raise HTTPException(status_code=400, detail=f"上游 {endpoint_label} 返回网页 HTML，请检查请求地址是否为 API Base URL")
             if resp.status_code >= 400:
-                if resp.status_code in (401, 403):
-                    raise HTTPException(status_code=resp.status_code, detail=f"上游 {endpoint_label} 失败：{resp.text[:300]}")
                 if is_ominilink_api_url(base_url) and resp.status_code in {404, 405}:
                     return ominilink_catalog_fallback_payload(base_url, resp.status_code, {"models_error": resp.text[:300]})
                 if protocol == "volcengine":
