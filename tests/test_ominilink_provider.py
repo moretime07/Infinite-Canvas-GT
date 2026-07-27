@@ -187,6 +187,135 @@ class OminiLinkProviderEndpointTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(saved[0]["protocol"], "openai")
                 self.assertEqual(result["providers"][0]["protocol"], "openai")
 
+    async def test_get_fetch_models_legacy_ids_use_ominilink_url_and_standard_key(self):
+        cases = (
+            {
+                "id": "runninghub",
+                "name": "Legacy RunningHub",
+                "base_url": "https://api.runninghub.cn",
+                "video_base_url": "https://vg-api.ominilink.ai/v1",
+                "protocol": "runninghub",
+                "image_request_mode": "openai",
+                "expected_url": "https://api.ominilink.ai/v1",
+            },
+            {
+                "id": "volcengine",
+                "name": "Legacy Volcengine",
+                "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+                "video_base_url": "https://vg-api.aig-ai.com/v1",
+                "protocol": "volcengine",
+                "image_request_mode": "openai",
+                "expected_url": "https://api.aig-ai.com/v1",
+            },
+        )
+        for provider in cases:
+            with self.subTest(provider_id=provider["id"]):
+                captured = []
+
+                async def fake_fetch(base_url, api_key, protocol, image_request_mode):
+                    captured.append((base_url, api_key, protocol, image_request_mode))
+                    return {"source": "model-fetch-sentinel"}
+
+                def fake_getenv(name, default=""):
+                    if name == main.runninghub_wallet_key_env():
+                        return "wallet-key-sentinel"
+                    if name == main.provider_key_env(provider["id"]):
+                        return "standard-key-sentinel"
+                    return default
+
+                with patch.object(main, "get_api_provider_exact", return_value=provider), patch.object(
+                    main, "provider_env_key_value", return_value="standard-key-sentinel"
+                ), patch.object(main.os, "getenv", side_effect=fake_getenv), patch.object(
+                    main, "fetch_models_from_upstream", side_effect=fake_fetch
+                ):
+                    result = await main.fetch_upstream_models(provider["id"])
+
+                self.assertEqual(result, {"source": "model-fetch-sentinel"})
+                self.assertEqual(
+                    captured,
+                    [
+                        (
+                            provider["expected_url"],
+                            "standard-key-sentinel",
+                            "openai",
+                            "openai",
+                        )
+                    ],
+                )
+
+    async def test_get_fetch_models_rejects_wallet_only_ominilink_runninghub(self):
+        provider = {
+            "id": "runninghub",
+            "name": "Legacy RunningHub",
+            "base_url": "https://api.runninghub.cn",
+            "video_base_url": "https://vg-api.ominilink.ai/v1",
+            "protocol": "runninghub",
+            "image_request_mode": "openai",
+        }
+        captured = []
+
+        async def fake_fetch(*args):
+            captured.append(args)
+            return {"source": "unexpected"}
+
+        def fake_getenv(name, default=""):
+            if name == main.runninghub_wallet_key_env():
+                return "wallet-only-sentinel"
+            return default
+
+        with patch.object(main, "get_api_provider_exact", return_value=provider), patch.object(
+            main, "provider_env_key_value", return_value=""
+        ), patch.object(main.os, "getenv", side_effect=fake_getenv), patch.object(
+            main, "fetch_models_from_upstream", side_effect=fake_fetch
+        ):
+            with self.assertRaises(main.HTTPException) as raised:
+                await main.fetch_upstream_models("runninghub")
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(captured, [])
+
+    async def test_get_fetch_models_true_runninghub_keeps_wallet_transport(self):
+        provider = {
+            "id": "runninghub",
+            "name": "RunningHub",
+            "base_url": "https://api.runninghub.cn",
+            "video_base_url": "",
+            "protocol": "runninghub",
+            "image_request_mode": "openai",
+        }
+        captured = []
+
+        async def fake_fetch(base_url, api_key, protocol, image_request_mode):
+            captured.append((base_url, api_key, protocol, image_request_mode))
+            return {"source": "runninghub-sentinel"}
+
+        def fake_getenv(name, default=""):
+            if name == main.runninghub_wallet_key_env():
+                return "wallet-key-sentinel"
+            if name == main.provider_key_env("runninghub"):
+                return "standard-key-sentinel"
+            return default
+
+        with patch.object(main, "get_api_provider_exact", return_value=provider), patch.object(
+            main, "provider_env_key_value", return_value="standard-key-sentinel"
+        ), patch.object(main.os, "getenv", side_effect=fake_getenv), patch.object(
+            main, "fetch_models_from_upstream", side_effect=fake_fetch
+        ):
+            result = await main.fetch_upstream_models("runninghub")
+
+        self.assertEqual(result, {"source": "runninghub-sentinel"})
+        self.assertEqual(
+            captured,
+            [
+                (
+                    "https://api.runninghub.cn",
+                    "wallet-key-sentinel",
+                    "runninghub",
+                    "openai",
+                )
+            ],
+        )
+
 
 class OminiLinkDiscoveryTests(unittest.IsolatedAsyncioTestCase):
     def test_probe_payload_retains_video_base_url(self):

@@ -676,7 +676,7 @@ def provider_has_primary_credential(provider: dict, credential_overrides: dict |
     standard_key = str(
         overrides[provider_id] if provider_id in overrides else provider_env_key_value(provider_id) or ""
     ).strip()
-    if provider_id == "runninghub":
+    if provider_id == "runninghub" and not is_ominilink_provider_config(provider):
         wallet_key = str(
             overrides["runninghub_wallet"]
             if "runninghub_wallet" in overrides
@@ -11710,12 +11710,19 @@ async def fetch_upstream_models_from_payload(payload: TestConnectionPayload):
 async def fetch_upstream_models(provider_id: str):
     """从已保存的上游 OpenAI 兼容接口拉取 /v1/models 列表，按名称智能分类为 image/chat/video。"""
     provider = get_api_provider_exact(provider_id)
-    api_key = os.getenv(runninghub_wallet_key_env(), "") if provider["id"] == "runninghub" else ""
-    if not api_key:
-        api_key = os.getenv(provider_key_env(provider["id"]), "")
+    if is_ominilink_provider_config(provider):
+        base_url = ominilink_chat_api_url(provider)
+        api_key = provider_env_key_value(provider["id"])
+        protocol = "openai"
+    else:
+        base_url = provider.get("base_url") or ""
+        api_key = os.getenv(runninghub_wallet_key_env(), "") if provider["id"] == "runninghub" else ""
+        if not api_key:
+            api_key = os.getenv(provider_key_env(provider["id"]), "")
+        protocol = provider_protocol(provider)
     if not api_key:
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider_id} 未配置 API Key")
-    return await fetch_models_from_upstream(provider.get("base_url") or "", api_key, provider_protocol(provider), provider.get("image_request_mode") or "openai")
+    return await fetch_models_from_upstream(base_url, api_key, protocol, provider.get("image_request_mode") or "openai")
 
 async def build_online_image_result(payload: OnlineImageRequest):
     provider = get_api_provider(payload.provider_id)

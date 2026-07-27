@@ -86,6 +86,26 @@ class PrimaryProviderTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertFalse(main.provider_has_primary_credential(item))
 
+    def test_ominilink_runninghub_requires_standard_key_for_base_or_video_authority(self):
+        cases = (
+            provider("runninghub", base_url="https://api.ominilink.ai/v1"),
+            provider(
+                "runninghub",
+                base_url="https://api.runninghub.cn",
+                video_base_url="https://vg-api.aig-ai.com/v1",
+            ),
+        )
+        for item in cases:
+            with self.subTest(base_url=item["base_url"], video_base_url=item.get("video_base_url")):
+                with patch.object(main, "provider_env_key_value", return_value=""), patch.object(
+                    main, "runninghub_wallet_key_value", return_value="wallet-only-sentinel"
+                ):
+                    self.assertFalse(main.provider_has_primary_credential(item))
+                with patch.object(
+                    main, "provider_env_key_value", return_value="standard-key-sentinel"
+                ), patch.object(main, "runninghub_wallet_key_value", return_value=""):
+                    self.assertTrue(main.provider_has_primary_credential(item))
+
     def test_transition_rejects_removing_or_disabling_current_primary(self):
         current = [provider("current", primary=True), provider("other")]
         for proposed in (
