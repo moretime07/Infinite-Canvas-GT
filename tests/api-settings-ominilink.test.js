@@ -30,7 +30,7 @@ function clone(value){
 async function createState(providerRows){
     const calls = [];
     const elements = new Map();
-    const initialRows = clone(providerRows);
+    let persistedRows = clone(providerRows);
     const document = {
         body:fakeElement(),
         getElementById(id){
@@ -41,12 +41,22 @@ async function createState(providerRows){
         querySelectorAll(){return [];},
         addEventListener(){}
     };
-    document.getElementById('keyInput').value = 'secret-value';
     const window = {addEventListener(){},parent:{postMessage(){}},top:{postMessage(){}},location:{href:''}};
     const fetch = async (url, options={}) => {
         calls.push({url, options});
-        if(url === '/api/providers' && options.method === 'PUT') return {ok:true,json:async()=>({providers:clone(initialRows)})};
-        if(url === '/api/providers') return {ok:true,json:async()=>({providers:clone(initialRows)})};
+        if(url === '/api/providers' && options.method === 'PUT'){
+            const priorById = new Map(persistedRows.map(row => [row.id, row]));
+            persistedRows = JSON.parse(options.body).map(row => {
+                const prior = priorById.get(row.id) || {};
+                return {
+                    ...row,
+                    has_key:prior.has_key === true,
+                    key_preview:prior.key_preview || ''
+                };
+            });
+            return {ok:true,json:async()=>({providers:clone(persistedRows)})};
+        }
+        if(url === '/api/providers') return {ok:true,json:async()=>({providers:clone(persistedRows)})};
         if(url === '/api/providers/test-connection' || url === '/api/providers/fetch-models'){
             return {ok:true,json:async()=>({
                 ok:true,
@@ -72,19 +82,33 @@ async function createState(providerRows){
 }
 
 (async()=>{
-    const state = await createState([{
-        id:'ominilink',
-        name:'OminiLink',
-        base_url:'https://api.aig-ai.com/v1',
-        video_base_url:'',
-        protocol:'openai',
-        enabled:true,
-        primary:true,
-        has_key:true,
-        image_models:[],
-        chat_models:[],
-        video_models:[]
-    }]);
+    let state;
+    for(const legacyId of ['volcengine', 'runninghub']){
+        const legacyState = await createState([{
+            id:legacyId,
+            name:'OminiLink',
+            base_url:'https://api.aig-ai.com/v1',
+            video_base_url:'',
+            protocol:legacyId,
+            enabled:true,
+            primary:true,
+            has_key:true,
+            image_models:[],
+            chat_models:[],
+            video_models:[]
+        }]);
+        legacyState.elements.get('baseInput').value = 'https://api.aig-ai.com/v1';
+        legacyState.elements.get('videoBaseInput').value = 'https://vg-api.aig-ai.com/v1';
+        assert.equal(await legacyState.api.saveProviders(), true);
+        const saved = JSON.parse(legacyState.calls.find(call => call.url === '/api/providers' && call.options.method === 'PUT').options.body)[0];
+        assert.equal(saved.protocol, 'openai', `${legacyId} must not override an exact OminiLink host`);
+        assert.equal(saved.video_base_url, 'https://vg-api.aig-ai.com/v1');
+        assert.ok(!Object.hasOwn(saved, 'api_key'));
+        await legacyState.api.loadProviders();
+        assert.equal(legacyState.api.providers()[0].protocol, 'openai');
+        assert.equal(legacyState.elements.get('protocolInput').value, 'openai');
+        if(legacyId === 'volcengine') state = legacyState;
+    }
 
     assert.equal(state.api.isOminiLinkApiUrl('https://api.aig-ai.com/v1'), true);
     assert.equal(state.api.isOminiLinkApiUrl('https://portal.ominilink.ai/'), false);
@@ -94,14 +118,6 @@ async function createState(providerRows){
     );
 
     assert.equal(state.elements.get('videoBaseInput').value, 'https://vg-api.aig-ai.com/v1');
-    state.elements.get('baseInput').value = 'https://api.aig-ai.com/v1';
-    state.elements.get('videoBaseInput').value = 'https://vg-api.aig-ai.com/v1';
-    assert.equal(await state.api.saveProviders(), true);
-    const putCall = state.calls.find(call => call.options.method === 'PUT');
-    const body = JSON.parse(putCall.options.body);
-    assert.equal(body[0].video_base_url, 'https://vg-api.aig-ai.com/v1');
-    assert.ok(!Object.hasOwn(body[0], 'api_key'));
-    assert.ok(!JSON.stringify(body).includes('secret-value'));
 
     await state.api.testConnection();
     const verificationRequest = state.calls.find(call => call.url === '/api/providers/test-connection');
@@ -122,24 +138,39 @@ async function createState(providerRows){
     state.api.togglePickerRow('chat-only');
     state.api.togglePickerRow('video-only');
     state.api.applyModelPicker();
-
-    state.api.openModelPicker();
-    state.api.togglePickerRow('gemini-omni-flash-preview');
-    state.api.applyModelPicker();
-    const deselectedProvider = state.api.providers()[0];
-    assert.ok(!deselectedProvider.chat_models.includes('gemini-omni-flash-preview'));
-    assert.ok(!deselectedProvider.video_models.includes('gemini-omni-flash-preview'));
+    assert.equal(await state.api.saveProviders(), true);
+    await state.api.loadProviders();
+    let persistedProvider = state.api.providers()[0];
+    assert.deepEqual(Array.from(persistedProvider.chat_models), ['gemini-omni-flash-preview', 'chat-only']);
+    assert.deepEqual(Array.from(persistedProvider.video_models), ['gemini-omni-flash-preview', 'video-only']);
+    assert.equal(persistedProvider.chat_models.filter(id => id === 'gemini-omni-flash-preview').length, 1);
+    assert.equal(persistedProvider.video_models.filter(id => id === 'gemini-omni-flash-preview').length, 1);
 
     state.api.openModelPicker();
     state.api.togglePickerRow('gemini-omni-flash-preview');
     state.api.applyModelPicker();
     assert.equal(await state.api.saveProviders(), true);
+    await state.api.loadProviders();
+    persistedProvider = state.api.providers()[0];
+    assert.ok(!persistedProvider.chat_models.includes('gemini-omni-flash-preview'));
+    assert.ok(!persistedProvider.video_models.includes('gemini-omni-flash-preview'));
+
+    state.api.openModelPicker();
+    state.api.togglePickerRow('gemini-omni-flash-preview');
+    state.api.applyModelPicker();
+    assert.equal(await state.api.saveProviders(), true);
+    await state.api.loadProviders();
     const pickerSaveBody = JSON.parse(state.calls.filter(call => call.url === '/api/providers' && call.options.method === 'PUT').at(-1).options.body)[0];
+    persistedProvider = state.api.providers()[0];
     assert.deepEqual(Array.from(pickerSaveBody.chat_models), ['gemini-omni-flash-preview', 'chat-only']);
     assert.deepEqual(Array.from(pickerSaveBody.video_models), ['gemini-omni-flash-preview', 'video-only']);
     assert.equal(pickerSaveBody.chat_models.filter(id => id === 'gemini-omni-flash-preview').length, 1);
     assert.equal(pickerSaveBody.video_models.filter(id => id === 'gemini-omni-flash-preview').length, 1);
-    assert.ok(!JSON.stringify(pickerSaveBody).includes('secret-value'));
+    assert.deepEqual(Array.from(persistedProvider.chat_models), ['gemini-omni-flash-preview', 'chat-only']);
+    assert.deepEqual(Array.from(persistedProvider.video_models), ['gemini-omni-flash-preview', 'video-only']);
+    state.calls.filter(call => call.url === '/api/providers' && call.options.method === 'PUT').forEach(call => {
+        JSON.parse(call.options.body).forEach(row => assert.ok(!Object.hasOwn(row, 'api_key')));
+    });
     console.log('api-settings-ominilink tests passed');
 })().catch(error => {
     console.error(error);

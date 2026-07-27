@@ -708,7 +708,7 @@ function syncEditor(){
     item.id = nextId;
     if(oldId !== item.id) selectedId = item.id;
     item.name = nameInput.value.trim() || item.id;
-    const selectedProtocol = item.id === 'modelscope' ? 'openai' : item.id === 'runninghub' ? 'runninghub' : item.id === 'volcengine' ? 'volcengine' : item.id === 'jimeng' ? 'jimeng' : (protocolInput?.value || 'openai');
+    const selectedProtocol = effectiveProviderProtocol(item, baseInput.value.trim(), protocolInput?.value);
     item.base_url = selectedProtocol === 'jimeng' ? '' : baseInput.value.trim();
     const enteredVideoBaseUrl = videoBaseInput?.value.trim() || '';
     item.video_base_url = enteredVideoBaseUrl || defaultOminiLinkVideoBaseUrl(item.base_url);
@@ -761,7 +761,7 @@ function updateProtocolFromInput(){
     if(keyInput) keyInput.value = savedKey;
 }
 function isVolcengineProvider(item){
-    return String(item?.protocol || '').toLowerCase() === 'volcengine';
+    return !isOminiLinkApiUrl(item?.base_url) && String(item?.protocol || '').toLowerCase() === 'volcengine';
 }
 function handleRhPasteInput(value){
     const parsed = parseRunningHubRunRef(value);
@@ -2347,6 +2347,7 @@ function handleProviderDragEnd(){
 function renderEditor(){
     const item = provider();
     if(!item) return;
+    const isOminiLink = isOminiLinkApiUrl(item.base_url);
     editorTitle.textContent = item.name || item.id;
     nameInput.value = item.name || '';
     idInput.value = item.id || '';
@@ -2355,15 +2356,15 @@ function renderEditor(){
     baseInput.placeholder = EXAMPLE_BASE_URL;
     baseInput.value = item.base_url || '';
     if(videoBaseInput) videoBaseInput.value = item.video_base_url || defaultOminiLinkVideoBaseUrl(item.base_url);
-    if(protocolInput) protocolInput.value = item.id === 'runninghub' ? 'runninghub' : item.id === 'volcengine' ? 'volcengine' : item.id === 'jimeng' ? 'jimeng' : (item.protocol || 'openai');
+    if(protocolInput) protocolInput.value = effectiveProviderProtocol(item);
     if(imageRequestModeInput) imageRequestModeInput.value = normalizeImageRequestMode(item.image_request_mode);
     keyInput.value = '';
     keyInput.placeholder = item.has_key ? `${tr('api.keepCurrentKey')} ${item.key_preview || ''}` : tr('api.enterKey');
     keyHint.textContent = item.has_key ? `${tr('api.keySaved')}${item.key_env || 'API/.env'}` : tr('api.noKey');
     const isModelScope = item.id === 'modelscope';
-    const isRunningHub = item.id === 'runninghub';
-    const isVolcengine = item.id === 'volcengine' || String(protocolInput?.value || item.protocol || '').toLowerCase() === 'volcengine';
-    const isStandaloneVolcengine = item.id === 'volcengine';
+    const isRunningHub = item.id === 'runninghub' && !isOminiLink;
+    const isVolcengine = !isOminiLink && (item.id === 'volcengine' || String(protocolInput?.value || item.protocol || '').toLowerCase() === 'volcengine');
+    const isStandaloneVolcengine = item.id === 'volcengine' && !isOminiLink;
     const isJimeng = item.id === 'jimeng' || String(protocolInput?.value || item.protocol || '').toLowerCase() === 'jimeng';
     if(isRunningHub){
         ensureRunningHubLists(item);
@@ -2594,7 +2595,7 @@ async function loadJimengHelp(){
     }
 }
 function currentProviderApiKey(item){
-    if(item?.id === 'runninghub'){
+    if(item?.id === 'runninghub' && !isOminiLinkApiUrl(baseInput?.value || item.base_url)){
         return rhWalletKeyInput?.value.trim() || rhFreeKeyInput?.value.trim() || '';
     }
     return keyInput.value.trim();
@@ -2608,6 +2609,7 @@ function imageRequestModeLabel(mode){
 function isRunningHubContext(item, baseUrl=''){
     const protocol = String(protocolInput?.value || item?.protocol || '').trim().toLowerCase();
     const url = String(baseUrl || baseInput?.value || item?.base_url || '').trim().toLowerCase();
+    if(isOminiLinkApiUrl(url)) return false;
     return item?.id === 'runninghub'
         || protocol === 'runninghub'
         || url.includes('runninghub.cn')
@@ -2621,6 +2623,15 @@ function isOminiLinkApiUrl(value){
     } catch(_) {
         return false;
     }
+}
+function effectiveProviderProtocol(item, baseUrl=item?.base_url, requestedProtocol=item?.protocol){
+    if(isOminiLinkApiUrl(baseUrl)) return 'openai';
+    if(item?.id === 'modelscope') return 'openai';
+    if(item?.id === 'runninghub') return 'runninghub';
+    if(item?.id === 'volcengine') return 'volcengine';
+    if(item?.id === 'jimeng') return 'jimeng';
+    const normalized = String(requestedProtocol || '').trim().toLowerCase();
+    return ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng'].includes(normalized) ? normalized : 'openai';
 }
 function defaultOminiLinkVideoBaseUrl(value){
     if(!isOminiLinkApiUrl(value)) return '';
@@ -3336,13 +3347,7 @@ async function saveProviders(){
     syncEditor();
     providers.forEach(item => {
         item.id = normalizeId(item.id);
-        item.protocol = item.id === 'runninghub'
-            ? 'runninghub'
-            : item.id === 'volcengine'
-            ? 'volcengine'
-            : item.id === 'jimeng'
-            ? 'jimeng'
-            : ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng'].includes(String(item.protocol || '').toLowerCase()) ? String(item.protocol).toLowerCase() : 'openai';
+        item.protocol = effectiveProviderProtocol(item);
         item.image_request_mode = normalizeImageRequestMode(
             item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || item.id === 'jimeng'
                 ? 'openai'
@@ -3386,7 +3391,7 @@ async function saveProviders(){
                 name:item.name,
                 base_url:item.base_url,
                 video_base_url:item.video_base_url || '',
-                protocol:(item.id === 'modelscope') ? 'openai' : item.id === 'runninghub' ? 'runninghub' : item.id === 'volcengine' ? 'volcengine' : item.id === 'jimeng' ? 'jimeng' : (item.protocol || 'openai'),
+                protocol:effectiveProviderProtocol(item),
                 image_request_mode:item.image_request_mode || 'openai',
                 image_generation_endpoint:item.image_generation_endpoint || '',
                 image_edit_endpoint:item.image_edit_endpoint || '',
