@@ -4,6 +4,8 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const source = fs.readFileSync(path.resolve(__dirname, '..', 'static', 'js', 'canvas.js'), 'utf8');
+const providerMode = require('../static/js/canvas-provider-mode.js');
+const providerDefaults = require('../static/js/provider-defaults.js');
 
 function productionFunction(name){
     const asyncStart = source.indexOf(`async function ${name}(`);
@@ -14,71 +16,66 @@ function productionFunction(name){
     return source.slice(start, next === -1 ? source.length : start + 1 + next);
 }
 
-const provider = {
-    id:'orange',
-    name:'Orange',
-    enabled:true,
+const orangeProvider = {
+    id:'orange', name:'Orange', enabled:true,
     base_url:'https://api.aig-ai.com/v1',
     video_base_url:'https://vg-api.aig-ai.com/v1',
     video_models:['gemini-omni-flash-preview']
 };
+const unrelatedProvider = {
+    id:'unrelated', name:'Unrelated', enabled:true,
+    base_url:'https://example.test/v1', video_models:['gemini-omni-flash-preview']
+};
+const lookalikeProvider = {
+    id:'lookalike', name:'Lookalike', enabled:true,
+    base_url:'https://api.aig-ai.com.evil.test/v1', video_models:['gemini-omni-flash-preview']
+};
 
 const sandbox = {
     URL,
-    apiProviders:[provider],
+    apiProviders:[orangeProvider, unrelatedProvider, lookalikeProvider],
     defaultApiProviders:() => [],
-    ProviderDefaults:require('../static/js/provider-defaults.js'),
-    CanvasProviderMode:{mode:() => 'fixed'},
+    ProviderDefaults:providerDefaults,
+    CanvasProviderMode:providerMode,
     escapeHtml:value => String(value),
     tr:key => key,
+    trf:(key, values={}) => `${key}:${JSON.stringify(values)}`,
     CANVAS_REFERENCE_IMAGE_MAX:8,
     isVideoUrl:() => false,
     isAudioUrl:() => false,
     isTextUrl:() => false,
-    nodes:[],
-    alerts:[],
-    submitted:[],
-    fetchCalls:0,
-    syncDefaultCanvasNodeProvider:() => false,
-    stopUnresolvedDefaultCanvasRun:() => false,
-    preflightCanvasNodeRequest:node => ({providerId:node.apiProvider, model:node.model}),
-    videoProviderModeOptions:() => ({}),
+    nodes:[], alerts:[], fetchCalls:[],
     cascadeTargetIdFromOptions:() => '',
-    generatorSources:() => [],
+    generatorSources:node => node.sources || [],
     orderedSources:(_node, sources) => sources,
     openRouterVideoReferenceState:() => ({conflict:false}),
     outputForNode:() => null,
     uid:() => 'pending-1',
-    runSnapshot:() => ({}),
+    runSnapshot:node => ({node:{apiProvider:node.apiProvider, model:node.model}}),
     makePendingForRun:() => ({}),
-    refreshRunNodes:() => {},
-    scheduleSave:() => {},
-    manualVideoUrlForNode:() => '',
-    tempShUploadedUrlForNode:(_node, url) => url,
-    createCanvasVideoTask:async payload => {
-        sandbox.submitted.push(payload);
-        return {task_id:'task-1', status:'queued'};
-    },
+    refreshRunNodes:() => {}, scheduleSave:() => {},
     waitCanvasVideoTaskResult:async () => ({videos:['/assets/output/video.mp4']}),
-    collectRunMeta:() => ({runMs:0}),
-    resultMediaUrls:result => result.videos || [],
-    outputUrlValue:value => value,
-    requestMetaFromResult:() => ({}),
-    appendOutputImages:() => {},
-    mergeGeneratedOutputs:() => {},
-    addGenerationLog:() => {},
-    isCascadeAbortError:() => false,
-    langIsEn:() => false,
+    collectRunMeta:() => ({runMs:0}), resultMediaUrls:result => result.videos || [], outputUrlValue:value => value,
+    requestMetaFromResult:() => ({}), appendOutputImages:() => {}, mergeGeneratedOutputs:() => {}, addGenerationLog:() => {},
+    isCascadeAbortError:() => false, langIsEn:() => false,
     alert:message => sandbox.alerts.push(String(message)),
-    fetch:async () => {
-        sandbox.fetchCalls += 1;
-        throw new Error('network must not be reached');
+    cascadeFetch:async (url, options={}) => {
+        sandbox.fetchCalls.push({url, body:JSON.parse(options.body || '{}')});
+        return {ok:true, json:async () => ({task_id:'task-1', status:'queued'})};
     }
 };
 vm.createContext(sandbox);
 vm.runInContext([
     productionFunction('uniqueModels'),
     productionFunction('preferredProviderId'),
+    productionFunction('canvasProviderMode'),
+    productionFunction('videoProviderModeOptions'),
+    productionFunction('syncCanvasNodeProvider'),
+    productionFunction('syncDefaultCanvasNodeProvider'),
+    productionFunction('unresolvedDefaultCanvasNodeError'),
+    productionFunction('stopUnresolvedDefaultCanvasRun'),
+    productionFunction('resolveCanvasNodeRequest'),
+    productionFunction('preflightCanvasNodeRequest'),
     productionFunction('videoApiProviders'),
     productionFunction('resolveVideoProviderId'),
     productionFunction('videoProviderOptions'),
@@ -87,109 +84,89 @@ vm.runInContext([
     productionFunction('mediaKindForRef'),
     productionFunction('imageRefsOnly'),
     productionFunction('videoRefsOnly'),
+    productionFunction('tempShUploadedUrlForNode'),
     productionFunction('applyUploadedUrlToRefs'),
+    productionFunction('manualVideoUrlForNode'),
     productionFunction('audioRefsOnly'),
-    productionFunction('runVideoNode'),
     productionFunction('isOminiLinkProvider'),
     productionFunction('omniFlashVideoValidationError'),
+    productionFunction('createCanvasVideoTask'),
+    productionFunction('runVideoNode'),
     'this.controls = {isOminiLinkProvider, omniFlashVideoValidationError, videoProviderOptions, videoModelOptions, runVideoNode};'
 ].join('\n'), sandbox);
 
 const {controls} = sandbox;
 
 for(const url of [
-    'https://api.aig-ai.com/v1',
-    'https://vg-api.aig-ai.com/v1',
-    'https://api.ominilink.ai/v1',
-    'https://vg-api.ominilink.ai/v1'
-]){
-    assert.equal(controls.isOminiLinkProvider({base_url:url}), true, `${url} must be recognized as OminiLink`);
-}
+    'https://api.aig-ai.com/v1', 'https://vg-api.aig-ai.com/v1',
+    'https://api.ominilink.ai/v1', 'https://vg-api.ominilink.ai/v1'
+]) assert.equal(controls.isOminiLinkProvider({base_url:url}), true, `${url} must be recognized`);
 for(const url of [
-    'https://portal.ominilink.ai/',
-    'https://api.aig-ai.com.evil.test/v1',
-    'https://notominilink.ai/v1',
-    'not a url'
-]){
-    assert.equal(controls.isOminiLinkProvider({base_url:url}), false, `${url} must not be recognized as OminiLink`);
-}
+    'https://portal.ominilink.ai/', 'https://api.aig-ai.com.evil.test/v1',
+    'https://notominilink.ai/v1', 'not a url'
+]) assert.equal(controls.isOminiLinkProvider({base_url:url}), false, `${url} must be rejected`);
 assert.equal(controls.isOminiLinkProvider({video_base_url:'https://vg-api.aig-ai.com/v1'}), true);
 
-const providerMarkup = controls.videoProviderOptions('orange');
-const modelMarkup = controls.videoModelOptions('gemini-omni-flash-preview', 'orange');
-assert.match(providerMarkup, /value="orange"/, 'the exact OminiLink provider must remain selectable');
-assert.match(modelMarkup, /value="gemini-omni-flash-preview"/, 'the exact Omni Flash model must remain selectable');
+assert.match(controls.videoProviderOptions('orange'), /value="orange"/);
+assert.match(controls.videoModelOptions('gemini-omni-flash-preview', 'orange'), /value="gemini-omni-flash-preview"/);
 
-assert.equal(
-    controls.omniFlashVideoValidationError(
-        {model:'gemini-omni-flash-preview', duration:6},
-        [{kind:'image'}, {kind:'video'}]
-    ),
-    'Omni Flash \u4e0d\u80fd\u540c\u65f6\u63d0\u4ea4\u56fe\u7247\u548c\u89c6\u9891\u53c2\u8003\u3002'
-);
-assert.equal(
-    controls.omniFlashVideoValidationError({model:'gemini-omni-flash-preview', duration:2}, []),
-    'Omni Flash \u89c6\u9891\u65f6\u957f\u5fc5\u987b\u5728 3 \u5230 10 \u79d2\u4e4b\u95f4\u3002'
-);
-assert.equal(controls.omniFlashVideoValidationError({model:'other-video', duration:2}, []), '');
-
-async function runCase({duration=6, refs=[], cascade=false}){
+async function runCase({providerId='orange', duration=6, refs=[], manualVideo='', cascade=false}){
     const node = {
-        id:'video-1',
-        type:'video',
-        apiProvider:'orange',
-        model:'gemini-omni-flash-preview',
-        duration,
+        id:'video-1', type:'video', providerMode:'fixed', apiProvider:providerId,
+        model:'gemini-omni-flash-preview', duration,
+        manualVideoUrls:manualVideo ? [manualVideo] : [],
         sources:[{prompt:'A moving landscape', refs}]
     };
     sandbox.nodes = [node];
     sandbox.alerts = [];
-    sandbox.submitted = [];
-    sandbox.fetchCalls = 0;
-    sandbox.generatorSources = current => current.sources;
+    sandbox.fetchCalls = [];
     let thrown = '';
-    try {
-        await controls.runVideoNode(node.id, cascade ? {cascade:true} : {});
-    } catch(error) {
-        thrown = error.message || String(error);
-    }
-    return {node, alerts:sandbox.alerts, submitted:sandbox.submitted, fetchCalls:sandbox.fetchCalls, thrown};
+    try { await controls.runVideoNode(node.id, cascade ? {cascade:true} : {}); }
+    catch(error) { thrown = error.message || String(error); }
+    return {node, alerts:sandbox.alerts, fetchCalls:sandbox.fetchCalls, thrown};
 }
 
 (async () => {
-    const valid = await runCase({duration:6});
-    assert.equal(valid.submitted.length, 1, 'a valid Omni Flash request should submit exactly once');
-    assert.equal(valid.fetchCalls, 0, 'the task helper, not a direct fetch, handles a valid request');
-    assert.equal(valid.submitted[0].provider_id, 'orange', 'the chosen OminiLink provider must be serialized unchanged');
-    assert.equal(valid.submitted[0].model, 'gemini-omni-flash-preview', 'the chosen Omni Flash model must be serialized unchanged');
+    const valid = await runCase({duration:'6'});
+    assert.equal(valid.fetchCalls.length, 1, 'valid OminiLink input must reach the real task fetch boundary once');
+    assert.equal(valid.fetchCalls[0].url, '/api/canvas-video-tasks');
+    assert.equal(valid.fetchCalls[0].body.provider_id, 'orange');
+    assert.equal(valid.fetchCalls[0].body.model, 'gemini-omni-flash-preview');
+    assert.equal(valid.fetchCalls[0].body.duration, 6, 'the serialized duration must be normalized once');
+    assert.equal(valid.node.apiProvider, 'orange', 'the fixed provider selection must persist on the node');
+    assert.equal(valid.node.model, 'gemini-omni-flash-preview', 'the selected model must persist on the node');
+
+    for(const providerId of ['unrelated', 'lookalike']){
+        const unchanged = await runCase({
+            providerId, duration:2,
+            refs:[{kind:'image', url:'/assets/input/image.png'}, {kind:'video', url:'/assets/input/video.mp4'}]
+        });
+        assert.equal(unchanged.fetchCalls.length, 1, `${providerId} must retain existing behavior for the same model`);
+        assert.equal(unchanged.alerts.length, 0, `${providerId} must not receive the OminiLink preflight`);
+    }
 
     const invalidCases = [
         ['duration below range', {duration:2}, /\u89c6\u9891\u65f6\u957f.*3.*10/],
         ['duration above range', {duration:11}, /\u89c6\u9891\u65f6\u957f.*3.*10/],
+        ['non-numeric duration', {duration:'six'}, /\u89c6\u9891\u65f6\u957f.*3.*10/],
+        ['non-finite duration', {duration:Infinity}, /\u89c6\u9891\u65f6\u957f.*3.*10/],
         ['audio reference', {refs:[{kind:'audio', url:'/assets/input/audio.mp3'}]}, /\u4e0d\u652f\u6301\u97f3\u9891/],
         ['mixed image and video', {refs:[{kind:'image', url:'/assets/input/image.png'}, {kind:'video', url:'/assets/input/video.mp4'}]}, /\u4e0d\u80fd\u540c\u65f6/],
+        ['image plus manual video', {refs:[{kind:'image', url:'/assets/input/image.png'}], manualVideo:'https://cdn.example.test/input.mp4'}, /\u4e0d\u80fd\u540c\u65f6/],
         ['two images', {refs:[{kind:'image', url:'/assets/input/one.png'}, {kind:'image', url:'/assets/input/two.png'}]}, /\u53ea\u652f\u6301\u4e00\u5f20\u53c2\u8003\u56fe/],
         ['two videos', {refs:[{kind:'video', url:'/assets/input/one.mp4'}, {kind:'video', url:'/assets/input/two.mp4'}]}, /\u53ea\u652f\u6301\u4e00\u4e2a\u53c2\u8003\u89c6\u9891/]
     ];
     for(const [name, input, expected] of invalidCases){
         const result = await runCase(input);
-        assert.equal(result.submitted.length, 0, `${name} must fail before creating a paid task`);
-        assert.equal(result.fetchCalls, 0, `${name} must make zero network calls`);
+        assert.equal(result.fetchCalls.length, 0, `${name} must make zero task/network requests`);
         assert.match(result.alerts.join('\n'), expected, `${name} must show a Chinese validation error`);
     }
 
-    const cascade = await runCase({duration:2, cascade:true});
-    assert.equal(cascade.submitted.length, 0, 'cascade validation must fail before creating a paid task');
-    assert.equal(cascade.fetchCalls, 0, 'cascade validation must make zero network calls');
-    assert.match(cascade.thrown, /\u89c6\u9891\u65f6\u957f.*3.*10/, 'cascade validation must propagate its Chinese error');
+    const cascade = await runCase({duration:'six', cascade:true});
+    assert.equal(cascade.fetchCalls.length, 0, 'cascade validation must stop before fetch');
+    assert.match(cascade.thrown, /\u89c6\u9891\u65f6\u957f.*3.*10/);
 
     const runVideoNode = productionFunction('runVideoNode');
-    assert.ok(
-        runVideoNode.indexOf('omniFlashVideoValidationError(') < runVideoNode.indexOf('createCanvasVideoTask('),
-        'Omni validation must run before the paid task is created'
-    );
+    assert.ok(runVideoNode.indexOf('omniFlashVideoValidationError(') < runVideoNode.indexOf('createCanvasVideoTask('));
     console.log('canvas OminiLink Omni Flash tests passed');
-})().catch(error => {
-    console.error(error);
-    process.exitCode = 1;
-});
+})().catch(error => { console.error(error); process.exitCode = 1; });

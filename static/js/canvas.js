@@ -680,14 +680,14 @@ function isOminiLinkProvider(provider){
         }
     });
 }
-function omniFlashVideoValidationError(node, mediaRefs){
-    if(String(node?.model || '').trim() !== 'gemini-omni-flash-preview') return '';
+function omniFlashVideoValidationError(node, mediaRefs, provider){
+    if(!isOminiLinkProvider(provider) || String(node?.model || '').trim() !== 'gemini-omni-flash-preview') return '';
     const refs = Array.isArray(mediaRefs) ? mediaRefs : [];
     const imageCount = refs.filter(ref => mediaKindForRef(ref) === 'image').length;
     const videoCount = refs.filter(ref => mediaKindForRef(ref) === 'video').length;
     const audioCount = refs.filter(ref => mediaKindForRef(ref) === 'audio').length;
     const duration = Number(node?.duration);
-    if(duration < 3 || duration > 10) return 'Omni Flash 视频时长必须在 3 到 10 秒之间。';
+    if(!Number.isFinite(duration) || duration < 3 || duration > 10) return 'Omni Flash 视频时长必须在 3 到 10 秒之间。';
     if(audioCount) return 'Omni Flash 不支持音频参考，请移除音频后重试。';
     if(imageCount && videoCount) return 'Omni Flash 不能同时提交图片和视频参考。';
     if(imageCount > 1) return 'Omni Flash 图片生视频只支持一张参考图。';
@@ -10290,14 +10290,6 @@ async function runVideoNode(nodeId, opts={}){
     const refs = imageRefsOnly(mediaRefs);
     const videoRefs = videoRefsOnly(mediaRefs);
     const audioRefs = audioRefsOnly(mediaRefs);
-    const omniValidationError = typeof omniFlashVideoValidationError === 'function'
-        ? omniFlashVideoValidationError({...node, model:requestProvider.model}, mediaRefs)
-        : '';
-    if(omniValidationError){
-        if(opts.cascade) throw new Error(omniValidationError);
-        alert(omniValidationError);
-        return;
-    }
     const openRouterReferenceState = openRouterVideoReferenceState(
         {...node, apiProvider:requestProvider.providerId},
         sources
@@ -10310,6 +10302,41 @@ async function runVideoNode(nodeId, opts={}){
     }
     if(node.useFrameRoles && refs[0]) refs[0] = {...refs[0], role:'first_frame'};
     if(node.useFrameRoles && refs[1]) refs[1] = {...refs[1], role:'last_frame'};
+    const rawDuration = node?.duration;
+    const duration = rawDuration === undefined || rawDuration === null || rawDuration === '' ? 5 : Number(rawDuration);
+    const manualVideoUrl = manualVideoUrlForNode(node);
+    const requestPayload = {
+        prompt,
+        provider_id:requestProvider.providerId,
+        model:requestProvider.model,
+        duration,
+        aspect_ratio:node.aspectRatio || '16:9',
+        resolution:node.resolution || '',
+        images:refs,
+        videos:manualVideoUrl ? [manualVideoUrl] : videoRefs.map(ref => tempShUploadedUrlForNode(node, ref.url)),
+        audios:audioRefs.map(ref => ref.url).filter(Boolean),
+        enhance_prompt:Boolean(node.enhancePrompt),
+        enable_upsample:Boolean(node.enableUpsample),
+        watermark:Boolean(node.watermark),
+        camerafixed:Boolean(node.cameraFixed),
+        generate_audio:Boolean(node.generateAudio),
+        multimodal:Boolean(node.multimodal)
+    };
+    const resolvedProvider = (apiProviders.length ? apiProviders : defaultApiProviders())
+        .find(provider => String(provider?.id || '') === requestProvider.providerId);
+    const effectiveMediaRefs = [
+        ...requestPayload.images,
+        ...requestPayload.videos.map(url => ({kind:'video', url})),
+        ...requestPayload.audios.map(url => ({kind:'audio', url}))
+    ];
+    const omniValidationError = typeof omniFlashVideoValidationError === 'function'
+        ? omniFlashVideoValidationError(requestPayload, effectiveMediaRefs, resolvedProvider)
+        : '';
+    if(omniValidationError){
+        if(opts.cascade) throw new Error(omniValidationError);
+        alert(omniValidationError);
+        return;
+    }
     if(!prompt){ alert(tr('canvas.videoNeedsPrompt')); return; }
     let out = outputForNode(node, 460);
     const pendingId = uid('p');
