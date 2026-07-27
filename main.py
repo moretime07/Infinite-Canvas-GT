@@ -11485,6 +11485,8 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
         "chat_models": grouped["chat"],
         "video_models": grouped["video"],
         "all": ids,
+        "catalog_fallback": False,
+        "connection_verified": True,
         "image_request_mode": detect_image_request_mode(base_url, ids) or normalize_image_request_mode(image_request_mode),
         "raw": {"models": raw, "openrouter_video_models": openrouter_video_raw} if openrouter_video_raw is not None else raw,
     }
