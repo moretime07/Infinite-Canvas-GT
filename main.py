@@ -1245,7 +1245,7 @@ def normalize_provider(item):
     if provider_id == "runninghub":
         protocol = "runninghub"
         base_url = base_url or RUNNINGHUB_DEFAULT_BASE_URL
-    if is_ominilink_api_url(base_url):
+    if is_ominilink_api_url(base_url) or is_ominilink_api_url(video_base_url):
         protocol = "openai"
     return {
         "id": provider_id,
@@ -10830,6 +10830,8 @@ async def save_providers(payload: List[ApiProviderPayload]):
             provider["protocol"] = "runninghub"
         if provider["id"] == "volcengine":
             provider["protocol"] = "volcengine"
+        if is_ominilink_api_url(provider.get("base_url")) or is_ominilink_api_url(provider.get("video_base_url")):
+            provider["protocol"] = "openai"
     if not providers:
         raise HTTPException(status_code=400, detail="至少保留一个 API 平台")
     # 强制最多一个 primary（取最后被标记的；都没标记则保持原样不强制）
@@ -10946,7 +10948,7 @@ def volcengine_task_probe_url(base_url: str):
 
 
 def route_probe_succeeded(status_code: int) -> bool:
-    return 200 <= int(status_code or 0) < 500 and int(status_code) not in {404, 405}
+    return 200 <= int(status_code or 0) < 500 and int(status_code) not in {404, 405, 429}
 
 
 async def probe_volcengine_task_endpoint(client, base_url: str, api_key: str):
@@ -11308,6 +11310,76 @@ async def probe_async_endpoint(payload: TestConnectionPayload):
     api_key = api_key_from_payload(payload, protocol)
     if not api_key:
         raise HTTPException(status_code=400, detail="请先填写或保存 API Key")
+    if is_ominilink_api_url(base_url):
+        base_url, _ = normalize_ominilink_urls(base_url)
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                openai_ok, openai_probe = await probe_openai_models_endpoint(client, base_url, api_key)
+                openai_status = int(openai_probe.get("status") or 0)
+                if openai_status == 429:
+                    return {
+                        "ok": False,
+                        "protocol": "openai",
+                        "status_code": 429,
+                        "message": "OminiLink OpenAI 兼容入口请求过于频繁，请稍后重试",
+                    }
+                if openai_ok:
+                    return {
+                        "ok": True,
+                        "protocol": "openai",
+                        "status_code": openai_status,
+                        "message": openai_probe.get("message") or "OminiLink OpenAI 兼容入口可用",
+                        "raw": openai_probe.get("raw"),
+                        "model_count": openai_probe.get("model_count") or 0,
+                        "image_models": openai_probe.get("image_models") or [],
+                        "chat_models": openai_probe.get("chat_models") or [],
+                        "video_models": openai_probe.get("video_models") or [],
+                        "all": openai_probe.get("all") or [],
+                    }
+                if openai_status in {401, 403}:
+                    return {
+                        "ok": False,
+                        "protocol": "openai",
+                        "status_code": openai_status,
+                        "message": openai_probe.get("message") or "OminiLink API Key 无效或无权限",
+                    }
+                compat_ok, compat_probe = await probe_openai_compat_bearer_endpoint(client, base_url, api_key)
+                compat_status = int(compat_probe.get("status") or 0)
+                if compat_status == 429:
+                    return {
+                        "ok": False,
+                        "protocol": "openai",
+                        "status_code": 429,
+                        "message": "OminiLink OpenAI 兼容入口请求过于频繁，请稍后重试",
+                    }
+                if compat_ok and compat_status != 404:
+                    return {
+                        "ok": True,
+                        "protocol": "openai",
+                        "status_code": compat_status or openai_status,
+                        "message": "OminiLink OpenAI 兼容入口可达（该站未提供 /v1/models，模型请手动填写）",
+                        "raw": {
+                            "openai_probe": openai_probe.get("raw"),
+                            "openai_compat_probe": compat_probe.get("raw"),
+                        },
+                        "model_count": 0,
+                        "image_models": [],
+                        "chat_models": [],
+                        "video_models": [],
+                        "all": [],
+                    }
+                return {
+                    "ok": False,
+                    "protocol": "openai",
+                    "status_code": compat_status or openai_status,
+                    "message": compat_probe.get("message") or openai_probe.get("message") or "OminiLink OpenAI 兼容入口不可用",
+                    "raw": {
+                        "openai_probe": openai_probe.get("raw"),
+                        "openai_compat_probe": compat_probe.get("raw"),
+                    },
+                }
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=str(e)[:300])
     if protocol == "volcengine":
         try:
             async with httpx.AsyncClient(timeout=15) as client:

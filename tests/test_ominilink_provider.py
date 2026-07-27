@@ -40,6 +40,26 @@ class FakeClient:
         return next(self.responses)
 
 
+class RouteClient:
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+    async def get(self, url, **kwargs):
+        self.calls.append(("GET", url, kwargs))
+        return self.responses[("GET", url)]
+
+    async def post(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        return self.responses[("POST", url)]
+
+
 class OminiLinkProviderTests(unittest.TestCase):
     def test_exact_api_hosts_are_recognized(self):
         for url in (
@@ -91,7 +111,111 @@ class OminiLinkProviderTests(unittest.TestCase):
         self.assertEqual(main.protocol_from_payload(payload), "openai")
 
 
+class OminiLinkProviderEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_save_endpoint_persists_and_returns_openai_for_exact_hosts(self):
+        cases = (
+            ("volcengine", "https://api.aig-ai.com/v1", ""),
+            ("volcengine", "https://vg-api.aig-ai.com/v1", ""),
+            ("runninghub", "https://api.ominilink.ai/v1", ""),
+            ("runninghub", "https://example.test/v1", "https://vg-api.ominilink.ai/v1"),
+        )
+        for provider_id, base_url, video_base_url in cases:
+            with self.subTest(provider_id=provider_id, base_url=base_url, video_base_url=video_base_url):
+                payload = [main.ApiProviderPayload(
+                    id=provider_id,
+                    name=provider_id,
+                    base_url=base_url,
+                    video_base_url=video_base_url,
+                    protocol=provider_id,
+                    chat_models=["chat-model"],
+                )]
+                saved = []
+                with patch.object(main, "load_api_providers", return_value=[]), patch.object(
+                    main, "load_static_runninghub_provider", return_value=None
+                ), patch.object(main, "load_runninghub_workflow_store", return_value={}), patch.object(
+                    main, "provider_env_key_value", return_value=""
+                ), patch.object(main, "runninghub_wallet_key_value", return_value=""), patch.object(
+                    main, "volcengine_access_key_value", return_value=""
+                ), patch.object(main, "volcengine_secret_key_value", return_value=""), patch.object(
+                    main, "save_api_providers", side_effect=lambda items: saved.extend(dict(item) for item in items)
+                ), patch.object(main, "update_env_values"), patch.object(main, "reload_env_globals"):
+                    result = await main.save_providers(payload)
+
+                self.assertEqual(saved[0]["protocol"], "openai")
+                self.assertEqual(result["providers"][0]["protocol"], "openai")
+
+
 class OminiLinkDiscoveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_route_probe_rate_limit_is_not_success(self):
+        self.assertFalse(main.route_probe_succeeded(429))
+
+    async def test_probe_async_exact_host_uses_only_openai_compatible_routes(self):
+        base_url = "https://api.aig-ai.com/v1"
+        client = RouteClient({
+            ("GET", f"{base_url}/models"): FakeResponse(
+                404, {"error": "not found"}, '{"error":"not found"}'
+            ),
+            ("POST", f"{base_url}/chat/completions"): FakeResponse(
+                400, {"error": {"message": "messages required"}},
+                '{"error":{"message":"messages required"}}',
+            ),
+            ("GET", f"{base_url}/tasks/healthcheck_probe_do_not_submit"): FakeResponse(
+                404, {"error": "not found"}, '{"error":"not found"}'
+            ),
+        })
+        payload = main.TestConnectionPayload(
+            base_url=base_url,
+            api_key="redacted-key",
+            provider_id="volcengine",
+            protocol="volcengine",
+        )
+
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            result = await main.probe_async_endpoint(payload)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["protocol"], "openai")
+        self.assertEqual(
+            [(method, url) for method, url, _ in client.calls],
+            [
+                ("GET", f"{base_url}/models"),
+                ("POST", f"{base_url}/chat/completions"),
+            ],
+        )
+
+    async def test_probe_async_exact_host_returns_redacted_terminal_rate_limit(self):
+        base_url = "https://api.ominilink.ai/v1"
+        sensitive = "rate limited: token=do-not-echo"
+        client = RouteClient({
+            ("GET", f"{base_url}/models"): FakeResponse(
+                429, {"error": sensitive}, sensitive
+            ),
+            ("GET", f"{base_url}/tasks/healthcheck_probe_do_not_submit"): FakeResponse(
+                404, {"error": "not found"}, '{"error":"not found"}'
+            ),
+            ("POST", f"{base_url}/chat/completions"): FakeResponse(
+                429, {"error": sensitive}, sensitive
+            ),
+        })
+        payload = main.TestConnectionPayload(
+            base_url=base_url,
+            api_key="redacted-key",
+            provider_id="runninghub",
+            protocol="runninghub",
+        )
+
+        with patch.object(main.httpx, "AsyncClient", return_value=client):
+            result = await main.probe_async_endpoint(payload)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["protocol"], "openai")
+        self.assertEqual(result["status_code"], 429)
+        self.assertNotIn("do-not-echo", str(result))
+        self.assertEqual(
+            [(method, url) for method, url, _ in client.calls],
+            [("GET", f"{base_url}/models")],
+        )
+
     async def test_ark_404_is_not_route_success(self):
         client = AsyncMock()
         client.get.return_value = FakeResponse(404, {"error": "not found"}, '{"error":"not found"}')
