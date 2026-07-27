@@ -680,6 +680,32 @@ function isOminiLinkProvider(provider){
         }
     });
 }
+function omniFlashSafePublicHttpsUri(value){
+    try {
+        const parsed = new URL(String(value || '').trim());
+        const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+        if(parsed.protocol !== 'https:' || parsed.username || parsed.password || !host) return false;
+        if(host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return false;
+        if(host.includes(':')) return host !== '::1' && !/^f[cd][0-9a-f:]*$/i.test(host) && !/^fe[89ab][0-9a-f:]*$/i.test(host);
+        const octets = host.split('.');
+        if(octets.length !== 4 || !octets.every(part => /^\d+$/.test(part))) return true;
+        const values = octets.map(Number);
+        if(values.some(part => part < 0 || part > 255)) return false;
+        const [a, b] = values;
+        return a !== 0 && a !== 10 && a !== 127 && a !== 169 && b !== 254
+            && !(a === 172 && b >= 16 && b <= 31)
+            && !(a === 192 && b === 168)
+            && !(a === 100 && b >= 64 && b <= 127)
+            && a < 224;
+    } catch(_) {
+        return false;
+    }
+}
+function omniFlashCanonicalMediaRef(ref){
+    if(!ref || typeof ref !== 'object') return ref;
+    const original = String(ref.originalLocalUrl || '').trim();
+    return original ? {...ref, url:original} : ref;
+}
 function omniFlashVideoValidationError(node, mediaRefs, provider){
     if(!isOminiLinkProvider(provider) || String(node?.model || '').trim() !== 'gemini-omni-flash-preview') return '';
     const refs = Array.isArray(mediaRefs) ? mediaRefs : [];
@@ -689,6 +715,9 @@ function omniFlashVideoValidationError(node, mediaRefs, provider){
     const duration = Number(node?.duration);
     if(!Number.isFinite(duration) || duration < 3 || duration > 10) return 'Omni Flash 视频时长必须在 3 到 10 秒之间。';
     if(audioCount) return 'Omni Flash 不支持音频参考，请移除音频后重试。';
+    if(refs.some(ref => /^https?:\/\//i.test(String(ref?.url || '')) && !omniFlashSafePublicHttpsUri(ref.url))){
+        return 'Omni Flash 远程参考素材只支持安全的公网 HTTPS 媒体 URI。';
+    }
     if(imageCount && videoCount) return 'Omni Flash 不能同时提交图片和视频参考。';
     if(imageCount > 1) return 'Omni Flash 图片生视频只支持一张参考图。';
     if(videoCount > 1) return 'Omni Flash 视频编辑只支持一个参考视频。';
@@ -10324,6 +10353,12 @@ async function runVideoNode(nodeId, opts={}){
     };
     const resolvedProvider = (apiProviders.length ? apiProviders : defaultApiProviders())
         .find(provider => String(provider?.id || '') === requestProvider.providerId);
+    if(isOminiLinkProvider(resolvedProvider)){
+        requestPayload.images = requestPayload.images.map(omniFlashCanonicalMediaRef);
+        requestPayload.videos = manualVideoUrl
+            ? [manualVideoUrl]
+            : videoRefs.map(omniFlashCanonicalMediaRef).map(ref => ref?.url).filter(Boolean);
+    }
     const effectiveMediaRefs = [
         ...requestPayload.images,
         ...requestPayload.videos.map(url => ({kind:'video', url})),

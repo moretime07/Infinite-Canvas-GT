@@ -78,6 +78,34 @@ class ExceptionRecordingClient(RecordingClient):
         raise self.exc
 
 
+class DownloadResponse:
+    def __init__(self, status_code=200, content=b"video", headers=None):
+        self.status_code = status_code
+        self.content = content
+        self.headers = headers or {"Content-Type": "video/mp4"}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise main.httpx.HTTPStatusError(
+                "download failed",
+                request=main.httpx.Request("GET", "https://public.example.test/video.mp4"),
+                response=main.httpx.Response(self.status_code),
+            )
+
+
+class DownloadClient:
+    def __init__(self, responses=(), exc=None):
+        self.responses = iter(responses)
+        self.exc = exc
+        self.calls = []
+
+    async def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if self.exc:
+            raise self.exc
+        return next(self.responses)
+
+
 class OminiLinkVideoRequestTests(unittest.IsolatedAsyncioTestCase):
     def test_video_api_root_prefers_the_normalized_video_base_url(self):
         provider = {
@@ -197,6 +225,45 @@ class OminiLinkVideoRequestTests(unittest.IsolatedAsyncioTestCase):
             {"type": "video", "data": "dmlkZW8=", "mime_type": "video/mp4"},
         ])
 
+    async def test_image_and_video_accept_safe_public_https_uri(self):
+        resolver = lambda _host: ["93.184.216.34"]
+        image = await main.build_ominilink_omni_request(
+            main.CanvasVideoRequest(
+                prompt="move", model="gemini-omni-flash-preview",
+                images=[main.AIReference(url="https://cdn.example.test/reference.png")],
+            ),
+            resolver=resolver,
+        )
+        video = await main.build_ominilink_omni_request(
+            main.CanvasVideoRequest(
+                prompt="edit", model="gemini-omni-flash-preview",
+                videos=["https://cdn.example.test/reference.mp4"],
+            ),
+            resolver=resolver,
+        )
+
+        self.assertEqual(image["input"][0]["content"][1], {
+            "type": "image", "uri": "https://cdn.example.test/reference.png",
+        })
+        self.assertEqual(video["input"][0]["content"][1], {
+            "type": "video", "uri": "https://cdn.example.test/reference.mp4",
+        })
+
+    async def test_oversized_local_media_is_rejected_without_reading_bytes(self):
+        payload = main.CanvasVideoRequest(
+            prompt="edit", model="gemini-omni-flash-preview",
+            videos=["/assets/input/large.mp4"],
+        )
+        with patch.object(main, "local_media_path_for_cloud_upload", return_value="C:/media/large.mp4"), \
+                patch.object(main.os.path, "isfile", return_value=True), \
+                patch.object(main.os.path, "getsize", return_value=4 * 1024 * 1024 + 1), \
+                patch("builtins.open", side_effect=AssertionError("oversized media must not be read")):
+            with self.assertRaises(main.HTTPException) as raised:
+                await main.build_ominilink_omni_request(payload)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("HTTPS", raised.exception.detail)
+
     async def test_video_edit_rejects_non_video_mimes(self):
         for reference_url in (
             "data:image/png;base64,aGVsbG8=",
@@ -244,10 +311,10 @@ class OminiLinkVideoRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(image_body["input"][0]["content"][1]["mime_type"], "image/vnd.example+json.test-base64")
         self.assertEqual(video_body["input"][0]["content"][1]["mime_type"], "video/vnd.example+json.test-base64")
 
-    async def test_video_edit_rejects_http_references_locally(self):
+    async def test_video_edit_rejects_http_and_private_https_references_locally(self):
         payload = main.CanvasVideoRequest(
             prompt="edit", model="gemini-omni-flash-preview",
-            videos=["https://cdn.example.test/clip.mp4"],
+            videos=["http://cdn.example.test/clip.mp4"],
         )
 
         with self.assertRaises(main.HTTPException) as raised:
@@ -255,6 +322,18 @@ class OminiLinkVideoRequestTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 400)
         self.assertIn("HTTP", raised.exception.detail)
+
+        with self.assertRaises(main.HTTPException) as raised:
+            await main.build_ominilink_omni_request(
+                main.CanvasVideoRequest(
+                    prompt="edit", model="gemini-omni-flash-preview",
+                    videos=["https://user:pass@127.0.0.1/clip.mp4"],
+                ),
+                resolver=lambda _host: ["127.0.0.1"],
+            )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("HTTPS", raised.exception.detail)
 
     async def test_video_edit_rejects_an_unresolvable_local_reference(self):
         payload = main.CanvasVideoRequest(
@@ -409,6 +488,74 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
             ["https://cdn.example.test/result.mp4"],
         )
 
+    async def test_result_downloader_saves_public_https_video_as_local_asset(self):
+        target = os.path.join(tempfile.gettempdir(), "ominilink-result.mp4")
+        client = DownloadClient([DownloadResponse(content=b"durable-video")])
+        with patch.object(main, "output_path_for", return_value=target), \
+                patch.object(main, "output_url_for", return_value="/assets/output/ominilink-result.mp4"):
+            result = await main.save_ominilink_video_to_output(
+                "https://cdn.example.test/result.mp4?token=secret",
+                client=client,
+                resolver=lambda _host: ["93.184.216.34"],
+            )
+        try:
+            self.assertEqual(result, "/assets/output/ominilink-result.mp4")
+            with open(target, "rb") as handle:
+                self.assertEqual(handle.read(), b"durable-video")
+            self.assertFalse(client.calls[0][1].get("follow_redirects", True))
+        finally:
+            if os.path.exists(target):
+                os.unlink(target)
+
+    async def test_result_downloader_rejects_private_initial_and_redirect_hosts(self):
+        with self.assertRaises(main.HTTPException) as raised:
+            await main.save_ominilink_video_to_output(
+                "https://private.example.test/result.mp4",
+                client=DownloadClient(),
+                resolver=lambda _host: ["127.0.0.1"],
+            )
+        self.assertEqual(raised.exception.status_code, 502)
+
+        client = DownloadClient([DownloadResponse(302, headers={"Location": "https://127.0.0.1/private.mp4"})])
+        with self.assertRaises(main.HTTPException) as raised:
+            await main.save_ominilink_video_to_output(
+                "https://cdn.example.test/result.mp4",
+                client=client,
+                resolver=lambda _host: ["93.184.216.34"],
+            )
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(len(client.calls), 1)
+
+    async def test_result_download_failure_never_leaks_signed_url_or_returns_it(self):
+        signed = "https://cdn.example.test/result.mp4?token=private-signed-token"
+        client = DownloadClient(exc=main.httpx.ConnectError(
+            f"connect failed: {signed}",
+            request=main.httpx.Request("GET", signed),
+        ))
+        with self.assertRaises(main.HTTPException) as raised:
+            await main.save_ominilink_video_to_output(
+                signed,
+                client=client,
+                resolver=lambda _host: ["93.184.216.34"],
+            )
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertNotIn("private-signed-token", raised.exception.detail)
+        self.assertNotIn("cdn.example.test", raised.exception.detail)
+
+        completed = FakeResponse(200, {
+            "id": "job-download-fallback", "status": "completed",
+            "steps": [{"content": [{"type": "video", "uri": signed}]}],
+        })
+        with patch.object(main, "save_ominilink_video_to_output", new=AsyncMock(return_value=signed)):
+            with self.assertRaises(main.HTTPException) as raised:
+                await main.generate_ominilink_video(
+                    main.CanvasVideoRequest(prompt="go", model="gemini-omni-flash-preview"),
+                    self.provider,
+                    client=RecordingClient([completed]),
+                )
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertNotIn("private-signed-token", raised.exception.detail)
+
     def test_video_size_maps_supported_ratios_and_falls_back(self):
         expected = {
             "16:9": "1280x720",
@@ -473,7 +620,7 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
             "/assets/output/second.mp4",
         ])
 
-        with patch.object(main, "save_remote_video_to_output", new=save):
+        with patch.object(main, "save_ominilink_video_to_output", new=save):
             result = await main.generate_ominilink_video(
                 main.CanvasVideoRequest(
                     prompt="go",
@@ -521,7 +668,7 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         save = AsyncMock(return_value="/assets/output/nested.mp4")
 
         with patch.object(main.asyncio, "sleep", new=AsyncMock()), \
-                patch.object(main, "save_remote_video_to_output", new=save):
+                patch.object(main, "save_ominilink_video_to_output", new=save):
             result = await main.generate_ominilink_video(
                 main.CanvasVideoRequest(
                     prompt="go",
@@ -560,7 +707,7 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         save = AsyncMock(return_value="/assets/output/v.mp4")
 
         with patch.object(main.asyncio, "sleep", new=AsyncMock()), \
-                patch.object(main, "save_remote_video_to_output", new=save):
+                patch.object(main, "save_ominilink_video_to_output", new=save):
             result = await main.generate_ominilink_video(
                 main.CanvasVideoRequest(
                     prompt="go",
@@ -749,7 +896,7 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         client = RecordingClient([completed])
         save = AsyncMock(return_value="/assets/output/now.mp4")
 
-        with patch.object(main, "save_remote_video_to_output", new=save):
+        with patch.object(main, "save_ominilink_video_to_output", new=save):
             result = await main.generate_ominilink_video(
                 main.CanvasVideoRequest(
                     prompt="go",
@@ -822,7 +969,7 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         save = AsyncMock(return_value="/assets/output/basic.mp4")
 
         with patch.object(main.asyncio, "sleep", new=AsyncMock()), \
-                patch.object(main, "save_remote_video_to_output", new=save):
+                patch.object(main, "save_ominilink_video_to_output", new=save):
             result = await main.generate_ominilink_video(
                 main.CanvasVideoRequest(
                     prompt="go", model="seedance-2.0", duration=6,
@@ -884,7 +1031,7 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         save = AsyncMock(return_value="/assets/output/encoded.mp4")
 
         with patch.object(main.asyncio, "sleep", new=AsyncMock()), \
-                patch.object(main, "save_remote_video_to_output", new=save):
+                patch.object(main, "save_ominilink_video_to_output", new=save):
             result = await main.generate_ominilink_video(
                 main.CanvasVideoRequest(
                     prompt="go", model="seedance/model 2", duration=6,
@@ -1295,7 +1442,7 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(main.asyncio, "timeout", new=None, create=True), \
                 patch.object(main.asyncio, "sleep", new=AsyncMock()), \
-                patch.object(main, "save_remote_video_to_output", new=save):
+                patch.object(main, "save_ominilink_video_to_output", new=save):
             result = await asyncio.wait_for(
                 main.generate_ominilink_video(
                     main.CanvasVideoRequest(
@@ -1421,7 +1568,7 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(main, "VIDEO_POLL_TIMEOUT", 123.0), \
                 patch.object(main.httpx, "AsyncClient", return_value=client) as factory, \
-                patch.object(main, "save_remote_video_to_output", new=save):
+                patch.object(main, "save_ominilink_video_to_output", new=save):
             result = await main.generate_ominilink_video(
                 main.CanvasVideoRequest(
                     prompt="go",

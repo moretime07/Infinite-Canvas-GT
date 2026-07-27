@@ -25,6 +25,8 @@ import math
 import shlex
 import functools
 import html
+import ipaddress
+import socket
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Optional, Tuple
 from threading import Lock, Thread
@@ -7503,6 +7505,62 @@ async def save_remote_video_to_output(url, prefix="video_", category="output"):
             pass
         return url
 
+async def save_ominilink_video_to_output(url, prefix="video_", category="output", client=None, resolver=None):
+    """Download an OminiLink result only after SSRF-safe validation at every hop."""
+    video_exts = {".mp4", ".webm", ".mov", ".m4v", ".avi", ".mkv", ".flv"}
+    path = ""
+
+    def safe_url(value):
+        try:
+            return ominilink_public_https_uri(value, resolver=resolver)
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail="OminiLink 视频结果下载地址不安全。") from exc
+
+    async def download(active_client):
+        nonlocal path
+        current = safe_url(url)
+        for _ in range(4):
+            response = await active_client.get(current, follow_redirects=False)
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if 300 <= status_code < 400:
+                location = str((getattr(response, "headers", {}) or {}).get("Location") or "").strip()
+                if not location:
+                    raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
+                current = safe_url(urllib.parse.urljoin(current, location))
+                continue
+            response.raise_for_status()
+            content_type = str((getattr(response, "headers", {}) or {}).get("Content-Type") or "").lower()
+            if "text/html" in content_type or "application/json" in content_type:
+                raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
+            clean_ext = os.path.splitext(urllib.parse.urlsplit(current).path)[1].lower()
+            stem = f"{prefix}{uuid.uuid4().hex[:10]}"
+            filename = f"{stem}{clean_ext if clean_ext in video_exts else '.mp4'}"
+            path = output_path_for(filename, category)
+            with open(path, "wb") as handle:
+                handle.write(response.content)
+            if os.path.getsize(path) <= 0:
+                raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
+            return output_url_for(filename, category)
+        raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
+
+    try:
+        if client is not None:
+            return await download(client)
+        timeout = httpx.Timeout(connect=20.0, read=VIDEO_POLL_TIMEOUT, write=60.0, pool=20.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as owned_client:
+            return await download(owned_client)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。") from exc
+    finally:
+        if path:
+            try:
+                if os.path.exists(path) and os.path.getsize(path) <= 0:
+                    os.remove(path)
+            except OSError:
+                pass
+
 def parse_size_pair(size):
     match = re.fullmatch(r"\s*(\d+)\s*[xX*]\s*(\d+)\s*", str(size or ""))
     if not match:
@@ -11972,7 +12030,71 @@ def ominilink_video_size(aspect_ratio: str, resolution: str = "") -> str:
         "9:21": "720x1680",
     }.get(str(aspect_ratio or "").strip(), "1280x720")
 
-def split_data_url(value: str) -> tuple[str, str]:
+OMINILINK_INLINE_MEDIA_MAX_BYTES = 4 * 1024 * 1024
+
+def _ominilink_public_host_addresses(host: str, resolver=None) -> list[str]:
+    if resolver is not None:
+        resolved = resolver(host)
+    else:
+        resolved = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    addresses = []
+    for item in resolved:
+        if isinstance(item, str):
+            addresses.append(item)
+        elif isinstance(item, (tuple, list)):
+            candidate = item[-1] if item and isinstance(item[-1], (tuple, list)) else item
+            if isinstance(candidate, (tuple, list)) and candidate:
+                addresses.append(str(candidate[0]))
+            elif candidate:
+                addresses.append(str(candidate))
+    return addresses
+
+def ominilink_public_https_uri(value: str, resolver=None) -> str:
+    text = str(value or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(text)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("invalid URL") from exc
+    host = (parsed.hostname or "").strip().rstrip(".").lower()
+    if (
+        parsed.scheme.lower() != "https"
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or "%" in host
+        or host == "localhost"
+        or host.endswith(".localhost")
+        or host.endswith(".local")
+        or (port is not None and not (1 <= port <= 65535))
+    ):
+        raise ValueError("unsafe URL")
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    try:
+        addresses = [str(literal)] if literal is not None else _ominilink_public_host_addresses(host, resolver)
+    except (OSError, socket.gaierror, TypeError, ValueError) as exc:
+        raise ValueError("unresolvable host") from exc
+    if not addresses:
+        raise ValueError("unresolvable host")
+    try:
+        if any(not ipaddress.ip_address(address).is_global for address in addresses):
+            raise ValueError("non-public host")
+    except ValueError as exc:
+        if str(exc) == "non-public host":
+            raise
+        raise ValueError("invalid resolved address") from exc
+    return text
+
+def _ominilink_inline_media_error() -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail="Omni Flash 内联参考素材不能超过 4 MiB；请提供已验证的公网 HTTPS 媒体 URI。",
+    )
+
+def split_data_url(value: str, max_bytes=None) -> tuple[str, str]:
     match = re.fullmatch(r"data:([^;,]+);base64,(.+)", str(value or ""), re.S)
     if not match:
         raise HTTPException(status_code=400, detail="参考素材必须能转换为 base64 数据")
@@ -11980,35 +12102,61 @@ def split_data_url(value: str) -> tuple[str, str]:
     if not re.fullmatch(r"[-!#$%&'*+.\^_`|~0-9A-Za-z]+/[-!#$%&'*+.\^_`|~0-9A-Za-z]+", mime_type):
         raise HTTPException(status_code=400, detail="参考素材包含无效的 MIME 类型")
     data = re.sub(r"\s+", "", match.group(2))
+    if max_bytes is not None:
+        unpadded_length = len(data.rstrip("="))
+        remainder = unpadded_length % 4
+        estimated_bytes = (unpadded_length // 4) * 3 + {0: 0, 2: 1, 3: 2}.get(remainder, 0)
+        if remainder == 1 or estimated_bytes > int(max_bytes):
+            raise _ominilink_inline_media_error()
     try:
         decoded = base64.b64decode(data, validate=True)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="参考素材包含无效的 base64 数据") from exc
     if not decoded:
         raise HTTPException(status_code=400, detail="参考素材包含空的 base64 数据")
+    if max_bytes is not None and len(decoded) > max_bytes:
+        raise _ominilink_inline_media_error()
     return mime_type, base64.b64encode(decoded).decode("ascii")
 
-def ominilink_video_content_item(value: str) -> dict:
+def ominilink_media_content_item(value: str, expected_prefix: str, resolver=None) -> dict:
     text = str(value or "").strip()
     if text.startswith("data:"):
-        mime_type, data = split_data_url(text)
-        if not mime_type.startswith("video/"):
-            raise HTTPException(status_code=400, detail="Omni Flash 参考视频必须使用 video/* 媒体类型。")
-    else:
-        if text.startswith(("http://", "https://")):
-            raise HTTPException(status_code=400, detail="Omni Flash 参考视频不支持 HTTP(S) URL，请使用本地画布视频。")
-        path = local_media_path_for_cloud_upload(text, ("video/",))
-        if not path or not os.path.isfile(path):
-            raise HTTPException(status_code=400, detail="Omni Flash 本地参考视频不存在或无法安全读取。")
+        mime_type, data = split_data_url(text, max_bytes=OMINILINK_INLINE_MEDIA_MAX_BYTES)
+        if not mime_type.startswith(expected_prefix):
+            label = "图片" if expected_prefix == "image/" else "视频"
+            raise HTTPException(status_code=400, detail=f"Omni Flash 参考{label}必须使用 {expected_prefix}* 媒体类型。")
+        return {"type": expected_prefix[:-1], "data": data, "mime_type": mime_type}
+    if text.startswith(("http://", "https://")):
         try:
-            with open(path, "rb") as handle:
-                data = base64.b64encode(handle.read()).decode("ascii")
-        except OSError as exc:
-            raise HTTPException(status_code=400, detail="Omni Flash 本地参考视频无法读取。") from exc
-        mime_type = content_type_for_path(path)
-    return {"type": "video", "data": data, "mime_type": mime_type}
+            uri = ominilink_public_https_uri(text, resolver=resolver)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Omni Flash 远程参考素材只支持安全的公网 HTTPS 媒体 URI。",
+            ) from exc
+        return {"type": expected_prefix[:-1], "uri": uri}
+    path = local_media_path_for_cloud_upload(text, (expected_prefix,))
+    if not path or not os.path.isfile(path):
+        label = "图片" if expected_prefix == "image/" else "视频"
+        raise HTTPException(status_code=400, detail=f"Omni Flash 本地参考{label}不存在或无法安全读取。")
+    if os.path.getsize(path) > OMINILINK_INLINE_MEDIA_MAX_BYTES:
+        raise _ominilink_inline_media_error()
+    try:
+        with open(path, "rb") as handle:
+            data = base64.b64encode(handle.read()).decode("ascii")
+    except OSError as exc:
+        label = "图片" if expected_prefix == "image/" else "视频"
+        raise HTTPException(status_code=400, detail=f"Omni Flash 本地参考{label}无法读取。") from exc
+    mime_type = content_type_for_path(path)
+    if not mime_type.startswith(expected_prefix):
+        label = "图片" if expected_prefix == "image/" else "视频"
+        raise HTTPException(status_code=400, detail=f"Omni Flash 参考{label}必须使用 {expected_prefix}* 媒体类型。")
+    return {"type": expected_prefix[:-1], "data": data, "mime_type": mime_type}
 
-async def build_ominilink_omni_request(payload: CanvasVideoRequest) -> dict:
+def ominilink_video_content_item(value: str, resolver=None) -> dict:
+    return ominilink_media_content_item(value, "video/", resolver=resolver)
+
+async def build_ominilink_omni_request(payload: CanvasVideoRequest, resolver=None) -> dict:
     images = [ref for ref in (payload.images or []) if str(getattr(ref, "url", "") or "").strip()]
     videos = [str(value or "").strip() for value in (payload.videos or []) if str(value or "").strip()]
     audios = [str(value or "").strip() for value in (payload.audios or []) if str(value or "").strip()]
@@ -12026,17 +12174,13 @@ async def build_ominilink_omni_request(payload: CanvasVideoRequest) -> dict:
     content = [{"type": "text", "text": str(payload.prompt or "")}]
     task = "text_to_video"
     if images:
-        image_data_url = reference_to_data_url({"url": images[0].url}, max_size=1536)
-        mime_type, data = split_data_url(image_data_url)
-        if not mime_type.startswith("image/"):
-            raise HTTPException(status_code=400, detail="Omni Flash 参考图片必须使用 image/* 媒体类型。")
-        content.append({"type": "image", "data": data, "mime_type": mime_type})
+        content.append(ominilink_media_content_item(images[0].url, "image/", resolver=resolver))
         task = "image_to_video"
     elif videos:
-        duration = probe_local_video_duration_seconds(videos[0])
+        duration = None if videos[0].startswith(("http://", "https://", "data:")) else probe_local_video_duration_seconds(videos[0])
         if duration is not None and duration > 3:
             raise HTTPException(status_code=400, detail="Omni Flash 参考视频时长不能超过 3 秒。")
-        content.append(ominilink_video_content_item(videos[0]))
+        content.append(ominilink_video_content_item(videos[0], resolver=resolver))
         task = "edit"
 
     return {
@@ -12512,9 +12656,11 @@ async def generate_ominilink_video(payload, provider, client=None) -> dict:
                     ),
                 )
             local_urls = [
-                await save_remote_video_to_output(url)
+                await save_ominilink_video_to_output(url)
                 for url in urls
             ]
+            if any(not str(local_url or "").startswith(("/output/", "/assets/")) for local_url in local_urls):
+                raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
             return {"videos": local_urls, "task_id": task_id, "raw": result}
         except httpx.HTTPError as exc:
             raise HTTPException(
