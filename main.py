@@ -6552,6 +6552,33 @@ def probe_local_audio_duration_seconds(value: str) -> Optional[float]:
     except Exception:
         return None
 
+def probe_local_video_duration_seconds(value: str) -> Optional[float]:
+    path = output_file_from_url(value)
+    if not path or not os.path.isfile(path):
+        return None
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if proc.returncode != 0:
+            return None
+        duration = float(str(proc.stdout or "").strip())
+        return duration if math.isfinite(duration) and duration > 0 else None
+    except Exception:
+        return None
+
 async def volcengine_video_reference_content_items(value, max_frames=4, max_size=768):
     text = str(value or "").strip()
     if not text:
@@ -11876,6 +11903,72 @@ def video_api_root(provider):
     if base_url.endswith("/v1") or base_url.endswith("/v2"):
         base_url = base_url.rsplit("/", 1)[0]
     return base_url
+
+def ominilink_video_api_root(provider: dict) -> str:
+    return str(provider.get("video_base_url") or video_api_root(provider) or "").rstrip("/")
+
+def split_data_url(value: str) -> tuple[str, str]:
+    match = re.fullmatch(r"data:([^;,]+);base64,(.+)", str(value or ""), re.S)
+    if not match:
+        raise HTTPException(status_code=400, detail="参考素材必须能转换为 base64 数据")
+    return match.group(1).lower(), re.sub(r"\s+", "", match.group(2))
+
+def ominilink_video_content_item(value: str) -> dict:
+    text = str(value or "").strip()
+    if text.startswith("data:"):
+        mime_type, data = split_data_url(text)
+    else:
+        path = local_media_path_for_cloud_upload(text, ("video/",))
+        with open(path, "rb") as handle:
+            data = base64.b64encode(handle.read()).decode("ascii")
+        mime_type = content_type_for_path(path)
+    return {"type": "video", "data": data, "mime_type": mime_type}
+
+async def build_ominilink_omni_request(payload: CanvasVideoRequest) -> dict:
+    images = [ref for ref in (payload.images or []) if str(getattr(ref, "url", "") or "").strip()]
+    videos = [str(value or "").strip() for value in (payload.videos or []) if str(value or "").strip()]
+    audios = [str(value or "").strip() for value in (payload.audios or []) if str(value or "").strip()]
+    if payload.duration < 3 or payload.duration > 10:
+        raise HTTPException(status_code=400, detail="Omni Flash 视频时长必须在 3 到 10 秒之间。")
+    if audios:
+        raise HTTPException(status_code=400, detail="Omni Flash 不支持音频参考，请移除音频后重试。")
+    if images and videos:
+        raise HTTPException(status_code=400, detail="Omni Flash 不能同时提交图片和视频参考。")
+    if len(images) > 1:
+        raise HTTPException(status_code=400, detail="Omni Flash 图片生视频只支持一张参考图。")
+    if len(videos) > 1:
+        raise HTTPException(status_code=400, detail="Omni Flash 视频编辑只支持一个参考视频。")
+
+    content = [{"type": "text", "text": str(payload.prompt or "")}]
+    task = "text_to_video"
+    if images:
+        image_data_url = reference_to_data_url({"url": images[0].url}, max_size=1536)
+        mime_type, data = split_data_url(image_data_url)
+        content.append({"type": "image", "data": data, "mime_type": mime_type})
+        task = "image_to_video"
+    elif videos:
+        duration = probe_local_video_duration_seconds(videos[0])
+        if duration is not None and duration > 3:
+            raise HTTPException(status_code=400, detail="Omni Flash 参考视频时长不能超过 3 秒。")
+        content.append(ominilink_video_content_item(videos[0]))
+        task = "edit"
+
+    return {
+        "model": "gemini-omni-flash-preview",
+        "background": True,
+        "input": [{"type": "user_input", "content": content}],
+        "generation_config": {
+            "thinking_level": "low",
+            "thinking_summaries": "auto",
+            "video_config": {"task": task},
+        },
+        "response_format": {
+            "type": "video",
+            "delivery": "uri",
+            "aspect_ratio": payload.aspect_ratio or "16:9",
+            "duration": f"{payload.duration}s",
+        },
+    }
 
 def looks_like_html_response(text: str) -> bool:
     sample = str(text or "").lstrip()[:200].lower()
