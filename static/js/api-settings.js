@@ -2835,7 +2835,11 @@ async function testConnection(){
                 : data.connection_verified === false
                     ? ' · 未验证当前账号权限'
                     : '';
-            showVerifyResult(`<span style="color:#15803d;font-size:11px;font-weight:800">✓ 地址验证通过 · 找到 ${data.model_count} 个模型${runninghubNote}${sourceNote}</span>${volcengineNote}${jimengNote}`);
+            if(data.catalog_fallback){
+                showVerifyResult(`<span style="color:#92400e;font-size:11px;font-weight:800">已加载官方目录兜底（未验证当前账号权限） · 找到 ${data.model_count || data.total || 0} 个模型</span>`);
+            } else {
+                showVerifyResult(`<span style="color:#15803d;font-size:11px;font-weight:800">✓ 地址验证通过 · 找到 ${data.model_count} 个模型${runninghubNote}${sourceNote}</span>${volcengineNote}${jimengNote}`);
+            }
         } else {
             showVerifyResult(`
                 <div style="font-size:11px;font-weight:800;color:#b45309">⚠ 地址验证未通过 (HTTP ${data.status})</div>

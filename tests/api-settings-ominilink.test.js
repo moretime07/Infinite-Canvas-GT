@@ -41,12 +41,13 @@ async function createState(providerRows){
         querySelectorAll(){return [];},
         addEventListener(){}
     };
+    document.getElementById('keyInput').value = 'secret-value';
     const window = {addEventListener(){},parent:{postMessage(){}},top:{postMessage(){}},location:{href:''}};
     const fetch = async (url, options={}) => {
         calls.push({url, options});
         if(url === '/api/providers' && options.method === 'PUT') return {ok:true,json:async()=>({providers:clone(initialRows)})};
         if(url === '/api/providers') return {ok:true,json:async()=>({providers:clone(initialRows)})};
-        if(url === '/api/providers/test-connection'){
+        if(url === '/api/providers/test-connection' || url === '/api/providers/fetch-models'){
             return {ok:true,json:async()=>({
                 ok:true,
                 total:19,
@@ -64,7 +65,7 @@ async function createState(providerRows){
     const context = {document,window,fetch,URL,console,setTimeout,clearTimeout,alert(){},confirm(){return true;}};
     context.globalThis = context;
     const sourcePath = path.resolve(__dirname, '..', 'static', 'js', 'api-settings.js');
-    const source = fs.readFileSync(sourcePath, 'utf8') + '\n globalThis.__ominiLinkTest={loadProviders,syncEditor,renderEditor,saveProviders,testConnection,isOminiLinkApiUrl,defaultOminiLinkVideoBaseUrl};';
+    const source = fs.readFileSync(sourcePath, 'utf8') + '\n globalThis.__ominiLinkTest={loadProviders,syncEditor,renderEditor,saveProviders,testConnection,fetchModels,isOminiLinkApiUrl,defaultOminiLinkVideoBaseUrl};';
     vm.runInNewContext(source, context, {filename:sourcePath});
     await context.__ominiLinkTest.loadProviders();
     return {api:context.__ominiLinkTest,calls,elements};
@@ -100,13 +101,22 @@ async function createState(providerRows){
     const body = JSON.parse(putCall.options.body);
     assert.equal(body[0].video_base_url, 'https://vg-api.aig-ai.com/v1');
     assert.ok(!Object.hasOwn(body[0], 'api_key'));
+    assert.ok(!JSON.stringify(body).includes('secret-value'));
 
     await state.api.testConnection();
     const verificationRequest = state.calls.find(call => call.url === '/api/providers/test-connection');
     assert.equal(JSON.parse(verificationRequest.options.body).video_base_url, 'https://vg-api.aig-ai.com/v1');
     const verification = state.elements.get('verifyResult').innerHTML;
     assert.match(verification, /官方目录兜底/);
-    assert.doesNotMatch(verification, /API Key 验证通过/);
+    assert.doesNotMatch(verification, /地址验证通过|API Key 验证通过|✓/);
+
+    await state.api.fetchModels();
+    const fetchRequest = state.calls.find(call => call.url === '/api/providers/fetch-models');
+    assert.equal(JSON.parse(fetchRequest.options.body).video_base_url, 'https://vg-api.aig-ai.com/v1');
+    const fetchStatus = state.elements.get('status').textContent;
+    assert.match(fetchStatus, /官方目录兜底/);
+    assert.match(fetchStatus, /未验证当前账号权限/);
+    assert.doesNotMatch(fetchStatus, /地址验证通过|API Key 验证通过/);
     console.log('api-settings-ominilink tests passed');
 })().catch(error => {
     console.error(error);
