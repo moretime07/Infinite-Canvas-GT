@@ -418,3 +418,18 @@ def ensure_depth_assets(
         source_names=(VIDEO_DEPTH_ANYTHING_SOURCE.name,),
         artifact_names=("video_depth_anything_vits.pth",),
     )
+
+
+def ensure_pose_assets(
+    cache_root: Path,
+    progress: Callable[[str, float], None],
+    cancelled: Callable[[], bool],
+) -> dict[str, Path]:
+    """Prepare exactly the pinned DWPose source and its two ONNX artifacts."""
+    return ensure_motion_assets(
+        cache_root,
+        progress,
+        cancelled,
+        source_names=(DWPOSE_SOURCE.name,),
+        artifact_names=("yolox_l.onnx", "dw-ll_ucoco_384.onnx"),
+    )
