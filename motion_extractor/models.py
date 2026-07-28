@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import os
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -116,11 +115,29 @@ _HASH_CHUNK_SIZE = 1024 * 1024
 
 
 def _model_directory(cache_root: Path) -> Path:
-    return Path(cache_root) / "motion_models"
+    return _cache_path(cache_root, "motion_models")
 
 
 def _source_directory(cache_root: Path) -> Path:
-    return Path(cache_root) / "motion_sources"
+    return _cache_path(cache_root, "motion_models", "sources")
+
+
+def _cache_path(cache_root: Path, *parts: str) -> Path:
+    root = Path(cache_root).resolve()
+    candidate = root.joinpath(*parts)
+    try:
+        candidate.resolve(strict=False).relative_to(root)
+    except ValueError as error:
+        raise MotionAssetError("Motion runtime path escapes the supplied cache root") from error
+    return candidate
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def _is_cancelled(cancelled: Callable[[], bool]) -> None:
@@ -143,6 +160,7 @@ def _has_expected_hash(path: Path, artifact: ModelArtifact) -> bool:
 
 
 def _download_artifact(
+    cache_root: Path,
     artifact: ModelArtifact,
     destination: Path,
     progress: Callable[[str, float], None],
@@ -157,7 +175,16 @@ def _download_artifact(
     part_path.unlink(missing_ok=True)
     progress(f"Downloading {artifact.filename}", 0.0)
     try:
-        downloaded = Path(hf_hub_download(repo_id=artifact.repo_id, filename=artifact.filename))
+        downloaded = Path(
+            hf_hub_download(
+                repo_id=artifact.repo_id,
+                filename=artifact.filename,
+                cache_dir=str(_cache_path(cache_root, "motion_models", ".hf-cache")),
+                local_dir=str(_cache_path(cache_root, "motion_models", ".hf-downloads")),
+            )
+        )
+        if not _is_within(downloaded, Path(cache_root)):
+            raise MotionIntegrityError("Downloaded model escaped the supplied cache root")
         _is_cancelled(cancelled)
         with downloaded.open("rb") as source_handle, part_path.open("wb") as target_handle:
             while chunk := source_handle.read(_HASH_CHUNK_SIZE):
@@ -181,34 +208,55 @@ def ensure_model_artifact(
     cancelled: Callable[[], bool],
 ) -> Path:
     """Return a manifest-verified model, downloading it only when necessary."""
-    destination = _model_directory(cache_root) / artifact.filename
+    destination = _cache_path(cache_root, "motion_models", artifact.filename)
     if _has_expected_hash(destination, artifact):
         progress(f"Reusing {artifact.filename}", 1.0)
         return destination
     destination.unlink(missing_ok=True)
-    return _download_artifact(artifact, destination, progress, cancelled)
+    return _download_artifact(cache_root, artifact, destination, progress, cancelled)
 
 
-def verify_source_checkout(checkout: Path, source: GitSource) -> None:
-    """Reject a checkout unless its current HEAD is the immutable pinned commit."""
+def verify_source_checkout(checkout: Path, source: GitSource, source_root: Path) -> None:
+    """Reject a checkout unless it is clean, contained, and at its pinned commit."""
+    if (
+        not checkout.is_dir()
+        or checkout.is_symlink()
+        or not _is_within(checkout, source_root)
+        or any(path.is_symlink() and not _is_within(path, checkout) for path in checkout.rglob("*"))
+    ):
+        raise MotionSourceError(f"Source {source.name} escapes its verified cache directory")
     try:
-        result = subprocess.run(
+        head = subprocess.run(
             ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        status = subprocess.run(
+            ["git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching"],
             check=True,
             capture_output=True,
             text=True,
         )
     except (OSError, subprocess.CalledProcessError) as error:
         raise MotionSourceError(f"Unable to verify pinned source {source.name}") from error
-    if result.stdout.strip().lower() != source.commit.lower():
+    if head.stdout.strip().lower() != source.commit.lower():
         raise MotionSourceError(f"Source {source.name} is not at its pinned commit")
+    if status.stdout.strip():
+        raise MotionSourceError(f"Source {source.name} contains local modifications")
 
 
 def ensure_source_checkout(cache_root: Path, source: GitSource) -> Path:
     """Clone a source without checking out a branch, then detach at its pinned commit."""
-    checkout = _source_directory(cache_root) / source.name
+    try:
+        source_root = _source_directory(cache_root)
+        checkout = _cache_path(cache_root, "motion_models", "sources", source.name)
+    except MotionAssetError as error:
+        raise MotionSourceError(f"Source {source.name} escapes its verified cache directory") from error
+    if checkout.is_symlink():
+        raise MotionSourceError(f"Source {source.name} escapes its verified cache directory")
     if checkout.exists():
-        verify_source_checkout(checkout, source)
+        verify_source_checkout(checkout, source, source_root)
         return checkout
 
     checkout.parent.mkdir(parents=True, exist_ok=True)
@@ -225,7 +273,7 @@ def ensure_source_checkout(cache_root: Path, source: GitSource) -> Path:
             capture_output=True,
             text=True,
         )
-        verify_source_checkout(checkout, source)
+        verify_source_checkout(checkout, source, source_root)
     except (OSError, subprocess.CalledProcessError) as error:
         raise MotionSourceError(f"Unable to prepare pinned source {source.name}") from error
     return checkout
@@ -271,7 +319,7 @@ def ensure_motion_assets(
     for source in GIT_SOURCES:
         _is_cancelled(cancelled)
         checkout = ensure_source_checkout(cache_root, source)
-        verify_source_checkout(checkout, source)
+        verify_source_checkout(checkout, source, _source_directory(cache_root))
         checkout_string = str(checkout)
         if checkout_string not in sys.path:
             sys.path.insert(0, checkout_string)

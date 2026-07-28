@@ -1,5 +1,6 @@
 import hashlib
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -34,12 +35,13 @@ class MotionModelCacheTests(unittest.TestCase):
             return models.ensure_motion_assets(self.cache_root, lambda _message, _progress: None, cancelled)
 
     def make_downloader(self, payload=None, calls=None):
-        source = Path(self.temp_dir.name) / "downloaded-model"
-        source.write_bytes(self.payload if payload is None else payload)
-
-        def download(**_kwargs):
+        def download(**kwargs):
             if calls is not None:
-                calls.append(True)
+                calls.append(kwargs)
+            download_root = Path(kwargs.get("local_dir", self.temp_dir.name))
+            source = download_root / self.artifact.filename
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(self.payload if payload is None else payload)
             return str(source)
 
         return download
@@ -65,7 +67,7 @@ class MotionModelCacheTests(unittest.TestCase):
 
         assets = self.ensure(self.make_downloader(calls=calls))
 
-        self.assertEqual(calls, [True])
+        self.assertEqual(len(calls), 1)
         self.assertEqual(assets[self.artifact.filename].read_bytes(), self.payload)
         self.assertFalse(destination.with_suffix(destination.suffix + ".part").exists())
 
@@ -77,7 +79,7 @@ class MotionModelCacheTests(unittest.TestCase):
 
         assets = self.ensure(self.make_downloader(calls=calls))
 
-        self.assertEqual(calls, [True])
+        self.assertEqual(len(calls), 1)
         self.assertTrue(assets[self.artifact.filename].is_file())
         self.assertFalse(part_file.exists())
 
@@ -98,12 +100,32 @@ class MotionModelCacheTests(unittest.TestCase):
         self.assertEqual(observations, [(True, False)])
         self.assertEqual(destination.read_bytes(), self.payload)
 
+    def test_directs_huggingface_download_storage_below_the_cache_root(self):
+        calls = []
+
+        self.ensure(self.make_downloader(calls=calls))
+
+        self.assertEqual(len(calls), 1)
+        for key in ("cache_dir", "local_dir"):
+            self.assertTrue(Path(calls[0][key]).resolve().is_relative_to(self.cache_root.resolve()))
+
+    def test_wrong_hash_never_promotes_a_final_model_file(self):
+        destination = self.cache_root / "motion_models" / self.artifact.filename
+        replacement_calls = []
+
+        with patch.object(models.os, "replace", side_effect=lambda *_args: replacement_calls.append(True)):
+            with self.assertRaises(models.MotionIntegrityError):
+                self.ensure(self.make_downloader(payload=b"invalid-model-data"))
+
+        self.assertEqual(replacement_calls, [])
+        self.assertFalse(destination.exists())
+
     def test_cancellation_leaves_no_valid_looking_final_file(self):
         cancelled = {"value": False}
-        source = Path(self.temp_dir.name) / "downloaded-model"
-        source.write_bytes(self.payload)
-
-        def downloader(**_kwargs):
+        def downloader(**kwargs):
+            source = Path(kwargs.get("local_dir", self.temp_dir.name)) / self.artifact.filename
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(self.payload)
             cancelled["value"] = True
             return str(source)
 
@@ -119,7 +141,7 @@ class MotionModelCacheTests(unittest.TestCase):
             url="https://example.invalid/source.git",
             commit="a" * 40,
         )
-        checkout = self.cache_root / "motion_sources" / source.name
+        checkout = self.cache_root / "motion_models" / "sources" / source.name
         checkout.mkdir(parents=True)
         completed = CompletedProcess(
             args=["git", "rev-parse", "HEAD"],
@@ -130,7 +152,79 @@ class MotionModelCacheTests(unittest.TestCase):
 
         with patch.object(models.subprocess, "run", return_value=completed):
             with self.assertRaises(models.MotionSourceError):
-                models.verify_source_checkout(checkout, source)
+                models.verify_source_checkout(checkout, source, checkout.parent)
+
+    def test_places_source_checkouts_below_the_model_cache(self):
+        source = models.GitSource(
+            name="example-source",
+            url="https://example.invalid/source.git",
+            commit="a" * 40,
+        )
+
+        def git_run(command, **_kwargs):
+            if command[1] == "clone":
+                Path(command[-1]).mkdir(parents=True)
+            if command[-2:] == ["rev-parse", "HEAD"]:
+                return CompletedProcess(command, 0, source.commit + "\n", "")
+            return CompletedProcess(command, 0, "", "")
+
+        with patch.object(models.subprocess, "run", side_effect=git_run):
+            checkout = models.ensure_source_checkout(self.cache_root, source)
+
+        self.assertEqual(checkout, self.cache_root / "motion_models" / "sources" / source.name)
+
+    def test_rejects_dirty_tracked_source_checkout(self):
+        source = models.GitSource("example-source", "https://example.invalid/source.git", "a" * 40)
+        checkout = self.cache_root / "motion_models" / "sources" / source.name
+        checkout.mkdir(parents=True)
+
+        def git_run(command, **_kwargs):
+            if command[-2:] == ["rev-parse", "HEAD"]:
+                return CompletedProcess(command, 0, source.commit + "\n", "")
+            return CompletedProcess(command, 0, " M changed.py\n", "")
+
+        with patch.object(models.subprocess, "run", side_effect=git_run):
+            with self.assertRaises(models.MotionSourceError):
+                models.verify_source_checkout(checkout, source, checkout.parent)
+
+    def test_rejects_source_checkout_with_untracked_injected_file(self):
+        source = models.GitSource("example-source", "https://example.invalid/source.git", "a" * 40)
+        checkout = self.cache_root / "motion_models" / "sources" / source.name
+        checkout.mkdir(parents=True)
+
+        def git_run(command, **_kwargs):
+            if command[-2:] == ["rev-parse", "HEAD"]:
+                return CompletedProcess(command, 0, source.commit + "\n", "")
+            return CompletedProcess(command, 0, "?? injected.py\n", "")
+
+        with patch.object(models.subprocess, "run", side_effect=git_run):
+            with self.assertRaises(models.MotionSourceError):
+                models.verify_source_checkout(checkout, source, checkout.parent)
+
+    def test_rejects_source_checkout_path_escape(self):
+        source = models.GitSource("../outside", "https://example.invalid/source.git", "a" * 40)
+
+        with self.assertRaises(models.MotionSourceError):
+            models.ensure_source_checkout(self.cache_root, source)
+
+    def test_rejects_source_checkout_symlink_escape(self):
+        source = models.GitSource("example-source", "https://example.invalid/source.git", "a" * 40)
+        checkout = self.cache_root / "motion_models" / "sources" / source.name
+        checkout.parent.mkdir(parents=True)
+        outside = Path(self.temp_dir.name) / "outside"
+        outside.mkdir()
+        try:
+            os.symlink(outside, checkout, target_is_directory=True)
+        except OSError as error:
+            junction = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(checkout), str(outside)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(junction.returncode, 0, f"could not create an escaping link: {error}")
+
+        with self.assertRaises(models.MotionSourceError):
+            models.ensure_source_checkout(self.cache_root, source)
 
     def test_runtime_status_serialization_has_names_without_absolute_paths(self):
         status = models.MotionRuntimeStatus(
