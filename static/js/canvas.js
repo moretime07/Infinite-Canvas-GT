@@ -6191,10 +6191,15 @@ function renderNode(node){
         if(e.button !== 0 || !isNodeDragSurface(e.target)) return;
         startNodeDrag(e, node);
     };
+    const namedOutputPorts = nodeOutputPorts(node);
     const canInput = ['generator','comfy','ltxDirector','output','llm','msgen','video','rh'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
-    const canOutput = ['image','prompt','loop','group','promptGroup','generator','comfy','ltxDirector','llm','msgen','video','rh','output'].includes(node.type);
+    const canOutput = namedOutputPorts.length || ['image','prompt','loop','group','promptGroup','generator','comfy','ltxDirector','llm','msgen','video','rh','output'].includes(node.type);
     if(canInput) el.insertAdjacentHTML('beforeend', `<div class="port in" title="${tr('canvas.connectHere')}"></div>`);
-    if(canOutput) el.insertAdjacentHTML('beforeend', `<div class="port out" title="${tr('canvas.dragConnect')}"></div>`);
+    if(namedOutputPorts.length){
+        el.insertAdjacentHTML('beforeend', namedOutputPorts.map(port => `<div class="port out named-port ${port.disabled ? 'disabled' : ''}" data-port-kind="out" data-port-name="${escapeAttr(port.name)}" title="${escapeAttr(port.label)}"><span class="port-label">${escapeHtml(port.label)}</span></div>`).join(''));
+    } else if(canOutput) {
+        el.insertAdjacentHTML('beforeend', `<div class="port out" title="${tr('canvas.dragConnect')}"></div>`);
+    }
     el.insertAdjacentHTML('beforeend', `<div class="resize-handle" title="${tr('canvas.resize')}"></div>`);
     el.querySelector('.node-head').onmousedown = e => {
         if(e.button !== 0) return;
@@ -6210,8 +6215,11 @@ function renderNode(node){
     };
     el.querySelector('.resize-handle').onmousedown = e => { if(e.button === 0 && !e.shiftKey) startNodeResize(e, node); };
     el.ondragstart = e => { e.preventDefault(); e.stopPropagation(); };
-    const out = el.querySelector('.port.out');
-    if(out) out.onmousedown = e => { if(e.button === 0 && !e.shiftKey) startLink(e, node.id, 'out'); };
+    el.querySelectorAll('.port.out').forEach(out => {
+        out.onmousedown = e => {
+            if(e.button === 0 && !e.shiftKey && !out.classList.contains('disabled')) startLink(e, node.id, 'out', out.dataset.portName || '');
+        };
+    });
     const inp = el.querySelector('.port.in');
     if(inp) inp.onmousedown = e => { if(e.button === 0 && !e.shiftKey) startLink(e, node.id, 'in'); };
     return el;
@@ -14005,12 +14013,27 @@ function onNodeResize(e){
     renderSelectionHub();
     scheduleMinimapRender();
 }
-function startLink(e, originId, originKind){
+function nodeOutputPorts(node){
+    if(node?.type !== 'motionExtract') return [];
+    return [
+        {name:'depth', label:'DEPTH', disabled:node.depthEnabled === false || node.depthState === 'disabled'},
+        {name:'pose', label:'POSE', disabled:node.poseEnabled !== true || node.poseState === 'disabled'},
+    ];
+}
+function normalizedFromPort(connection){
+    return typeof connection?.fromPort === 'string' ? connection.fromPort : '';
+}
+function connectionKey(fromId, toId, fromPort=''){
+    return `${fromId}\u0000${toId}\u0000${fromPort || ''}`;
+}
+function startLink(e, originId, originKind, originPort=''){
     e.stopPropagation();
     originKind = originKind || 'out';
-    const src = portPoint(originId, originKind);
     const source = nodes.find(n => n.id === originId);
-    tempLink = {from:originId, originKind, x1:src.x, y1:src.y, x2:src.x, y2:src.y};
+    originPort = originKind === 'out' ? originPort || '' : '';
+    if(originPort && !nodeOutputPorts(source).some(port => port.name === originPort && !port.disabled)) return;
+    const src = portPoint(originId, originKind, originPort);
+    tempLink = {from:originId, originKind, originPort, x1:src.x, y1:src.y, x2:src.x, y2:src.y};
     window.onmousemove = e2 => {
         const p = screenToWorld(e2.clientX, e2.clientY);
         tempLink.x2 = p.x;
@@ -14025,10 +14048,14 @@ function startLink(e, originId, originKind){
             const targetId = target.dataset.id;
             const fromId = originKind === 'out' ? originId : targetId;
             const toId = originKind === 'out' ? targetId : originId;
+            const fromPort = originKind === 'out' ? originPort : (targetPort?.dataset?.portName || '');
             if(canConnect(fromId, toId)){
-                if(!connections.some(c => c.from === fromId && c.to === toId)){
+                const key = connectionKey(fromId, toId, fromPort);
+                if(!connections.some(c => connectionKey(c.from, c.to, normalizedFromPort(c)) === key)){
                     pushUndo();
-                    connections.push({id:uid('c'), from:fromId, to:toId});
+                    const connection = {id:uid('c'), from:fromId, to:toId};
+                    if(fromPort) connection.fromPort = fromPort;
+                    connections.push(connection);
                     syncLatestGeneratedOutputToConnection(fromId, toId);
                 }
                 syncGeneratorInputs();
@@ -14061,10 +14088,11 @@ function startLink(e, originId, originKind){
 function nearestPort(clientX, clientY, kind){
     const selector = `.port.${kind}`;
     const direct = document.elementFromPoint(clientX, clientY)?.closest(selector);
-    if(direct) return direct;
+    if(direct) return direct.classList.contains('disabled') ? null : direct;
     let best = null;
     let bestDistance = Infinity;
     nodesEl.querySelectorAll(selector).forEach(port => {
+        if(port.classList.contains('disabled')) return;
         const r = port.getBoundingClientRect();
         const cx = r.left + r.width / 2;
         const cy = r.top + r.height / 2;
@@ -14107,6 +14135,7 @@ function canConnect(fromId, toId){
         }
         return false;
     }
+    if(from.type === 'motionExtract') return CANVAS_GENERATOR_TYPES.includes(to.type);
     if(to.type === 'loop'){
         const allowImage = Boolean(to.imageInput) && ['image','group','output'].includes(from.type);
         const allowPrompt = Boolean(to.showPrompt) && ['prompt','promptGroup','loop','llm'].includes(from.type);
@@ -14231,11 +14260,12 @@ function updateGroupMembership(movedNodes){
     }
 }
 
-function portPoint(id, kind){
+function portPoint(id, kind, portName=''){
     const n = nodes.find(x => x.id === id);
     if(!n) return {x:0,y:0};  // 真正的孤儿连线（节点已删除）：renderLinks 会跳过它
     const el = nodesEl.querySelector(`.node[data-id="${CSS.escape(id)}"]`);
-    const port = el?.querySelector(`.port.${kind}`);
+    const selector = kind === 'out' && portName ? `.port.${kind}[data-port-name="${CSS.escape(portName)}"]` : `.port.${kind}`;
+    const port = el?.querySelector(selector);
     if(port){
         const r = port.getBoundingClientRect();
         return screenToWorld(r.left + r.width / 2, r.top + r.height / 2);
@@ -14261,7 +14291,7 @@ function renderLinks(){
         // 端点无法解析（节点已删除、或尚未渲染出 DOM）就跳过，否则连线会被画到 (0,0)，
         // 看起来像很多连线都从同一个空白处中转。
         if(!canResolvePort(c.from) || !canResolvePort(c.to)) return;
-        segments.push({c, a:portPoint(c.from, 'out'), b:portPoint(c.to, 'in')});
+        segments.push({c, a:portPoint(c.from, 'out', normalizedFromPort(c)), b:portPoint(c.to, 'in')});
     });
     segments.forEach(({c, a, b}) => {
         linksEl.appendChild(pathEl(a.x, a.y, b.x, b.y, 'link'));
@@ -14312,7 +14342,7 @@ function setHoveredConnection(id){
     }
 }
 function connectionDistanceToPoint(connection, point){
-    const from = portPoint(connection.from, 'out');
+    const from = portPoint(connection.from, 'out', normalizedFromPort(connection));
     const to = portPoint(connection.to, 'in');
     let min = Infinity;
     let prev = cubicPoint(from, to, 0);
@@ -14396,7 +14426,7 @@ function cubicPoint(a, b, t){
     };
 }
 function knifeHitsConnection(a, b, connection){
-    const from = portPoint(connection.from, 'out');
+    const from = portPoint(connection.from, 'out', normalizedFromPort(connection));
     const to = portPoint(connection.to, 'in');
     const threshold = Math.max(8, 12 / viewport.scale);
     let prev = cubicPoint(from, to, 0);

@@ -649,6 +649,12 @@ input[type=range].canvas-range::-webkit-slider-runnable-track { height:3px; bord
 .port.in { left:-29px; cursor:crosshair; }
 .port.out { right:-15px; }
 .node > .port { top:50%; }
+.node > .port.named-port { top:calc(50% - 18px); height:26px; }
+.node > .port.named-port[data-port-name="pose"] { top:calc(50% + 18px); }
+.port.named-port::after { top:4px; }
+.port-label { position:absolute; right:34px; top:50%; transform:translateY(-50%); padding:2px 5px; border-radius:5px; background:rgba(15,23,42,.76); color:#fff; font-size:9px; font-weight:850; letter-spacing:.08em; line-height:1.2; white-space:nowrap; pointer-events:none; }
+.port.named-port.disabled { cursor:not-allowed; opacity:.42; pointer-events:none; }
+.port.named-port.disabled::after { background:#94a3b8; }
 .ltxDirector-node > .port,
 .ltx-director-node > .port { top:50%; }
 .group-node,.promptGroup-node { min-width:260px; background:rgba(255,255,255,.96); border:1px solid #e8edf3; box-shadow:0 16px 42px rgba(15,23,42,.08); z-index:0; }
