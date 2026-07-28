@@ -556,7 +556,14 @@ class PoseProcessor:
                 reporter.report(0.68 + 0.31 * (index + 1) / total)
 
         self._check_cancelled(cancelled)
-        self._encoder(rendered(), frame_store.metadata, Path(output_path), Path(output_path), preserve_audio=False)
+        self._encoder(
+            rendered(),
+            frame_store.metadata,
+            Path(output_path),
+            Path(output_path),
+            preserve_audio=False,
+            cancelled=cancelled,
+        )
 
     @staticmethod
     def _check_cancelled(cancelled: Callable[[], bool]) -> None:

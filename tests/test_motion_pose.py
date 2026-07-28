@@ -88,8 +88,9 @@ class MotionPoseTests(unittest.TestCase):
     def _processor(
         self, directory: Path, detector: FakeDetectorSession, pose: FakePoseSession, captured: list[np.ndarray], **kwargs: object
     ) -> PoseProcessor:
-        def encode(frames, _metadata, destination, _source, preserve_audio):
+        def encode(frames, _metadata, destination, _source, preserve_audio, cancelled):
             self.assertFalse(preserve_audio)
+            self.assertTrue(callable(cancelled))
             captured.extend(np.asarray(frame).copy() for frame in frames)
             destination.write_bytes(b"fake mp4")
             return media.EncodeResult(destination=destination, audio_transcoded=False)

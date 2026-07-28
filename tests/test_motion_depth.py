@@ -162,8 +162,10 @@ class MotionDepthTests(unittest.TestCase):
             destination: Path,
             _source: Path,
             preserve_audio: bool,
+            cancelled,
         ) -> media.EncodeResult:
             self.assertFalse(preserve_audio)
+            self.assertTrue(callable(cancelled))
             captured.extend(np.asarray(frame).copy() for frame in frames)  # type: ignore[arg-type]
             destination.write_bytes(b"fake mp4")
             return media.EncodeResult(destination=destination, audio_transcoded=False)
@@ -493,13 +495,14 @@ class MotionDepthTests(unittest.TestCase):
             def cancelled() -> bool:
                 return cancel_requested
 
-            def encode(frame_iterable, metadata, destination, source, preserve_audio):
+            def encode(frame_iterable, metadata, destination, source, preserve_audio, cancelled):
                 nonlocal cancel_requested
                 iterator = iter(frame_iterable)
                 first = next(iterator)
                 cancel_requested = True
                 return media.encode_rgb_frames(
-                    chain((first,), iterator), metadata, destination, source, preserve_audio
+                    chain((first,), iterator), metadata, destination, source, preserve_audio,
+                    cancelled=cancelled,
                 )
 
             processor = DepthProcessor(

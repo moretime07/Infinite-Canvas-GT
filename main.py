@@ -28,19 +28,25 @@ import html
 import ipaddress
 import socket
 import xml.etree.ElementTree as ET
+from collections import deque
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from threading import Lock, Thread
 import httpx
 from PIL import Image, ImageOps
 from io import BytesIO
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, Request
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
-from motion_extractor.errors import MotionError, MotionValidationError
+from motion_extractor.errors import (
+    MotionError,
+    MotionQueueFull,
+    MotionRuntimeUnavailable,
+    MotionValidationError,
+)
 from motion_extractor.service import MotionTaskService
 
 QUIET_ACCESS_PATHS = {
@@ -78,6 +84,72 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _canvas_motion_same_host(request: Request, value: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        return False
+    host = str(request.headers.get("host") or "").strip().lower()
+    return parsed.scheme in {"http", "https"} and bool(host) and parsed.netloc.lower() == host
+
+
+def _require_canvas_motion_access(request: Request) -> None:
+    origin = str(request.headers.get("origin") or "").strip()
+    if origin:
+        if _canvas_motion_same_host(request, origin):
+            return
+        raise HTTPException(status_code=403, detail="Motion task access is same-origin only.")
+    referer = str(request.headers.get("referer") or "").strip()
+    if referer:
+        if _canvas_motion_same_host(request, referer):
+            return
+        raise HTTPException(status_code=403, detail="Motion task access is same-origin only.")
+    fetch_site = str(request.headers.get("sec-fetch-site") or "").strip().lower()
+    if fetch_site:
+        if fetch_site == "same-origin":
+            return
+        raise HTTPException(status_code=403, detail="Motion task access is same-origin only.")
+    client_host = str(getattr(request.client, "host", "") or "")
+    try:
+        if ipaddress.ip_address(client_host).is_loopback:
+            return
+    except ValueError:
+        pass
+    raise HTTPException(status_code=403, detail="Motion task access is same-origin only.")
+
+
+class _MotionSubmissionRateLimiter:
+    def __init__(self, limit: int = 30, window_seconds: float = 10.0) -> None:
+        self._limit = max(1, int(limit))
+        self._window_seconds = max(1.0, float(window_seconds))
+        self._attempts: dict[str, deque[float]] = {}
+        self._lock = Lock()
+
+    def allow(self, key: str, now: float | None = None) -> bool:
+        timestamp = time.monotonic() if now is None else float(now)
+        cutoff = timestamp - self._window_seconds
+        with self._lock:
+            attempts = self._attempts.setdefault(key, deque())
+            while attempts and attempts[0] <= cutoff:
+                attempts.popleft()
+            if len(attempts) >= self._limit:
+                return False
+            attempts.append(timestamp)
+            return True
+
+
+MOTION_SUBMISSION_RATE_LIMITER = _MotionSubmissionRateLimiter()
+
+
+def _require_canvas_motion_submission(request: Request) -> None:
+    _require_canvas_motion_access(request)
+    origin = str(request.headers.get("origin") or "").strip().lower()
+    client_host = str(getattr(request.client, "host", "") or "").lower()
+    key = origin or client_host or "local"
+    if not MOTION_SUBMISSION_RATE_LIMITER.allow(key):
+        raise HTTPException(status_code=429, detail="Too many local motion submissions.")
 
 # --- WebSocket 状态管理器 ---
 class ConnectionManager:
@@ -13852,7 +13924,11 @@ async def run_canvas_video_task(task_id: str, payload: CanvasVideoRequest):
                 })
 
 
-@app.post("/api/canvas-motion-tasks", status_code=202)
+@app.post(
+    "/api/canvas-motion-tasks",
+    status_code=202,
+    dependencies=[Depends(_require_canvas_motion_submission)],
+)
 async def create_canvas_motion_task(payload: CanvasMotionTaskRequest):
     if not payload.depth_enabled and not payload.pose_enabled:
         raise HTTPException(status_code=422, detail="At least one motion processor must be enabled.")
@@ -13860,7 +13936,7 @@ async def create_canvas_motion_task(payload: CanvasMotionTaskRequest):
     if not source_path:
         raise HTTPException(status_code=422, detail="A valid local application video is required.")
     try:
-        MOTION_TASK_SERVICE.preflight(Path(source_path))
+        await MOTION_TASK_SERVICE.preflight_async(Path(source_path))
         return await MOTION_TASK_SERVICE.submit(
             payload.source_url,
             Path(source_path),
@@ -13868,13 +13944,26 @@ async def create_canvas_motion_task(payload: CanvasMotionTaskRequest):
             payload.pose_enabled,
             payload.preserve_audio,
         )
+    except MotionRuntimeUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Local motion extraction is unavailable.",
+                "error_code": "runtime_unavailable",
+            },
+        ) from None
+    except MotionQueueFull:
+        raise HTTPException(status_code=429, detail="The local motion queue is full.") from None
     except MotionValidationError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
     except MotionError:
         raise HTTPException(status_code=422, detail="The source video is invalid or unsupported.") from None
 
 
-@app.get("/api/canvas-motion-tasks/{task_id}")
+@app.get(
+    "/api/canvas-motion-tasks/{task_id}",
+    dependencies=[Depends(_require_canvas_motion_access)],
+)
 async def get_canvas_motion_task(task_id: str):
     task = await MOTION_TASK_SERVICE.get(task_id)
     if task is None:
@@ -13882,7 +13971,10 @@ async def get_canvas_motion_task(task_id: str):
     return task
 
 
-@app.post("/api/canvas-motion-tasks/{task_id}/cancel")
+@app.post(
+    "/api/canvas-motion-tasks/{task_id}/cancel",
+    dependencies=[Depends(_require_canvas_motion_access)],
+)
 async def cancel_canvas_motion_task(task_id: str):
     task = await MOTION_TASK_SERVICE.cancel(task_id)
     if task is None:

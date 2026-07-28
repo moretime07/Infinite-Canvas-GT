@@ -9,6 +9,24 @@ if not exist "%PYTHON%" (
     exit /b 1
 )
 
+where git >nul 2>nul
+if errorlevel 1 (
+    echo 未找到 Git。请先安装 Git，并确认 git 命令已加入 PATH。
+    exit /b 1
+)
+
+where ffmpeg >nul 2>nul
+if errorlevel 1 (
+    echo 未找到 FFmpeg。请先安装 FFmpeg，并确认 ffmpeg 命令已加入 PATH。
+    exit /b 1
+)
+
+where ffprobe >nul 2>nul
+if errorlevel 1 (
+    echo 未找到 FFprobe。请安装包含 FFprobe 的 FFmpeg 完整发行版，并确认 ffprobe 命令已加入 PATH。
+    exit /b 1
+)
+
 "%PYTHON%" -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
 if errorlevel 1 exit /b 1
 

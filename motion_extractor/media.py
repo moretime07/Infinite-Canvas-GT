@@ -16,17 +16,32 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import threading
 import time
 from typing import Any, Callable
 from uuid import uuid4
 
 import numpy as np
 
-from .errors import MotionCancelled, MotionMediaError
+from .errors import (
+    MotionCancelled,
+    MotionMediaError,
+    MotionRuntimeUnavailable,
+    MotionValidationError,
+)
 
 
 _MAX_DURATION_SECONDS = 30.0
+_MAX_DIMENSION = 4096
+_MAX_PIXELS = 3840 * 2160
+_MAX_FPS = 60.0
+_MAX_FRAMES = 1800
+_MAX_RAW_BYTES = 24 * 1024 * 1024 * 1024
 _PUBLIC_MEDIA_ERROR = "媒体文件无效或无法读取"
+_PUBLIC_VFR_ERROR = (
+    "Variable-frame-rate video is unsupported; convert it to constant frame rate before retrying."
+)
+_PUBLIC_RUNTIME_UNAVAILABLE = "The local FFmpeg runtime is unavailable."
 _PROCESS_TIMEOUT_SECONDS = 180
 _PROCESS_POLL_SECONDS = 0.01
 _PROCESS_STOP_TIMEOUT_SECONDS = 1.0
@@ -99,7 +114,7 @@ def _media_error() -> MotionMediaError:
 def _required_executable(name: str) -> str:
     executable = shutil.which(name)
     if not executable:
-        raise _media_error()
+        raise MotionRuntimeUnavailable(_PUBLIC_RUNTIME_UNAVAILABLE)
     return executable
 
 
@@ -187,6 +202,61 @@ def _ffprobe(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _video_timestamps(path: Path) -> list[float]:
+    try:
+        result = subprocess.run(
+            [
+                _required_executable("ffprobe"),
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-read_intervals", f"%+#{_MAX_FRAMES + 1}",
+                "-show_entries", "frame=best_effort_timestamp_time",
+                "-of", "json",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=_PROCESS_TIMEOUT_SECONDS,
+        )
+        payload = json.loads(result.stdout)
+        frames = payload.get("frames")
+        if not isinstance(frames, list):
+            raise _media_error()
+        timestamps: list[float] = []
+        for frame in frames:
+            if not isinstance(frame, dict):
+                raise _media_error()
+            value = float(frame.get("best_effort_timestamp_time"))
+            if not math.isfinite(value):
+                raise _media_error()
+            timestamps.append(value)
+        return timestamps
+    except MotionRuntimeUnavailable:
+        raise
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        TypeError,
+        ValueError,
+    ):
+        raise _media_error() from None
+
+
+def _reject_variable_frame_rate(timestamps: list[float], fps_num: int, fps_den: int) -> None:
+    if len(timestamps) > _MAX_FRAMES:
+        raise _media_error()
+    if len(timestamps) < 2:
+        return
+    expected = fps_den / fps_num
+    tolerance = max(0.001, expected * 0.05)
+    deltas = [later - earlier for earlier, later in zip(timestamps, timestamps[1:])]
+    if any(delta <= 0 or abs(delta - expected) > tolerance for delta in deltas):
+        raise MotionValidationError(_PUBLIC_VFR_ERROR)
+
+
 def probe_video(path: Path) -> VideoMetadata:
     """Return validated display metadata without decoding any frames."""
     source = _safe_readable_file(path)
@@ -206,20 +276,38 @@ def probe_video(path: Path) -> VideoMetadata:
     if fps_value in (None, "0/0"):
         fps_value = video_stream.get("r_frame_rate")
     fps_num, fps_den = _parse_rational(fps_value)
+    fps = fps_num / fps_den
+    duration_value = video_stream.get("duration")
+    if duration_value in (None, "N/A", ""):
+        duration_value = payload.get("format", {}).get("duration")
     try:
-        duration = float(payload.get("format", {}).get("duration"))
+        duration = float(duration_value)
     except (AttributeError, TypeError, ValueError):
         raise _media_error() from None
     if not math.isfinite(duration) or duration <= 0 or duration > _MAX_DURATION_SECONDS:
         raise _media_error()
     rotation = _rotation(video_stream)
     width, height = (encoded_height, encoded_width) if rotation in {90, 270} else (encoded_width, encoded_height)
+    frame_count = _optional_frame_count(video_stream.get("nb_frames"))
+    expected_frames = max(frame_count, math.ceil(duration * fps))
+    if (
+        encoded_width % 2
+        or encoded_height % 2
+        or width > _MAX_DIMENSION
+        or height > _MAX_DIMENSION
+        or width * height > _MAX_PIXELS
+        or fps > _MAX_FPS
+        or expected_frames > _MAX_FRAMES
+        or width * height * 3 * expected_frames > _MAX_RAW_BYTES
+    ):
+        raise _media_error()
+    _reject_variable_frame_rate(_video_timestamps(source), fps_num, fps_den)
     return VideoMetadata(
         width=width,
         height=height,
         fps_num=fps_num,
         fps_den=fps_den,
-        frame_count=_optional_frame_count(video_stream.get("nb_frames")),
+        frame_count=frame_count,
         duration_seconds=duration,
         rotation=rotation,
         has_audio=any(
@@ -301,6 +389,9 @@ def decode_video_once(
                 _required_executable("ffmpeg"),
                 "-hide_banner", "-loglevel", "error", "-y",
                 "-i", str(source), "-map", "0:v:0", "-an", "-sn", "-dn",
+                "-t", str(_MAX_DURATION_SECONDS + (metadata.fps_den / metadata.fps_num)),
+                "-frames:v", str(_MAX_FRAMES + 1),
+                "-fs", str(_MAX_RAW_BYTES),
                 "-pix_fmt", "rgb24", "-f", "rawvideo", str(raw_path),
             ],
             cancelled,
@@ -309,7 +400,19 @@ def decode_video_once(
         if byte_count == 0 or byte_count % frame_bytes:
             raise _media_error()
         frame_count = byte_count // frame_bytes
-        if frame_count <= 0:
+        actual_duration = frame_count * metadata.fps_den / metadata.fps_num
+        timing_tolerance = max(0.25, 2 * metadata.fps_den / metadata.fps_num)
+        if (
+            frame_count <= 0
+            or frame_count > _MAX_FRAMES
+            or byte_count > _MAX_RAW_BYTES
+            or actual_duration > _MAX_DURATION_SECONDS + timing_tolerance
+            or abs(actual_duration - metadata.duration_seconds) > timing_tolerance
+            or (
+                metadata.frame_count
+                and abs(frame_count - metadata.frame_count) > 1
+            )
+        ):
             raise _media_error()
         actual_metadata = replace(metadata, frame_count=frame_count)
         frames = np.memmap(
@@ -372,6 +475,7 @@ def _encode_attempt(
     temporary_destination: Path,
     source_path: Path | None,
     copy_audio: bool,
+    cancelled: Callable[[], bool],
 ) -> bool:
     command = [
         _required_executable("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
@@ -387,30 +491,81 @@ def _encode_attempt(
     if source_path is not None:
         command.extend(["-c:a", "copy" if copy_audio else "aac"])
     command.extend(["-movflags", "+faststart", str(temporary_destination)])
-    count = 0
+    state: dict[str, Any] = {"count": 0, "error": None, "stderr": False}
+    feeder_done = threading.Event()
+    stderr_done = threading.Event()
     try:
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         assert process.stdin is not None
-        for frame in frames:
-            process.stdin.write(_frame_bytes(frame, metadata))
-            count += 1
-        process.stdin.close()
-        stderr = process.stderr.read() if process.stderr is not None else b""
-        if process.stderr is not None:
-            process.stderr.close()
-        return count == metadata.frame_count and process.wait(timeout=_PROCESS_TIMEOUT_SECONDS) == 0 and not stderr
-    except MotionCancelled:
-        if "process" in locals() and process.poll() is None:
-            process.kill()
-            process.wait()
-        if "process" in locals():
+
+        def feed() -> None:
+            try:
+                for frame in frames:
+                    if cancelled():
+                        raise MotionCancelled("Task cancelled.")
+                    process.stdin.write(_frame_bytes(frame, metadata))
+                    state["count"] += 1
+            except BaseException as error:
+                state["error"] = error
+            finally:
+                _close_process_pipe(process.stdin)
+                feeder_done.set()
+
+        def drain_stderr() -> None:
+            try:
+                if process.stderr is not None:
+                    while chunk := process.stderr.read(64 * 1024):
+                        state["stderr"] = True
+            except (OSError, ValueError):
+                pass
+            finally:
+                _close_process_pipe(process.stderr)
+                stderr_done.set()
+
+        feeder = threading.Thread(target=feed, name="motion-ffmpeg-feeder", daemon=True)
+        drainer = threading.Thread(target=drain_stderr, name="motion-ffmpeg-stderr", daemon=True)
+        feeder.start()
+        drainer.start()
+        deadline = time.monotonic() + _PROCESS_TIMEOUT_SECONDS
+        cancellation_requested = False
+        timed_out = False
+        while process.poll() is None:
+            if cancelled():
+                cancellation_requested = True
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            if feeder_done.is_set() and state["error"] is not None:
+                break
+            time.sleep(_PROCESS_POLL_SECONDS)
+        if cancellation_requested or timed_out or state["error"] is not None:
+            _stop_process(process)
+        _close_process_pipe(process.stdin)
+        _close_process_pipe(process.stderr)
+        feeder.join(timeout=_PROCESS_STOP_TIMEOUT_SECONDS)
+        drainer.join(timeout=_PROCESS_STOP_TIMEOUT_SECONDS)
+        if feeder.is_alive() or drainer.is_alive():
+            _stop_process(process)
             _close_process_pipe(process.stdin)
             _close_process_pipe(process.stderr)
-        raise
+            feeder.join(timeout=_PROCESS_STOP_TIMEOUT_SECONDS)
+            drainer.join(timeout=_PROCESS_STOP_TIMEOUT_SECONDS)
+        if cancellation_requested or isinstance(state["error"], MotionCancelled):
+            raise MotionCancelled("Task cancelled.")
+        if (
+            timed_out
+            or feeder.is_alive()
+            or drainer.is_alive()
+            or state["error"] is not None
+            or process.poll() != 0
+            or state["stderr"]
+        ):
+            return False
+        return state["count"] == metadata.frame_count
     except (OSError, subprocess.SubprocessError, ValueError, MotionMediaError):
-        if "process" in locals() and process.poll() is None:
-            process.kill()
-            process.wait()
+        if "process" in locals():
+            _stop_process(process)
         if "process" in locals():
             _close_process_pipe(process.stdin)
             _close_process_pipe(process.stderr)
@@ -435,6 +590,7 @@ def encode_rgb_frames(
     destination: Path,
     source_path: Path,
     preserve_audio: bool,
+    cancelled: Callable[[], bool] = lambda: False,
 ) -> EncodeResult:
     """Stream RGB frames to an atomically-published H.264 MP4."""
     try:
@@ -450,13 +606,16 @@ def encode_rgb_frames(
     spool_path = parent / f".motion-encode-{uuid4().hex}.rgb" if audio_source else None
     try:
         if spool_path is None:
-            if not _encode_attempt(frames, metadata, temporary_destination, None, copy_audio=False):
+            if not _encode_attempt(
+                frames, metadata, temporary_destination, None, copy_audio=False, cancelled=cancelled
+            ):
                 raise _media_error()
             audio_transcoded = False
         else:
             _spool_frames(frames, metadata, spool_path)
             copied = _encode_attempt(
-                _spooled_frames(spool_path, metadata), metadata, temporary_destination, audio_source, copy_audio=True
+                _spooled_frames(spool_path, metadata), metadata, temporary_destination, audio_source,
+                copy_audio=True, cancelled=cancelled,
             )
             copied_codec = _audio_codec(temporary_destination) if copied else None
             if copied and copied_codec in _MP4_STREAM_COPY_AUDIO_CODECS:
@@ -464,7 +623,8 @@ def encode_rgb_frames(
             else:
                 _cleanup_artifact(temporary_destination)
                 if not _encode_attempt(
-                    _spooled_frames(spool_path, metadata), metadata, temporary_destination, audio_source, copy_audio=False
+                    _spooled_frames(spool_path, metadata), metadata, temporary_destination, audio_source,
+                    copy_audio=False, cancelled=cancelled,
                 ):
                     raise _media_error()
                 audio_transcoded = True

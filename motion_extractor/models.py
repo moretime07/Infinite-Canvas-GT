@@ -6,13 +6,16 @@ import hashlib
 import importlib
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Mapping, TypeVar
+from uuid import uuid4
 
 try:
     from huggingface_hub import hf_hub_download
@@ -115,8 +118,27 @@ _PACKAGE_MODULES = {
     "tqdm": "tqdm",
 }
 _HASH_CHUNK_SIZE = 1024 * 1024
+_GIT_TIMEOUT_SECONDS = 180
+_HF_ETAG_TIMEOUT_SECONDS = 10
+_HF_REQUEST_TIMEOUT_SECONDS = 30
+_HF_TOTAL_TIMEOUT_SECONDS = 1800
+_PROCESS_POLL_SECONDS = 0.1
+_PROCESS_STOP_TIMEOUT_SECONDS = 1.0
 _VERIFIED_SOURCE_IMPORT_LOCK = threading.RLock()
 _Selection = TypeVar("_Selection")
+_HF_DOWNLOAD_SCRIPT = """
+import sys
+from huggingface_hub import hf_hub_download
+
+result = hf_hub_download(
+    repo_id=sys.argv[1],
+    filename=sys.argv[2],
+    cache_dir=sys.argv[3],
+    local_dir=sys.argv[4],
+    etag_timeout=int(sys.argv[5]),
+)
+print(result)
+""".strip()
 
 
 def _model_directory(cache_root: Path) -> Path:
@@ -150,6 +172,112 @@ def _is_cancelled(cancelled: Callable[[], bool]) -> None:
         raise MotionCancelled("Motion asset preparation was cancelled")
 
 
+def _stop_asset_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=_PROCESS_STOP_TIMEOUT_SECONDS)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=_PROCESS_STOP_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _run_asset_command(
+    command: list[str],
+    *,
+    cancelled: Callable[[], bool],
+    timeout_seconds: float,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run one asset command with cancellation, deadline, and process cleanup."""
+    _is_cancelled(cancelled)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=dict(env) if env is not None else None,
+    )
+    deadline = time.monotonic() + max(_PROCESS_POLL_SECONDS, float(timeout_seconds))
+    try:
+        while True:
+            if cancelled():
+                _stop_asset_process(process)
+                raise MotionCancelled("Motion asset preparation was cancelled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _stop_asset_process(process)
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+            try:
+                stdout, stderr = process.communicate(
+                    timeout=min(_PROCESS_POLL_SECONDS, remaining)
+                )
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(
+                int(process.returncode or 1),
+                command,
+                output=stdout,
+                stderr=stderr,
+            )
+        return subprocess.CompletedProcess(command, 0, stdout, stderr)
+    except BaseException:
+        _stop_asset_process(process)
+        raise
+
+
+def _download_from_hub(
+    *,
+    repo_id: str,
+    filename: str,
+    cache_dir: str,
+    local_dir: str,
+    etag_timeout: int,
+    cancelled: Callable[[], bool],
+) -> Path:
+    environment = os.environ.copy()
+    environment["HF_HUB_ETAG_TIMEOUT"] = str(etag_timeout)
+    environment["HF_HUB_DOWNLOAD_TIMEOUT"] = str(_HF_REQUEST_TIMEOUT_SECONDS)
+    try:
+        result = _run_asset_command(
+            [
+                sys.executable,
+                "-c",
+                _HF_DOWNLOAD_SCRIPT,
+                repo_id,
+                filename,
+                cache_dir,
+                local_dir,
+                str(etag_timeout),
+            ],
+            cancelled=cancelled,
+            timeout_seconds=_HF_TOTAL_TIMEOUT_SECONDS,
+            env=environment,
+        )
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if not lines:
+            raise MotionDependencyError("Unable to download the required motion model")
+        return Path(lines[-1])
+    except MotionCancelled:
+        raise
+    except (OSError, subprocess.SubprocessError):
+        raise MotionDependencyError("Unable to download the required motion model") from None
+
+
 def _sha256(path: Path, cancelled: Callable[[], bool] | None = None) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file_handle:
@@ -170,24 +298,35 @@ def _download_artifact(
     destination: Path,
     progress: Callable[[str, float], None],
     cancelled: Callable[[], bool],
+    downloader: Callable[..., str] | None = None,
 ) -> Path:
     _is_cancelled(cancelled)
-    if hf_hub_download is None:
+    if downloader is None and hf_hub_download is None:
         raise MotionDependencyError("huggingface-hub is required to download motion models")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    part_path = destination.with_name(f"{destination.name}.part")
-    part_path.unlink(missing_ok=True)
+    legacy_part_path = destination.with_name(f"{destination.name}.part")
+    legacy_part_path.unlink(missing_ok=True)
+    part_path = destination.with_name(f".{destination.name}.{uuid4().hex}.part")
+    staging_directory = _cache_path(
+        cache_root, "motion_models", ".hf-downloads", uuid4().hex
+    )
     progress(f"Downloading {artifact.filename}", 0.0)
     try:
-        downloaded = Path(
-            hf_hub_download(
-                repo_id=artifact.repo_id,
-                filename=artifact.filename,
-                cache_dir=str(_cache_path(cache_root, "motion_models", ".hf-cache")),
-                local_dir=str(_cache_path(cache_root, "motion_models", ".hf-downloads")),
+        download_arguments = {
+            "repo_id": artifact.repo_id,
+            "filename": artifact.filename,
+            "cache_dir": str(_cache_path(cache_root, "motion_models", ".hf-cache")),
+            "local_dir": str(staging_directory),
+            "etag_timeout": _HF_ETAG_TIMEOUT_SECONDS,
+        }
+        if downloader is None:
+            downloaded = _download_from_hub(
+                **download_arguments,
+                cancelled=cancelled,
             )
-        )
+        else:
+            downloaded = Path(downloader(**download_arguments))
         if not _is_within(downloaded, Path(cache_root)):
             raise MotionIntegrityError("Downloaded model escaped the supplied cache root")
         _is_cancelled(cancelled)
@@ -204,6 +343,8 @@ def _download_artifact(
     except Exception:
         part_path.unlink(missing_ok=True)
         raise
+    finally:
+        shutil.rmtree(staging_directory, ignore_errors=True)
 
 
 def ensure_model_artifact(
@@ -211,6 +352,8 @@ def ensure_model_artifact(
     artifact: ModelArtifact,
     progress: Callable[[str, float], None],
     cancelled: Callable[[], bool],
+    *,
+    downloader: Callable[..., str] | None = None,
 ) -> Path:
     """Return a manifest-verified model, downloading it only when necessary."""
     destination = _cache_path(cache_root, "motion_models", artifact.filename)
@@ -218,7 +361,14 @@ def ensure_model_artifact(
         progress(f"Reusing {artifact.filename}", 1.0)
         return destination
     destination.unlink(missing_ok=True)
-    return _download_artifact(cache_root, artifact, destination, progress, cancelled)
+    return _download_artifact(
+        cache_root,
+        artifact,
+        destination,
+        progress,
+        cancelled,
+        downloader,
+    )
 
 
 def verify_source_checkout(checkout: Path, source: GitSource, source_root: Path) -> None:
@@ -242,14 +392,16 @@ def verify_source_checkout(checkout: Path, source: GitSource, source_root: Path)
             check=True,
             capture_output=True,
             text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
         )
         status = subprocess.run(
             ["git", "-C", str(checkout), "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"],
             check=True,
             capture_output=True,
             text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.CalledProcessError) as error:
+    except (OSError, subprocess.SubprocessError) as error:
         raise MotionSourceError(f"Unable to verify pinned source {source.name}") from error
     if head.stdout.strip().lower() != source.commit.lower():
         raise MotionSourceError(f"Source {source.name} is not at its pinned commit")
@@ -257,7 +409,11 @@ def verify_source_checkout(checkout: Path, source: GitSource, source_root: Path)
         raise MotionSourceError(f"Source {source.name} contains local modifications")
 
 
-def ensure_source_checkout(cache_root: Path, source: GitSource) -> Path:
+def ensure_source_checkout(
+    cache_root: Path,
+    source: GitSource,
+    cancelled: Callable[[], bool] = lambda: False,
+) -> Path:
     """Clone a source without checking out a branch, then detach at its pinned commit."""
     try:
         source_root = _source_directory(cache_root)
@@ -272,21 +428,49 @@ def ensure_source_checkout(cache_root: Path, source: GitSource) -> Path:
 
     checkout.parent.mkdir(parents=True, exist_ok=True)
     try:
-        subprocess.run(
-            ["git", "clone", "--no-checkout", source.url, str(checkout)],
-            check=True,
-            capture_output=True,
-            text=True,
+        staging = _cache_path(
+            cache_root,
+            "motion_models",
+            "sources",
+            f".{source.name}.{uuid4().hex}.staging",
         )
-        subprocess.run(
-            ["git", "-C", str(checkout), "checkout", "--detach", source.commit],
-            check=True,
-            capture_output=True,
-            text=True,
+    except MotionAssetError as error:
+        raise MotionSourceError(f"Source {source.name} escapes its verified cache directory") from error
+    _is_cancelled(cancelled)
+    promoted = False
+    try:
+        _run_asset_command(
+            ["git", "clone", "--no-checkout", source.url, str(staging)],
+            cancelled=cancelled,
+            timeout_seconds=_GIT_TIMEOUT_SECONDS,
         )
+        _is_cancelled(cancelled)
+        _run_asset_command(
+            ["git", "-C", str(staging), "checkout", "--detach", source.commit],
+            cancelled=cancelled,
+            timeout_seconds=_GIT_TIMEOUT_SECONDS,
+        )
+        _is_cancelled(cancelled)
+        verify_source_checkout(staging, source, source_root)
+        _is_cancelled(cancelled)
+        os.replace(staging, checkout)
+        promoted = True
         verify_source_checkout(checkout, source, source_root)
-    except (OSError, subprocess.CalledProcessError) as error:
+        _is_cancelled(cancelled)
+    except MotionCancelled:
+        if promoted:
+            shutil.rmtree(checkout, ignore_errors=True)
+        raise
+    except MotionSourceError:
+        if promoted:
+            shutil.rmtree(checkout, ignore_errors=True)
+        raise
+    except (OSError, subprocess.SubprocessError) as error:
+        if promoted:
+            shutil.rmtree(checkout, ignore_errors=True)
         raise MotionSourceError(f"Unable to prepare pinned source {source.name}") from error
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     return checkout
 
 
@@ -391,17 +575,29 @@ def ensure_motion_assets(
     *,
     source_names: Iterable[str] | None = None,
     artifact_names: Iterable[str] | None = None,
+    downloader: Callable[..., str] | None = None,
 ) -> dict[str, Path]:
     """Prepare only verified models and immutable source revisions below ``cache_root``."""
     assets: dict[str, Path] = {}
     for source in _select_named(GIT_SOURCES, source_names, lambda item: item.name):
         _is_cancelled(cancelled)
-        checkout = ensure_source_checkout(cache_root, source)
+        checkout = ensure_source_checkout(cache_root, source, cancelled)
         verify_source_checkout(checkout, source, _source_directory(cache_root))
         assets[source.name] = checkout
     for artifact in _select_named(MODEL_ARTIFACTS, artifact_names, lambda item: item.filename):
         _is_cancelled(cancelled)
-        assets[artifact.filename] = ensure_model_artifact(cache_root, artifact, progress, cancelled)
+        if downloader is None:
+            assets[artifact.filename] = ensure_model_artifact(
+                cache_root, artifact, progress, cancelled
+            )
+        else:
+            assets[artifact.filename] = ensure_model_artifact(
+                cache_root,
+                artifact,
+                progress,
+                cancelled,
+                downloader=downloader,
+            )
     return assets
 
 

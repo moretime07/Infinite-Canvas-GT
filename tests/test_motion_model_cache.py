@@ -61,8 +61,13 @@ class MotionModelCacheTests(unittest.TestCase):
     def ensure(self, downloader, cancelled=lambda: False):
         with patch.object(models, "MODEL_ARTIFACTS", (self.artifact,)), patch.object(
             models, "GIT_SOURCES", ()
-        ), patch.object(models, "hf_hub_download", downloader):
-            return models.ensure_motion_assets(self.cache_root, lambda _message, _progress: None, cancelled)
+        ):
+            return models.ensure_motion_assets(
+                self.cache_root,
+                lambda _message, _progress: None,
+                cancelled,
+                downloader=downloader,
+            )
 
     def make_downloader(self, payload=None, calls=None):
         def download(**kwargs):
@@ -176,6 +181,26 @@ class MotionModelCacheTests(unittest.TestCase):
         for key in ("cache_dir", "local_dir"):
             self.assertTrue(Path(calls[0][key]).resolve().is_relative_to(self.cache_root.resolve()))
 
+    def test_download_attempts_use_distinct_staging_and_clean_failed_attempts(self):
+        calls = []
+
+        def failing_download(**kwargs):
+            staging = Path(kwargs["local_dir"])
+            calls.append(kwargs)
+            staging.mkdir(parents=True, exist_ok=True)
+            (staging / "partial.bin").write_bytes(b"partial")
+            raise RuntimeError("network failed")
+
+        for _attempt in range(2):
+            with self.assertRaises(RuntimeError):
+                self.ensure(failing_download)
+
+        staging_dirs = [Path(call["local_dir"]) for call in calls]
+        self.assertEqual(len(set(staging_dirs)), 2)
+        self.assertTrue(all(path.resolve().is_relative_to(self.cache_root.resolve()) for path in staging_dirs))
+        self.assertTrue(all("etag_timeout" in call for call in calls))
+        self.assertTrue(all(not path.exists() for path in staging_dirs))
+
     def test_wrong_hash_never_promotes_a_final_model_file(self):
         destination = self.cache_root / "motion_models" / self.artifact.filename
         replacement_calls = []
@@ -235,10 +260,123 @@ class MotionModelCacheTests(unittest.TestCase):
                 return CompletedProcess(command, 0, source.commit + "\n", "")
             return CompletedProcess(command, 0, "", "")
 
-        with patch.object(models.subprocess, "run", side_effect=git_run):
+        with patch.object(models, "_run_asset_command", side_effect=git_run), \
+                patch.object(models.subprocess, "run", side_effect=git_run):
             checkout = models.ensure_source_checkout(self.cache_root, source)
 
         self.assertEqual(checkout, self.cache_root / "motion_models" / "sources" / source.name)
+
+    def test_source_clone_is_verified_in_random_staging_then_atomically_promoted(self):
+        source = models.GitSource("staged-source", "https://example.invalid/source.git", "a" * 40)
+        clone_targets = []
+
+        def git_run(command, **_kwargs):
+            if command[1] == "clone":
+                clone_target = Path(command[-1])
+                clone_targets.append(clone_target)
+                clone_target.mkdir(parents=True)
+            if command[-2:] == ["rev-parse", "HEAD"]:
+                return CompletedProcess(command, 0, source.commit + "\n", "")
+            return CompletedProcess(command, 0, "", "")
+
+        with patch.object(models, "_run_asset_command", side_effect=git_run), \
+                patch.object(models.subprocess, "run", side_effect=git_run):
+            checkout = models.ensure_source_checkout(self.cache_root, source)
+
+        expected = self.cache_root / "motion_models" / "sources" / source.name
+        self.assertEqual(checkout, expected)
+        self.assertEqual(len(clone_targets), 1)
+        self.assertNotEqual(clone_targets[0], expected)
+        self.assertFalse(clone_targets[0].exists())
+        self.assertTrue(expected.is_dir())
+
+    def test_failed_source_setup_cleans_staging_and_never_leaves_a_final_checkout(self):
+        source = models.GitSource("failed-source", "https://example.invalid/source.git", "a" * 40)
+
+        def git_run(command, **_kwargs):
+            if command[1] == "clone":
+                Path(command[-1]).mkdir(parents=True)
+                return CompletedProcess(command, 0, "", "")
+            raise subprocess.CalledProcessError(1, command)
+
+        with patch.object(models, "_run_asset_command", side_effect=git_run), \
+                patch.object(models.subprocess, "run", side_effect=git_run):
+            with self.assertRaises(models.MotionSourceError):
+                models.ensure_source_checkout(self.cache_root, source)
+
+        source_root = self.cache_root / "motion_models" / "sources"
+        self.assertFalse((source_root / source.name).exists())
+        self.assertEqual(list(source_root.glob(f".{source.name}.*.staging")), [])
+
+    def test_source_setup_honors_cancellation_before_launching_git(self):
+        source = models.GitSource("cancelled-source", "https://example.invalid/source.git", "a" * 40)
+        with patch.object(models, "_run_asset_command") as asset_command, \
+                patch.object(models.subprocess, "run") as git_run:
+            with self.assertRaises(models.MotionCancelled):
+                models.ensure_source_checkout(self.cache_root, source, cancelled=lambda: True)
+        asset_command.assert_not_called()
+        git_run.assert_not_called()
+
+    def test_asset_subprocess_cancellation_terminates_then_kills(self):
+        class StubbornProcess:
+            def __init__(self):
+                self.returncode = None
+                self.terminated = False
+                self.killed = False
+
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired(["asset-command"], timeout)
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                if not self.killed:
+                    raise subprocess.TimeoutExpired(["asset-command"], timeout)
+                self.returncode = -9
+                return self.returncode
+
+            def kill(self):
+                self.killed = True
+
+        process = StubbornProcess()
+        cancellation_checks = iter((False, True))
+        with patch.object(models.subprocess, "Popen", return_value=process), \
+                self.assertRaises(models.MotionCancelled):
+            models._run_asset_command(
+                ["asset-command"],
+                cancelled=lambda: next(cancellation_checks, True),
+                timeout_seconds=10,
+            )
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.killed)
+
+    def test_source_verification_subprocesses_have_timeouts(self):
+        source, checkout, _module_name, _module_path, fixture_run = self.make_source_fixture("timeouts")
+        calls = []
+
+        def git_run(command, **kwargs):
+            calls.append(kwargs)
+            return fixture_run(command, **kwargs)
+
+        with patch.object(models.subprocess, "run", side_effect=git_run):
+            models.verify_source_checkout(checkout, source, checkout.parent)
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(isinstance(call.get("timeout"), (int, float)) for call in calls))
+
+    def test_source_verification_timeout_is_a_typed_path_free_asset_failure(self):
+        source, checkout, _module_name, _module_path, _fixture_run = self.make_source_fixture("timeout-failure")
+        with patch.object(
+            models.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["git", "-C", str(checkout)], 1),
+        ), self.assertRaises(models.MotionSourceError) as raised:
+            models.verify_source_checkout(checkout, source, checkout.parent)
+        self.assertNotIn(str(checkout), str(raised.exception))
 
     def test_rejects_dirty_tracked_source_checkout(self):
         source = models.GitSource("example-source", "https://example.invalid/source.git", "a" * 40)
@@ -322,7 +460,7 @@ class MotionModelCacheTests(unittest.TestCase):
         selected_weight = self.cache_root / "motion_models" / depth_artifact.filename
         calls = []
 
-        def source_checkout(_root, source):
+        def source_checkout(_root, source, _cancelled):
             calls.append(("source", source.name))
             return selected_source
 

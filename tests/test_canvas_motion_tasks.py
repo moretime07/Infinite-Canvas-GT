@@ -1,5 +1,6 @@
 import asyncio
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -100,6 +101,7 @@ class CanvasMotionTaskTests(unittest.IsolatedAsyncioTestCase):
         decoder=None,
         prober=None,
         audio_muxer=None,
+        **service_options,
     ):
         service = MotionTaskService(
             output_dir=self.root / "assets" / "output" / "motion",
@@ -109,6 +111,7 @@ class CanvasMotionTaskTests(unittest.IsolatedAsyncioTestCase):
             decoder=decoder or (lambda _path, _work_dir, _cancelled: FakeFrameStore()),
             prober=prober or (lambda _path: METADATA),
             audio_muxer=audio_muxer,
+            **service_options,
         )
         self.services.append(service)
         return service
@@ -122,10 +125,319 @@ class CanvasMotionTaskTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         self.fail(f"task did not reach {sorted(expected)}")
 
-    async def post(self, payload):
+    async def post(self, payload, *, headers=None):
         transport = httpx.ASGITransport(app=main.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            return await client.post("/api/canvas-motion-tasks", json=payload)
+            return await client.post("/api/canvas-motion-tasks", json=payload, headers=headers)
+
+    async def test_motion_routes_reject_cross_origin_but_allow_same_host_and_local_requests(self):
+        service = self.make_service()
+        with patch.object(main, "MOTION_TASK_SERVICE", service), \
+                patch.object(main, "output_file_from_url", return_value=None) as resolver:
+            rejected = await self.post(
+                {"source_url": "/assets/input/source.mp4"},
+                headers={"Origin": "https://evil.example"},
+            )
+            self.assertEqual(rejected.status_code, 403)
+            resolver.assert_not_called()
+
+            same_host = await self.post(
+                {"source_url": "/assets/input/source.mp4"},
+                headers={"Origin": "http://test"},
+            )
+            self.assertEqual(same_host.status_code, 422)
+            local = await self.post({"source_url": "/assets/input/source.mp4"})
+            self.assertEqual(local.status_code, 422)
+            self.assertEqual(resolver.call_count, 2)
+
+            transport = httpx.ASGITransport(app=main.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                status = await client.get(
+                    "/api/canvas-motion-tasks/canvas_motion_" + "1" * 32,
+                    headers={"Origin": "https://evil.example"},
+                )
+                cancel = await client.post(
+                    "/api/canvas-motion-tasks/canvas_motion_" + "1" * 32 + "/cancel",
+                    headers={"Origin": "https://evil.example"},
+                )
+                cross_referer = await client.get(
+                    "/api/canvas-motion-tasks/canvas_motion_" + "1" * 32,
+                    headers={"Referer": "https://evil.example/page"},
+                )
+                cross_fetch_site = await client.get(
+                    "/api/canvas-motion-tasks/canvas_motion_" + "1" * 32,
+                    headers={"Sec-Fetch-Site": "cross-site"},
+                )
+            self.assertEqual(status.status_code, 403)
+            self.assertEqual(cancel.status_code, 403)
+            self.assertEqual(cross_referer.status_code, 403)
+            self.assertEqual(cross_fetch_site.status_code, 403)
+
+    async def test_motion_submission_rate_limit_is_bounded_per_local_caller(self):
+        service = self.make_service()
+        limiter = main._MotionSubmissionRateLimiter(limit=1, window_seconds=10)
+        with patch.object(main, "MOTION_TASK_SERVICE", service), \
+                patch.object(main, "MOTION_SUBMISSION_RATE_LIMITER", limiter), \
+                patch.object(main, "output_file_from_url", return_value=None):
+            first = await self.post(
+                {"source_url": "/assets/input/source.mp4"},
+                headers={"Origin": "http://test"},
+            )
+            second = await self.post(
+                {"source_url": "/assets/input/source.mp4"},
+                headers={"Origin": "http://test"},
+            )
+        self.assertEqual(first.status_code, 422)
+        self.assertEqual(second.status_code, 429)
+
+    async def test_post_uses_bounded_off_loop_preflight_before_submission(self):
+        active = 0
+        maximum = 0
+        guard = threading.Lock()
+        two_started = threading.Event()
+        release = threading.Event()
+
+        def blocking_probe(_path):
+            nonlocal active, maximum
+            with guard:
+                active += 1
+                maximum = max(maximum, active)
+                if active == 2:
+                    two_started.set()
+            release.wait(timeout=2)
+            with guard:
+                active -= 1
+            return METADATA
+
+        service = self.make_service(prober=blocking_probe, preflight_limit=2)
+        tasks = [
+            asyncio.create_task(service.preflight_async(self.source))
+            for _index in range(4)
+        ]
+        self.assertTrue(await asyncio.to_thread(two_started.wait, 1))
+        await asyncio.sleep(0)
+        self.assertEqual(maximum, 2)
+        release.set()
+        self.assertEqual(len(await asyncio.gather(*tasks)), 4)
+
+    async def test_route_never_calls_synchronous_preflight_on_the_event_loop(self):
+        service = self.make_service()
+        async_called = False
+
+        def forbidden_sync(_path):
+            self.fail("the route called synchronous preflight")
+
+        async def async_preflight(_path):
+            nonlocal async_called
+            async_called = True
+            raise MotionMediaError("invalid")
+
+        service.preflight = forbidden_sync
+        service.preflight_async = async_preflight
+        with patch.object(main, "MOTION_TASK_SERVICE", service), \
+                patch.object(main, "output_file_from_url", return_value=str(self.source)):
+            response = await self.post({"source_url": "/assets/input/source.mp4"})
+        self.assertEqual(response.status_code, 422)
+        self.assertTrue(async_called)
+
+    async def test_missing_native_runtime_returns_only_structured_unavailable_code(self):
+        service = self.make_service()
+
+        async def unavailable(_path):
+            raise motion_errors.MotionRuntimeUnavailable(
+                r"ffprobe missing at C:\private\bin"
+            )
+
+        service.preflight_async = unavailable
+        with patch.object(main, "MOTION_TASK_SERVICE", service), \
+                patch.object(main, "output_file_from_url", return_value=str(self.source)):
+            response = await self.post({"source_url": "/assets/input/source.mp4"})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json(),
+            {
+                "detail": {
+                    "message": "Local motion extraction is unavailable.",
+                    "error_code": "runtime_unavailable",
+                }
+            },
+        )
+        self.assertNotIn("private", response.text.lower())
+
+    async def test_pending_queue_is_bounded_with_a_typed_capacity_failure(self):
+        queue_full_type = getattr(motion_errors, "MotionQueueFull", None)
+        self.assertIsNotNone(queue_full_type)
+        release = threading.Event()
+
+        class BlockingDepth(SuccessfulDepth):
+            def run(self, *args, **kwargs):
+                release.wait(timeout=2)
+                return super().run(*args, **kwargs)
+
+        service = self.make_service(depth_factory=BlockingDepth, max_pending_tasks=2)
+        first = await service.submit("/assets/input/first.mp4", self.source, True, False, False)
+        second = await service.submit("/assets/input/second.mp4", self.source, True, False, False)
+        with self.assertRaises(queue_full_type):
+            await service.submit("/assets/input/third.mp4", self.source, True, False, False)
+        release.set()
+        await self.wait_for_state(service, first["task_id"], {"completed"})
+        await self.wait_for_state(service, second["task_id"], {"completed"})
+
+    async def test_terminal_cleanup_drops_private_state_and_bounds_public_history(self):
+        now = [100.0]
+        service = self.make_service(
+            terminal_record_limit=2,
+            terminal_ttl_seconds=5.0,
+            clock=lambda: now[0],
+        )
+        task_ids = []
+        for index in range(3):
+            created = await service.submit(
+                f"/assets/input/source-{index}.mp4", self.source, True, False, False
+            )
+            task_ids.append(created["task_id"])
+            await self.wait_for_state(service, created["task_id"], {"completed"})
+            await asyncio.sleep(0)
+            self.assertNotIn(created["task_id"], service._private)
+
+        self.assertIsNone(await service.get(task_ids[0]))
+        self.assertIsNotNone(await service.get(task_ids[1]))
+        self.assertIsNotNone(await service.get(task_ids[2]))
+        now[0] += 6.0
+        self.assertIsNone(await service.get(task_ids[1]))
+        self.assertIsNone(await service.get(task_ids[2]))
+
+    async def test_queued_cancellation_receives_a_terminal_timestamp_for_ttl_pruning(self):
+        decoder_started = threading.Event()
+        release_decoder = threading.Event()
+        now = [100.0]
+
+        def blocking_decoder(_path, _work_dir, _cancelled):
+            decoder_started.set()
+            release_decoder.wait(timeout=2)
+            return FakeFrameStore()
+
+        service = self.make_service(
+            decoder=blocking_decoder,
+            terminal_ttl_seconds=5.0,
+            clock=lambda: now[0],
+        )
+        active = await service.submit(
+            "/assets/input/active.mp4", self.source, True, False, False
+        )
+        self.assertTrue(await asyncio.to_thread(decoder_started.wait, 1))
+        queued = await service.submit(
+            "/assets/input/queued.mp4", self.source, True, False, False
+        )
+        cancelled = await service.cancel(queued["task_id"])
+        self.assertEqual(cancelled["state"], "cancelled")
+
+        release_decoder.set()
+        await self.wait_for_state(service, active["task_id"], {"completed"})
+        for _attempt in range(100):
+            if queued["task_id"] not in service._private:
+                break
+            await asyncio.sleep(0.01)
+        self.assertNotIn(queued["task_id"], service._private)
+
+        now[0] += 6.0
+        self.assertIsNone(await service.get(queued["task_id"]))
+
+    async def test_asset_preparation_and_publication_have_observable_progress_ranges(self):
+        preparing = threading.Event()
+        release_preparing = threading.Event()
+        publishing = threading.Event()
+        release_publishing = threading.Event()
+        metadata = VideoMetadata(**{**METADATA.__dict__, "has_audio": True})
+
+        class PreparingDepth(SuccessfulDepth):
+            def run(self, frame_store, output_path, progress, cancelled, input_size=518):
+                progress(0.01)
+                preparing.set()
+                release_preparing.wait(timeout=2)
+                return super().run(frame_store, output_path, progress, cancelled, input_size)
+
+        def blocking_muxer(_video_path, _source_path, destination, _cancelled):
+            publishing.set()
+            release_publishing.wait(timeout=2)
+            Path(destination).write_bytes(b"muxed")
+            return False
+
+        service = self.make_service(
+            depth_factory=PreparingDepth,
+            decoder=lambda _path, _work_dir, _cancelled: FakeFrameStore(metadata),
+            audio_muxer=blocking_muxer,
+        )
+        created = await service.submit(
+            "/assets/input/source.mp4", self.source, True, False, True
+        )
+        self.assertTrue(await asyncio.to_thread(preparing.wait, 1))
+        await asyncio.sleep(0.02)
+        preparation_record = await service.get(created["task_id"])
+        self.assertEqual(preparation_record["state"], "downloading")
+        self.assertEqual(preparation_record["stage"], "preparing_depth")
+        self.assertGreaterEqual(preparation_record["progress"], 15.0)
+        self.assertLess(preparation_record["progress"], 25.0)
+
+        release_preparing.set()
+        self.assertTrue(await asyncio.to_thread(publishing.wait, 1))
+        publication_record = await service.get(created["task_id"])
+        self.assertEqual(publication_record["state"], "running")
+        self.assertEqual(publication_record["stage"], "publishing")
+        self.assertGreaterEqual(publication_record["progress"], 85.0)
+        self.assertLess(publication_record["progress"], 100.0)
+        release_publishing.set()
+        terminal = await self.wait_for_state(service, created["task_id"], {"completed"})
+        self.assertEqual(terminal["progress"], 100.0)
+
+    async def test_second_branch_preparation_does_not_regress_running_task_state(self):
+        preparing_pose = threading.Event()
+        release_pose = threading.Event()
+
+        class PreparingPose(SuccessfulPose):
+            def run(self, frame_store, output_path, progress, cancelled):
+                progress(0.01)
+                preparing_pose.set()
+                release_pose.wait(timeout=2)
+                return super().run(frame_store, output_path, progress, cancelled)
+
+        service = self.make_service(pose_factory=PreparingPose)
+        created = await service.submit(
+            "/assets/input/source.mp4", self.source, True, True, False
+        )
+        self.assertTrue(await asyncio.to_thread(preparing_pose.wait, 1))
+        await asyncio.sleep(0.02)
+        preparation_record = await service.get(created["task_id"])
+        self.assertEqual(preparation_record["state"], "running")
+        self.assertEqual(preparation_record["stage"], "preparing_pose")
+
+        release_pose.set()
+        terminal = await self.wait_for_state(service, created["task_id"], {"completed"})
+        self.assertEqual(terminal["progress"], 100.0)
+
+    async def test_cancel_has_bounded_settlement_when_native_work_ignores_the_event(self):
+        decoder_started = threading.Event()
+        release_decoder = threading.Event()
+
+        def blocking_decoder(_path, _work_dir, _cancelled):
+            decoder_started.set()
+            release_decoder.wait(timeout=2)
+            return FakeFrameStore()
+
+        service = self.make_service(
+            decoder=blocking_decoder,
+            cancel_settle_seconds=0.05,
+        )
+        created = await service.submit(
+            "/assets/input/source.mp4", self.source, True, False, False
+        )
+        self.assertTrue(await asyncio.to_thread(decoder_started.wait, 1))
+        started = time.monotonic()
+        cancelled = await service.cancel(created["task_id"])
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(cancelled["state"], "cancelled")
+        release_decoder.set()
 
     async def test_post_rejects_missing_unsafe_and_nonlocal_urls_through_safe_resolver(self):
         service = self.make_service()
@@ -559,13 +871,12 @@ class CanvasMotionTaskTests(unittest.IsolatedAsyncioTestCase):
         service = self.make_service()
         created = await service.submit("/assets/input/source.mp4", self.source, True, False, False)
         completed = await self.wait_for_state(service, created["task_id"], {"completed"})
-        private = service._private[created["task_id"]]
-        self.assertFalse(private.cancel_event.is_set())
+        await asyncio.sleep(0)
+        self.assertNotIn(created["task_id"], service._private)
 
         after_cancel = await service.cancel(created["task_id"])
 
         self.assertEqual(after_cancel, completed)
-        self.assertFalse(private.cancel_event.is_set())
 
     async def test_frame_store_cleanup_failure_never_exposes_terminal_success(self):
         close_started = threading.Event()
@@ -638,7 +949,8 @@ class CanvasMotionTaskTests(unittest.IsolatedAsyncioTestCase):
             def kill(self):
                 self.killed = True
 
-        with patch("motion_extractor.service.shutil.which", return_value="ffmpeg"), \
+        with patch("motion_extractor.service._probe_stream_duration", return_value=1.0), \
+                patch("motion_extractor.service.shutil.which", return_value="ffmpeg"), \
                 patch("motion_extractor.service.subprocess.Popen", StubbornProcess):
             with self.assertRaises(MotionCancelled):
                 await asyncio.to_thread(
@@ -653,6 +965,53 @@ class CanvasMotionTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(processes[0].terminated)
         self.assertTrue(processes[0].killed)
         self.assertFalse(destination.exists())
+
+    async def test_short_audio_is_padded_without_shortening_the_video(self):
+        ffmpeg = shutil.which("ffmpeg")
+        ffprobe = shutil.which("ffprobe")
+        self.assertIsNotNone(ffmpeg, "ffmpeg is required for motion audio mux tests")
+        self.assertIsNotNone(ffprobe, "ffprobe is required for motion audio mux tests")
+        encoded = self.root / "two-second-video.mp4"
+        audio_source = self.root / "short-audio.m4a"
+        destination = self.root / "muxed-full-video.mp4"
+        subprocess.run(
+            [
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "color=c=black:size=16x16:rate=12:duration=2",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", str(encoded),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=0.4",
+                "-c:a", "aac", str(audio_source),
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        transcoded = await asyncio.to_thread(
+            mux_source_audio, encoded, audio_source, destination
+        )
+        result = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-show_entries",
+                "stream=codec_type,duration:format=duration", "-of", "json", str(destination),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        facts = json.loads(result.stdout)
+        video = next(stream for stream in facts["streams"] if stream["codec_type"] == "video")
+        audio = next(stream for stream in facts["streams"] if stream["codec_type"] == "audio")
+        self.assertGreaterEqual(float(video["duration"]), 1.9)
+        self.assertGreaterEqual(float(audio["duration"]), 1.9)
+        self.assertGreaterEqual(float(facts["format"]["duration"]), 1.9)
+        self.assertTrue(transcoded)
 
     async def test_depth_oom_retries_exactly_once_at_input_size_392(self):
         input_sizes = []

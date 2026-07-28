@@ -23,6 +23,10 @@ class MotionRuntimeUnavailable(MotionRuntimeError):
     """A verified local dependency or model asset is unavailable."""
 
 
+class MotionQueueFull(MotionError):
+    """The bounded local motion queue cannot accept another task."""
+
+
 class MotionOutOfMemory(MotionRuntimeError):
     """Local CUDA memory is insufficient for the requested inference."""
 

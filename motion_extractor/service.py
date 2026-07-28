@@ -6,6 +6,8 @@ import asyncio
 from contextlib import suppress
 from dataclasses import dataclass, field
 import gc
+import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -23,6 +25,7 @@ from .errors import (
     MotionError,
     MotionMediaError,
     MotionOutOfMemory,
+    MotionQueueFull,
     MotionRuntimeError,
     MotionRuntimeUnavailable,
     MotionValidationError,
@@ -32,6 +35,7 @@ from .pose import PoseProcessor
 
 
 _TERMINAL_STATES = frozenset({"partial", "completed", "failed", "cancelled"})
+_ACTIVE_STATE_RANKS = {"queued": 0, "downloading": 1, "running": 2}
 _BRANCHES = ("depth", "pose")
 _PUBLIC_MEDIA_ERROR = "The video could not be processed."
 _PUBLIC_RUNTIME_ERROR = "Local motion processing failed."
@@ -104,6 +108,52 @@ def _run_mux(command: list[str], cancelled: Callable[[], bool]) -> bool:
         raise
 
 
+def _probe_stream_duration(path: Path, selector: str) -> float:
+    executable = shutil.which("ffprobe")
+    if executable is None:
+        raise MotionRuntimeUnavailable("The local FFmpeg runtime is unavailable.")
+    try:
+        result = subprocess.run(
+            [
+                executable,
+                "-v", "error",
+                "-select_streams", selector,
+                "-show_entries", "stream=duration:format=duration",
+                "-of", "json",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=_PROCESS_TIMEOUT_SECONDS,
+        )
+        payload = json.loads(result.stdout)
+        streams = payload.get("streams", ())
+        candidates = [
+            stream.get("duration")
+            for stream in streams
+            if isinstance(stream, dict) and stream.get("duration") not in (None, "N/A", "")
+        ]
+        if not candidates:
+            format_data = payload.get("format", {})
+            if isinstance(format_data, dict):
+                candidates.append(format_data.get("duration"))
+        duration = float(candidates[0])
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError
+        return duration
+    except MotionRuntimeUnavailable:
+        raise
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ):
+        raise MotionMediaError(_PUBLIC_MEDIA_ERROR) from None
+
+
 def mux_source_audio(
     video_path: Path,
     source_path: Path,
@@ -118,14 +168,18 @@ def mux_source_audio(
         target = Path(destination)
         target.parent.mkdir(parents=True, exist_ok=True)
         if (
-            executable is None
-            or encoded.is_symlink()
+            encoded.is_symlink()
             or source.is_symlink()
             or not encoded.is_file()
             or not source.is_file()
             or target.is_symlink()
         ):
             raise MotionMediaError(_PUBLIC_MEDIA_ERROR)
+        if executable is None:
+            raise MotionRuntimeUnavailable("The local FFmpeg runtime is unavailable.")
+        video_duration = _probe_stream_duration(encoded, "v:0")
+        audio_duration = _probe_stream_duration(source, "a:0")
+        duration_argument = f"{video_duration:.6f}"
         common = [
             executable,
             "-hide_banner",
@@ -143,16 +197,27 @@ def mux_source_audio(
             "-c:v",
             "copy",
         ]
-        copy_command = [*common, "-c:a", "copy", "-shortest", "-movflags", "+faststart", str(target)]
-        copied = _run_mux(copy_command, cancelled)
+        copied = False
+        if audio_duration + 0.05 >= video_duration:
+            copy_command = [
+                *common, "-c:a", "copy", "-t", duration_argument,
+                "-movflags", "+faststart", str(target),
+            ]
+            copied = _run_mux(copy_command, cancelled)
         if not copied or not target.is_file() or target.stat().st_size <= 0:
             _safe_unlink(target)
-            aac_command = [*common, "-c:a", "aac", "-shortest", "-movflags", "+faststart", str(target)]
+            aac_command = [
+                *common, "-c:a", "aac", "-af", "apad", "-t", duration_argument,
+                "-movflags", "+faststart", str(target),
+            ]
             if not _run_mux(aac_command, cancelled) or not target.is_file() or target.stat().st_size <= 0:
                 raise MotionMediaError(_PUBLIC_MEDIA_ERROR)
             return True
         return False
     except MotionCancelled:
+        _safe_unlink(Path(destination))
+        raise
+    except MotionRuntimeUnavailable:
         _safe_unlink(Path(destination))
         raise
     except MotionMediaError:
@@ -192,6 +257,12 @@ class MotionTaskService:
         decoder: Callable[[Path, Path, Callable[[], bool]], SharedFrameStore] = decode_video_once,
         prober: Callable[[Path], VideoMetadata] = probe_video,
         audio_muxer: Callable[[Path, Path, Path, Callable[[], bool]], bool] | None = None,
+        preflight_limit: int = 2,
+        max_pending_tasks: int = 8,
+        terminal_record_limit: int = 128,
+        terminal_ttl_seconds: float = 3600.0,
+        cancel_settle_seconds: float = 5.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.work_dir = Path(work_dir)
@@ -200,6 +271,12 @@ class MotionTaskService:
         self._decoder = decoder
         self._prober = prober
         self._audio_muxer = audio_muxer or mux_source_audio
+        self._preflight_semaphore = asyncio.Semaphore(max(1, int(preflight_limit)))
+        self._max_pending_tasks = max(1, int(max_pending_tasks))
+        self._terminal_record_limit = max(1, int(terminal_record_limit))
+        self._terminal_ttl_seconds = max(1.0, float(terminal_ttl_seconds))
+        self._cancel_settle_seconds = max(0.01, float(cancel_settle_seconds))
+        self._clock = clock
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._worker: asyncio.Task[None] | None = None
         self._records: dict[str, dict[str, Any]] = {}
@@ -209,6 +286,11 @@ class MotionTaskService:
     def preflight(self, source_path: Path) -> VideoMetadata:
         """Synchronously validate local media before it can enter the GPU queue."""
         return self._prober(Path(source_path))
+
+    async def preflight_async(self, source_path: Path) -> VideoMetadata:
+        """Validate media off the event loop with bounded native-probe concurrency."""
+        async with self._preflight_semaphore:
+            return await asyncio.to_thread(self.preflight, Path(source_path))
 
     async def submit(
         self,
@@ -223,6 +305,9 @@ class MotionTaskService:
         safe_source_url = self._safe_source_url(source_url)
         task_id = f"canvas_motion_{uuid4().hex}"
         async with self._lock:
+            self._prune_terminal_records_locked()
+            if sum(record["state"] not in _TERMINAL_STATES for record in self._records.values()) >= self._max_pending_tasks:
+                raise MotionQueueFull("The local motion queue is full.")
             queue_position = 1 + sum(
                 record["state"] == "queued" for record in self._records.values()
             )
@@ -254,17 +339,21 @@ class MotionTaskService:
 
     async def get(self, task_id: str) -> dict[str, Any] | None:
         async with self._lock:
+            self._prune_terminal_records_locked()
             record = self._records.get(task_id)
             return self._public_copy(record) if record is not None else None
 
     async def cancel(self, task_id: str) -> dict[str, Any] | None:
         async with self._lock:
+            self._prune_terminal_records_locked()
             record = self._records.get(task_id)
             private = self._private.get(task_id)
-            if record is None or private is None:
+            if record is None:
                 return None
             if record["state"] in _TERMINAL_STATES:
                 return self._public_copy(record)
+            if private is None:
+                return None
             private.cancel_event.set()
             if record["state"] == "queued":
                 record.update({
@@ -277,7 +366,25 @@ class MotionTaskService:
                 self._refresh_queue_positions_locked()
                 return self._public_copy(record)
             done_event = private.done_event
-        await done_event.wait()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(done_event.wait()),
+                timeout=self._cancel_settle_seconds,
+            )
+        except asyncio.TimeoutError:
+            async with self._lock:
+                record = self._records.get(task_id)
+                if record is None:
+                    return None
+                if record["state"] not in _TERMINAL_STATES:
+                    record.update({
+                        "state": "cancelled",
+                        "stage": "cancelled",
+                        "queue_position": 0,
+                        "_terminal_at": self._clock(),
+                    })
+                    self._cancel_unfinished_branches(record)
+                return self._public_copy(record)
         return await self.get(task_id)
 
     async def close(self) -> None:
@@ -309,6 +416,7 @@ class MotionTaskService:
                     record = self._records[task_id]
                     private = self._private[task_id]
                     if record["state"] == "cancelled":
+                        terminal_state = "cancelled"
                         private.done_event.set()
                         continue
                     private.active = True
@@ -343,16 +451,14 @@ class MotionTaskService:
                             )
                         private.active = False
                         private.done_event.set()
+                        self._private.pop(task_id, None)
+                        self._prune_terminal_records_locked()
                         self._refresh_queue_positions_locked()
                 self._queue.task_done()
 
     async def _run_task(self, task_id: str) -> str:
         private = self._private[task_id]
-        await self._update(task_id, state="downloading", stage="preparing", progress=0.0)
-        self._raise_if_cancelled(private)
-        await self._update(task_id, progress=10.0)
-        self._raise_if_cancelled(private)
-        await self._update(task_id, state="running", stage="decoding", progress=10.0)
+        await self._update(task_id, state="downloading", stage="decoding", progress=0.0)
         task_work_dir = self.work_dir / task_id
         frame_store = await asyncio.to_thread(
             self._decoder,
@@ -366,11 +472,11 @@ class MotionTaskService:
             entered_store = await asyncio.to_thread(frame_store.__enter__)
         try:
             self._raise_if_cancelled(private)
-            await self._update(task_id, progress=20.0)
+            await self._update(task_id, progress=15.0)
             record = await self.get(task_id)
             assert record is not None
             enabled = [branch for branch in _BRANCHES if record[f"{branch}_state"] != "disabled"]
-            share = 65.0 / len(enabled)
+            share = 80.0 / len(enabled)
             for index, branch in enumerate(enabled):
                 if private.cancel_event.is_set():
                     break
@@ -378,12 +484,11 @@ class MotionTaskService:
                     task_id,
                     branch,
                     entered_store,
-                    20.0 + share * index,
-                    20.0 + share * (index + 1),
+                    15.0 + share * index,
+                    15.0 + share * (index + 1),
                 )
             if private.cancel_event.is_set():
                 return "cancelled"
-            await self._update(task_id, stage="publishing", progress=95.0)
             return await self._derived_terminal_state(task_id)
         finally:
             if has_context:
@@ -399,15 +504,30 @@ class MotionTaskService:
     ) -> None:
         private = self._private[task_id]
         await self._update_branch(task_id, branch, state="running", error=None)
-        await self._update(task_id, stage=branch)
+        await self._update(
+            task_id,
+            state="downloading",
+            stage=f"preparing_{branch}",
+            progress=progress_start,
+        )
         loop = asyncio.get_running_loop()
 
         def progress(value: float) -> None:
             normalized = max(0.0, min(1.0, float(value)))
-            overall = progress_start + (progress_end - progress_start) * normalized
+            span = progress_end - progress_start
+            if normalized <= 0.05:
+                overall = progress_start + span * 0.1 * (normalized / 0.05)
+                state = "downloading"
+                stage = f"preparing_{branch}"
+            else:
+                overall = progress_start + span * (
+                    0.1 + 0.8 * ((normalized - 0.05) / 0.95)
+                )
+                state = "running"
+                stage = branch
             loop.call_soon_threadsafe(
                 asyncio.create_task,
-                self._set_branch_progress(task_id, branch, overall),
+                self._set_branch_progress(task_id, branch, overall, state, stage),
             )
 
         temporary_output = self.output_dir / f".{uuid4().hex}-{branch}.work.mp4"
@@ -457,6 +577,12 @@ class MotionTaskService:
             if result.state != "completed" or not temporary_output.is_file() or temporary_output.is_symlink():
                 raise MotionRuntimeError(_PUBLIC_RUNTIME_ERROR)
             self._raise_if_cancelled(private)
+            await self._update(
+                task_id,
+                state="running",
+                stage="publishing",
+                progress=progress_start + (progress_end - progress_start) * 0.9,
+            )
             public_url, audio_transcoded = await self._publish_branch(
                 task_id,
                 branch,
@@ -562,17 +688,34 @@ class MotionTaskService:
                 with suppress(Exception):
                     empty_cache()
 
-    async def _set_branch_progress(self, task_id: str, branch: str, progress: float) -> None:
+    async def _set_branch_progress(
+        self,
+        task_id: str,
+        branch: str,
+        progress: float,
+        state: str,
+        stage: str,
+    ) -> None:
         async with self._lock:
             record = self._records.get(task_id)
             if record is None or record["state"] in _TERMINAL_STATES:
                 return
-            if record[f"{branch}_state"] == "running":
+            if record[f"{branch}_state"] == "running" and record["stage"] != "publishing":
                 record["progress"] = max(float(record["progress"]), min(100.0, progress))
+                current_rank = _ACTIVE_STATE_RANKS.get(str(record["state"]))
+                next_rank = _ACTIVE_STATE_RANKS.get(state)
+                if current_rank is None or next_rank is None or next_rank >= current_rank:
+                    record["state"] = state
+                record["stage"] = stage
 
     async def _update(self, task_id: str, **changes: Any) -> None:
         async with self._lock:
             record = self._records[task_id]
+            if "state" in changes:
+                current_rank = _ACTIVE_STATE_RANKS.get(str(record["state"]))
+                next_rank = _ACTIVE_STATE_RANKS.get(str(changes["state"]))
+                if current_rank is not None and next_rank is not None and next_rank < current_rank:
+                    changes.pop("state")
             if "progress" in changes:
                 changes["progress"] = max(float(record["progress"]), min(100.0, float(changes["progress"])))
             record.update(changes)
@@ -629,10 +772,37 @@ class MotionTaskService:
                     record[f"{branch}_url"] = None
                     record[f"{branch}_error"] = public_error
                     record[f"{branch}_error_code"] = self._public_error_code(error)
-        changes = {"state": state, "stage": state, "queue_position": 0}
+        changes = {
+            "state": state,
+            "stage": state,
+            "queue_position": 0,
+            "_terminal_at": self._clock(),
+        }
         if state != "cancelled":
             changes["progress"] = 100.0
         record.update(changes)
+
+    def _prune_terminal_records_locked(self) -> None:
+        now = self._clock()
+        removable = [
+            (task_id, float(record.get("_terminal_at", now)))
+            for task_id, record in self._records.items()
+            if record["state"] in _TERMINAL_STATES and task_id not in self._private
+        ]
+        for task_id, terminal_at in removable:
+            if now - terminal_at > self._terminal_ttl_seconds:
+                self._records.pop(task_id, None)
+        retained = sorted(
+            (
+                (task_id, float(record.get("_terminal_at", now)))
+                for task_id, record in self._records.items()
+                if record["state"] in _TERMINAL_STATES and task_id not in self._private
+            ),
+            key=lambda item: item[1],
+        )
+        while len(retained) > self._terminal_record_limit:
+            task_id, _terminal_at = retained.pop(0)
+            self._records.pop(task_id, None)
 
     def _refresh_queue_positions_locked(self) -> None:
         position = 1

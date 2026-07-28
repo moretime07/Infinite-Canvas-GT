@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -67,6 +68,7 @@ class MotionMediaTests(unittest.TestCase):
         cls.rotated = cls.fixture_dir / "rotated.mp4"
         cls.long_source = cls.fixture_dir / "long.mp4"
         cls.vorbis_source = cls.fixture_dir / "vorbis.mkv"
+        cls.vfr_source = cls.fixture_dir / "variable-frame-rate.mp4"
         _run_ffmpeg(
             "-f", "lavfi", "-i", "testsrc2=size=80x48:rate=12",
             "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=44100",
@@ -86,6 +88,12 @@ class MotionMediaTests(unittest.TestCase):
             "-f", "lavfi", "-i", "sine=frequency=500:sample_rate=44100",
             "-t", "3", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "libvorbis",
             str(cls.vorbis_source),
+        )
+        _run_ffmpeg(
+            "-f", "lavfi", "-i", "testsrc2=size=80x48:rate=30:duration=3",
+            "-vf", "select='if(lt(t,1.5),not(mod(n,2)),not(mod(n,3)))'",
+            "-fps_mode", "vfr", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            str(cls.vfr_source),
         )
 
     @classmethod
@@ -227,6 +235,76 @@ class MotionMediaTests(unittest.TestCase):
         with self.assertRaises(media.MotionMediaError):
             media.probe_video(self.long_source)
 
+    def test_variable_frame_rate_is_rejected_with_actionable_path_free_guidance(self) -> None:
+        with self.assertRaises(media.MotionValidationError) as raised:
+            media.probe_video(self.vfr_source)
+        self.assertIn("constant frame rate", str(raised.exception).lower())
+        self.assertNotIn(str(self.vfr_source), str(raised.exception))
+
+    def test_supported_portrait_sixty_fps_budget_is_not_rejected(self) -> None:
+        payload = {
+            "format": {"duration": "30.0"},
+            "streams": [{
+                "codec_type": "video", "codec_name": "h264", "width": 1080, "height": 1920,
+                "avg_frame_rate": "60/1", "r_frame_rate": "60/1", "nb_frames": "1800",
+            }],
+        }
+        timestamps = [index / 60 for index in range(1800)]
+        with patch("motion_extractor.media._ffprobe", return_value=payload), \
+                patch("motion_extractor.media._video_timestamps", return_value=timestamps):
+            metadata = media.probe_video(self.source)
+        self.assertEqual((metadata.width, metadata.height), (1080, 1920))
+        self.assertEqual(metadata.frame_count, 1800)
+
+    def test_probe_rejects_odd_dimensions_excessive_pixels_and_excessive_fps(self) -> None:
+        cases = (
+            ({"width": 81, "height": 48, "avg_frame_rate": "12/1"}, "odd width"),
+            ({"width": 4096, "height": 2162, "avg_frame_rate": "30/1"}, "pixel budget"),
+            ({"width": 1920, "height": 1080, "avg_frame_rate": "61/1"}, "fps budget"),
+        )
+        for overrides, label in cases:
+            stream = {
+                "codec_type": "video", "codec_name": "h264", "width": 80, "height": 48,
+                "avg_frame_rate": "12/1", "r_frame_rate": "12/1", "nb_frames": "36",
+                **overrides,
+            }
+            payload = {"format": {"duration": "3.0"}, "streams": [stream]}
+            with self.subTest(label=label), \
+                    patch("motion_extractor.media._ffprobe", return_value=payload), \
+                    patch("motion_extractor.media._video_timestamps", return_value=[0.0, 1 / 12, 2 / 12]):
+                with self.assertRaises(media.MotionMediaError):
+                    media.probe_video(self.source)
+
+    def test_actual_decode_count_cannot_exceed_declared_timing_or_frame_budget(self) -> None:
+        metadata = media.VideoMetadata(2, 2, 1, 1, 1, 1.0, 0, False)
+
+        def oversized_decode(command, _cancelled):
+            frame_bytes = metadata.width * metadata.height * 3
+            Path(command[-1]).write_bytes(b"\0" * frame_bytes * 31)
+
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch("motion_extractor.media.probe_video", return_value=metadata), \
+                patch("motion_extractor.media._decode_to_raw", side_effect=oversized_decode):
+            work_dir = Path(temporary)
+            with self.assertRaises(media.MotionMediaError):
+                media.decode_video_once(self.source, work_dir)
+            self.assertFalse(list(work_dir.glob("*.rgb")))
+
+    def test_truncated_decode_cannot_silently_publish_a_shorter_timeline(self) -> None:
+        metadata = media.VideoMetadata(2, 2, 10, 1, 20, 2.0, 0, False)
+
+        def truncated_decode(command, _cancelled):
+            frame_bytes = metadata.width * metadata.height * 3
+            Path(command[-1]).write_bytes(b"\0" * frame_bytes)
+
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch("motion_extractor.media.probe_video", return_value=metadata), \
+                patch("motion_extractor.media._decode_to_raw", side_effect=truncated_decode):
+            work_dir = Path(temporary)
+            with self.assertRaises(media.MotionMediaError):
+                media.decode_video_once(self.source, work_dir)
+            self.assertFalse(list(work_dir.glob("*.rgb")))
+
     def test_rotated_source_uses_display_dimensions(self) -> None:
         metadata = media.probe_video(self.rotated)
 
@@ -288,6 +366,77 @@ class MotionMediaTests(unittest.TestCase):
             audio = next(stream for stream in streams if stream["codec_type"] == "audio")
             self.assertEqual(audio["codec_name"], "aac")
             self.assertTrue(result.audio_transcoded)
+
+    def test_cancelled_encoder_supervision_terminates_kills_joins_and_cleans(self) -> None:
+        metadata = media.VideoMetadata(2, 2, 1, 1, 1, 1.0, 0, False)
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+        processes = []
+
+        class BlockingPipe:
+            def __init__(self):
+                self.started = threading.Event()
+                self.released = threading.Event()
+                self.closed = False
+
+            def write(self, _data):
+                self.started.set()
+                self.released.wait(timeout=2)
+                raise BrokenPipeError
+
+            def read(self, *_arguments):
+                self.started.set()
+                self.released.wait(timeout=2)
+                return b""
+
+            def close(self):
+                self.closed = True
+                self.released.set()
+
+        class StubbornEncodeProcess:
+            def __init__(self, _command, **_kwargs):
+                self.stdin = BlockingPipe()
+                self.stderr = BlockingPipe()
+                self.returncode = None
+                self.terminated = False
+                self.killed = False
+                processes.append(self)
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                if not self.killed:
+                    raise subprocess.TimeoutExpired("ffmpeg", timeout)
+                self.returncode = -9
+                return self.returncode
+
+            def kill(self):
+                self.killed = True
+
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch("motion_extractor.media._required_executable", return_value="ffmpeg"), \
+                patch("motion_extractor.media.subprocess.Popen", StubbornEncodeProcess):
+            destination = Path(temporary) / "cancelled.mp4"
+            with self.assertRaises(media.MotionCancelled):
+                media.encode_rgb_frames(
+                    [frame],
+                    metadata,
+                    destination,
+                    self.source,
+                    preserve_audio=False,
+                    cancelled=lambda: True,
+                )
+            self.assertEqual(len(processes), 1)
+            process = processes[0]
+            self.assertTrue(process.terminated)
+            self.assertTrue(process.killed)
+            self.assertTrue(process.stdin.closed)
+            self.assertTrue(process.stderr.closed)
+            self.assertFalse(destination.exists())
+            self.assertFalse(list(Path(temporary).glob("*.tmp.mp4")))
 
 
 if __name__ == "__main__":

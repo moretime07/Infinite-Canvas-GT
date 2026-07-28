@@ -31,7 +31,7 @@ http://127.0.0.1:3000/
 
 ## Local motion-reference extraction (Windows/NVIDIA)
 
-The canvas `动作提取` node is a local Windows workflow for an NVIDIA RTX GPU. Use Windows 10 or 11, a current NVIDIA driver, and the repository's `.venv` environment. After the base environment exists, run the one-time installer from the repository root and restart the app:
+The canvas `动作提取` node is a local Windows workflow for an NVIDIA RTX GPU. Use Windows 10 or 11, a current NVIDIA driver, the repository's `.venv` environment, and `git`, `ffmpeg`, and `ffprobe` available on `PATH`. The installer checks those native tools before it installs Python packages. After the base environment exists, run the one-time installer from the repository root and restart the app:
 
 ```bat
 安装动作提取环境.bat
@@ -47,11 +47,13 @@ A new node starts with:
 - `骨骼姿态` disabled;
 - `保留原始音频` disabled.
 
-At least one visual processor must remain enabled. Turn on `骨骼姿态` to publish a second pose video, and turn on `保留原始音频` when both generated MP4 files should carry the source audio. Inputs are limited to one local video of 30 seconds or less.
+At least one visual processor must remain enabled. Turn on `骨骼姿态` to publish a second pose video, and turn on `保留原始音频` when both generated MP4 files should carry the source audio. Processor and audio switches are locked while a task is queued, preparing, or running so the active task cannot diverge from its submitted settings.
+
+Inputs are limited to one local constant-frame-rate video of 30.0 seconds or less. Variable-frame-rate sources are rejected before queueing; convert them to constant frame rate first. Supported media must use even dimensions, no more than 4096 pixels on either side, no more than 3840 × 2160 total pixels in either portrait or landscape orientation, no more than 60 fps or 1,800 frames, and no more than 24 GiB of decoded RGB data. Motion extraction never silently resizes or crops an input. When source audio is shorter than the generated branch video, it is padded without shortening the video; longer audio is capped to the video duration.
 
 Connect the named `DEPTH` and `POSE` output ports independently to choose the reference role for each downstream video node. `DEPTH` and `POSE` publish separate browser-safe MP4 URLs; enabling one does not replace the other. Existing legacy canvas connections without a saved `fromPort` retain their previous behavior.
 
-Use `取消` while a task is queued or running. After cancellation or a branch failure, use `重试` to submit a fresh local task with the current switches. Cancellation cleans task-local decoded frames and incomplete outputs; already completed branch results remain distinguishable from disabled or failed branches.
+Use `取消` while a task is queued or running. After cancellation or a branch failure, use `重试` to submit a fresh local task with the current switches. Cancellation cleans task-local decoded frames and incomplete outputs; already completed branch results remain distinguishable from disabled or failed branches. The local service admits at most eight unfinished motion tasks, runs one GPU worker, probes at most two inputs concurrently, and retains only a bounded recent public terminal history; task-private paths are discarded immediately after cleanup.
 
 Motion extraction never uses an API-provider key and never falls back to a paid or cloud media service. Source video, decoded frames, model inference, and MP4 publication remain on the local machine.
 

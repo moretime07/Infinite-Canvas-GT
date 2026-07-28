@@ -32,7 +32,10 @@ from motion_extractor.service import MotionTaskService
 def _required_executable(name: str) -> str:
     executable = shutil.which(name)
     if executable is None:
-        raise unittest.SkipTest(f"{name} is required for motion pipeline integration")
+        raise RuntimeError(
+            f"{name} is required for motion pipeline integration; "
+            "run 安装动作提取环境.bat and retry the release gate"
+        )
     return executable
 
 
@@ -528,7 +531,10 @@ class MotionPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_runtime_failure_points_to_the_local_environment_installer(self) -> None:
         node = shutil.which("node")
         if node is None:
-            self.skipTest("node is required for motion runtime guidance integration")
+            self.fail(
+                "node is required for motion runtime guidance integration; "
+                "install the documented prerequisite and rerun the release gate"
+            )
         script = r"""
 const fs = require('node:fs');
 const vm = require('node:vm');

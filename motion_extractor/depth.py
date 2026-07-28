@@ -351,6 +351,7 @@ class DepthProcessor:
                 Path(output_path),
                 Path(output_path),
                 preserve_audio=False,
+                cancelled=cancelled,
             )
         finally:
             mapping = getattr(mapped, "_mmap", None)
