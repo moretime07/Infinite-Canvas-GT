@@ -2741,8 +2741,22 @@ function motionTaskSafeUrl(value){
 }
 function motionTaskSafeMessage(value){
     const text = typeof value === 'string' ? value.trim() : '';
-    const unsafe = /[\x00-\x1f\x7f]|(?:[A-Za-z]:[\\/])|\\\\[^\s]+|\bfile\s*:\s*(?:(?:[\\/]{2})|(?:%(?:2f|5c)){2})|(?:^|[=:\s("'\[,;])\/(?:[^/\s]+\/)*[^/\s]+|%(?:2f|5c|2e|00|0[0-9a-f]|1f|7f)|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}\b|data:|api[_ -]?key|authorization|bearer|token\s*[=:]|secret|password|credential/i;
-    if(!text || text.length > 240 || unsafe.test(text)) return tr('canvas.motionFailed');
+    const normalized = text.replace(/%2f/gi, '/').replace(/%5c/gi, '\\');
+    let hasAbsolutePath = false;
+    for(let index = 0; index < normalized.length; index += 1){
+        const separator = normalized[index] === '/' || normalized[index] === '\\';
+        const previousIsSeparator = index > 0 && (normalized[index - 1] === '/' || normalized[index - 1] === '\\');
+        const previousIsWord = index > 0 && /[\p{L}\p{N}]/u.test(normalized[index - 1]);
+        if(!separator || previousIsSeparator || previousIsWord) continue;
+        let end = index;
+        while(normalized[end] === '/' || normalized[end] === '\\') end += 1;
+        if(end < normalized.length && !/\s/.test(normalized[end]) && (normalized[index] === '/' || end - index > 1)){
+            hasAbsolutePath = true;
+            break;
+        }
+    }
+    const unsafe = /[\x00-\x1f\x7f]|(?:[A-Za-z]:[\\/])|%(?:2f|5c|2e|00|0[0-9a-f]|1f|7f)|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}\b|data:|api[_ -]?key|authorization|bearer|token\s*[=:]|secret|password|credential/i;
+    if(!text || text.length > 240 || hasAbsolutePath || unsafe.test(text)) return tr('canvas.motionFailed');
     return text;
 }
 function motionTaskNode(nodeId){ return nodes.find(candidate => candidate.id === nodeId && candidate.type === 'motionExtract') || null; }

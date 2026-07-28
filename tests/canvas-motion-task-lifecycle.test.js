@@ -363,6 +363,15 @@ function motionNode(overrides={}){
     [
         'source_path=/private/video.mp4',
         'failed:/private/video.mp4',
+        '//private/video.mp4',
+        '///private/video.mp4',
+        'source_path=//private/video.mp4',
+        'failed://private/video.mp4',
+        'failed,///private/video.mp4',
+        'source_path=%2F%2Fprivate%2Fvideo.mp4',
+        'failed:%2f%2Fprivate%2fvideo.mp4',
+        'source_path=/%5Cprivate/video.mp4',
+        'network=\\\\/private/video.mp4',
         'file:///private/video.mp4',
         'file:%2F%2Fprivate%2Fvideo.mp4',
         'encoded=%2Fprivate%2Fvideo.mp4',
@@ -372,6 +381,9 @@ function motionNode(overrides={}){
         'Authorization: Bearer secret-value',
     ].forEach(value => assert.equal(context.motionTaskSafeMessage(value), 'Motion task failed'));
     assert.equal(context.motionTaskSafeMessage('The source video is invalid or unsupported.'), 'The source video is invalid or unsupported.');
+    assert.equal(context.motionTaskSafeMessage('Audio/video extraction failed.'), 'Audio/video extraction failed.');
+    assert.equal(context.motionTaskSafeMessage('Retry in 1/2 second.'), 'Retry in 1/2 second.');
+    assert.equal(context.motionTaskSafeMessage('音频/视频提取失败'), '音频/视频提取失败');
     assert.equal(context.motionTaskSafeMessage('视频无效或不支持'), '视频无效或不支持');
 }
 
