@@ -49,6 +49,27 @@ class FakePoseSession:
         return [self.poses.pop(0)]
 
 
+class RawOrtSession:
+    """Small ORT boundary fake with inspectable input and provider state."""
+
+    def __init__(self, outputs, *, shape=(1, 3, 640, 640), providers=("CUDAExecutionProvider",)):
+        self.outputs = outputs
+        self._input = _Input("input")
+        self._input.shape = list(shape)
+        self.providers = list(providers)
+        self.inputs = []
+
+    def get_inputs(self):
+        return [self._input]
+
+    def get_providers(self):
+        return self.providers
+
+    def run(self, _outputs, inputs):
+        self.inputs.append(inputs)
+        return self.outputs
+
+
 class MotionPoseTests(unittest.TestCase):
     def _store(self, directory: Path, frames: np.ndarray) -> media.SharedFrameStore:
         raw_path = directory / "source.rgb"
@@ -103,6 +124,71 @@ class MotionPoseTests(unittest.TestCase):
                 ("dw-ll_ucoco_384.onnx", ("CPUExecutionProvider",)),
             ],
         )
+
+    def test_yolox_raw_head_decode_nms_and_letterbox_mapping_keep_distinct_people(self) -> None:
+        """Raw YOLOX rows need grid/stride decoding, NMS, and inverse letterbox mapping."""
+        raw = np.zeros((1, 8400, 85), dtype=np.float32)
+
+        def row(index, grid_x, grid_y, center_x, center_y, width, height, confidence=0.95):
+            value = raw[0, index]
+            value[:4] = [center_x / 8 - grid_x, center_y / 8 - grid_y, np.log(width / 8), np.log(height / 8)]
+            value[4] = confidence
+            value[5] = confidence  # COCO class 0: person
+
+        # Source 200x100 becomes 640x320 in a top-left 640-square letterbox.
+        row(20 * 80 + 12, 12, 20, 96, 160, 128, 256)
+        row(20 * 80 + 13, 13, 20, 98, 160, 128, 256)  # duplicate for NMS
+        row(30 * 80 + 45, 45, 30, 360, 240, 96, 160)  # distinct second person
+        raw[0, 0, 4] = raw[0, 0, 6] = 0.99  # a non-person class must be ignored
+        session = RawOrtSession([raw])
+        processor = PoseProcessor(confidence_threshold=0.3)
+
+        boxes = processor._detect(session, np.zeros((100, 200, 3), dtype=np.uint8))
+
+        self.assertEqual(len(boxes), 2)
+        self.assertTrue(any(np.allclose(box, (10, 10, 50, 90), atol=0.7) for box in boxes))
+        self.assertTrue(any(np.allclose(box, (97.5, 50, 127.5, 100), atol=0.51) for box in boxes))
+        detector_input = next(iter(session.inputs[0].values()))
+        self.assertEqual(detector_input.shape, (1, 3, 640, 640))
+        self.assertEqual(float(detector_input[0, 0, 500, 500]), 114.0)
+
+    def test_pose_affine_simcc_inverse_mapping_keeps_wholebody_landmarks_in_source_coordinates(self) -> None:
+        """Using a rectangular crop directly distorts DWPose's body, feet, face, and hands."""
+        x_simcc = np.zeros((1, 133, 576), dtype=np.float32)
+        y_simcc = np.zeros((1, 133, 768), dtype=np.float32)
+        locations = {0: (288, 384), 17: (400, 500), 23: (200, 200), 91: (500, 300), 112: (100, 600)}
+        for point_index, (x, y) in locations.items():
+            x_simcc[0, point_index, x] = 1.0
+            y_simcc[0, point_index, y] = 1.0
+        session = RawOrtSession([x_simcc, y_simcc], shape=(1, 3, 384, 288))
+        processor = PoseProcessor()
+        keypoints = processor._estimate_pose(
+            session, np.zeros((100, 200, 3), dtype=np.uint8), (20.0, 10.0, 140.0, 70.0)
+        )
+
+        # The official aspect-ratio and 1.25 padding turn the box into 150x200 source pixels.
+        for point_index, (simcc_x, simcc_y) in locations.items():
+            expected = (80 + ((simcc_x / 2) - 144) * 150 / 288, 40 + ((simcc_y / 2) - 192) * 200 / 384)
+            self.assertTrue(np.allclose(keypoints[point_index, :2], expected, atol=0.6))
+            self.assertEqual(float(keypoints[point_index, 2]), 1.0)
+        pose_input = next(iter(session.inputs[0].values()))
+        self.assertEqual(pose_input.shape, (1, 3, 384, 288))
+
+    def test_provider_contract_rejects_unrelated_errors_and_rebuilds_silent_cuda_fallback(self) -> None:
+        """A broken model is not a CUDA failure, while ORT's silent CPU fallback is explicit."""
+        with self.assertRaisesRegex(RuntimeError, "invalid model"):
+            PoseProcessor._open_session(lambda _path, _providers: (_ for _ in ()).throw(RuntimeError("invalid model")), Path("bad.onnx"))
+
+        attempts = []
+
+        def factory(_path, providers):
+            attempts.append(tuple(providers))
+            return RawOrtSession([], providers=("CPUExecutionProvider",))
+
+        with self.assertWarnsRegex(RuntimeWarning, "CPU"):
+            session = PoseProcessor._open_session(factory, Path("silent.onnx"))
+        self.assertEqual(session.get_providers(), ["CPUExecutionProvider"])
+        self.assertEqual(attempts, [("CUDAExecutionProvider",), ("CPUExecutionProvider",)])
 
     def test_retains_every_person_and_renders_body_feet_hands_and_face_on_black(self) -> None:
         """Selecting a best box or drawing source pixels violates the pose-reference contract."""
@@ -164,6 +250,25 @@ class MotionPoseTests(unittest.TestCase):
         self.assertIsNotNone(smoothed[0].people[0].track_id)
         self.assertIsNotNone(smoothed[2].people[0].track_id)
         self.assertNotEqual(smoothed[0].people[0].track_id, smoothed[2].people[0].track_id)
+
+    def test_association_uses_iou_and_keypoints_to_avoid_a_crossing_identity_swap(self) -> None:
+        """IoU alone swaps tracks when boxes overlap while people cross each other."""
+        def person(x, marker):
+            return PersonPose((x, 0, x + 20, 30), np.array([[marker, 10, 1]], dtype=np.float32))
+
+        tracked = smooth_pose_sequence(
+            [PoseFrame((person(0, 2), person(10, 28))), PoseFrame((person(8, 28), person(2, 2)))], 0.5
+        )
+        first_ids = {round(float(person.keypoints[0, 0])): person.track_id for person in tracked[0].people}
+        second_ids = {round(float(person.keypoints[0, 0])): person.track_id for person in tracked[1].people}
+        self.assertEqual(first_ids[2], second_ids[2])
+        self.assertEqual(first_ids[28], second_ids[28])
+
+    def test_rendering_honors_the_configured_confidence_threshold(self) -> None:
+        """Rendering at the processor threshold must not silently use a global confidence value."""
+        frame = PoseFrame((PersonPose((0, 0, 10, 10), np.array([[5, 5, 0.4]], dtype=np.float32)),))
+        self.assertFalse(render_pose_frame(frame, 12, 12, confidence_threshold=0.5).any())
+        self.assertTrue(render_pose_frame(frame, 12, 12, confidence_threshold=0.3).any())
 
     def test_missed_frames_stay_black_and_no_people_completes_with_warning(self) -> None:
         """A missed frame must never duplicate a preceding pose or fail the entire clip."""

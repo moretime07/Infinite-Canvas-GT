@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Literal
+from typing import Any
 import warnings
 
 import numpy as np
@@ -26,6 +26,12 @@ _NO_PEOPLE_WARNING = "No people were detected; the pose reference is black."
 _DEFAULT_CONFIDENCE = 0.30
 _LINE_VALUE = np.uint8(224)
 _JOINT_VALUE = np.uint8(255)
+_YOLOX_INPUT_SIZE = (640, 640)
+_YOLOX_NMS_THRESHOLD = 0.45
+_POSE_MEAN = np.array([123.675, 116.28, 103.53], dtype=np.float32)
+_POSE_STD = np.array([58.395, 57.12, 57.375], dtype=np.float32)
+_POSE_PADDING = 1.25
+_SIMCC_SPLIT_RATIO = 2.0
 
 # COCO WholeBody: body 0..16, feet 17..22, face 23..90, hands 91..132.
 _BODY_EDGES = (
@@ -98,8 +104,8 @@ def _associate_adjacent(frames: Sequence[PoseFrame], threshold: float) -> list[P
                 for current_index, current in enumerate(people):
                     iou = _bbox_iou(prior.bbox, current.bbox)
                     distance = _normalized_keypoint_distance(prior, current, threshold)
-                    if iou >= 0.05 or (distance is not None and distance <= 0.50):
-                        candidates.append((iou + (1.0 - distance if distance is not None else 0.0), prior_index, current_index))
+                    if iou >= 0.05 and distance is not None and distance <= 1.00:
+                        candidates.append((iou + (1.0 - distance), prior_index, current_index))
             used_prior: set[int] = set()
             used_current: set[int] = set()
             for _score, prior_index, current_index in sorted(candidates, reverse=True):
@@ -182,7 +188,9 @@ def _pose_edges(point_count: int) -> tuple[tuple[int, int], ...]:
     return tuple((first, second) for first, second in edges if first < point_count and second < point_count)
 
 
-def render_pose_frame(frame: PoseFrame, width: int, height: int) -> np.ndarray:
+def render_pose_frame(
+    frame: PoseFrame, width: int, height: int, confidence_threshold: float = _DEFAULT_CONFIDENCE
+) -> np.ndarray:
     """Render only light grayscale pose strokes onto a pure RGB-black background."""
     if width <= 0 or height <= 0:
         raise MotionRuntimeError(_RUNTIME_MESSAGE)
@@ -192,10 +200,10 @@ def render_pose_frame(frame: PoseFrame, width: int, height: int) -> np.ndarray:
         if points.ndim != 2 or points.shape[1] != 3:
             raise MotionRuntimeError(_RUNTIME_MESSAGE)
         for first, second in _pose_edges(len(points)):
-            if _valid_keypoint(points[first], _DEFAULT_CONFIDENCE) and _valid_keypoint(points[second], _DEFAULT_CONFIDENCE):
+            if _valid_keypoint(points[first], confidence_threshold) and _valid_keypoint(points[second], confidence_threshold):
                 _draw_line(canvas, points[first], points[second])
         for point in points:
-            if _valid_keypoint(point, _DEFAULT_CONFIDENCE):
+            if _valid_keypoint(point, confidence_threshold):
                 x, y = int(round(point[0])), int(round(point[1]))
                 if 0 <= y < height and 0 <= x < width:
                     canvas[y, x] = _JOINT_VALUE
@@ -276,10 +284,23 @@ class PoseProcessor:
     @staticmethod
     def _open_session(factory: Callable[[Path, list[str]], Any], path: Path) -> Any:
         try:
-            return factory(path, ["CUDAExecutionProvider"])
-        except Exception:
+            session = factory(path, ["CUDAExecutionProvider"])
+        except Exception as error:
+            if not PoseProcessor._is_cuda_provider_failure(error):
+                raise
             warnings.warn("CUDA ONNX provider initialization failed; using CPU fallback.", RuntimeWarning, stacklevel=2)
             return factory(path, ["CPUExecutionProvider"])
+        if hasattr(session, "get_providers") and "CUDAExecutionProvider" not in session.get_providers():
+            warnings.warn("CUDA ONNX provider was unavailable; rebuilding with the CPU fallback.", RuntimeWarning, stacklevel=2)
+            return factory(path, ["CPUExecutionProvider"])
+        return session
+
+    @staticmethod
+    def _is_cuda_provider_failure(error: Exception) -> bool:
+        message = str(error).lower()
+        mentions_cuda = "cudaexecutionprovider" in message or "cuda provider" in message
+        unavailable = ("not available", "unavailable", "not enabled", "failed to create", "cannot create", "not found")
+        return mentions_cuda and any(marker in message for marker in unavailable)
 
     def _infer_frames(
         self, frame_store: SharedFrameStore, detector: Any, pose: Any, cancelled: Callable[[], bool], reporter: _MonotonicProgress
@@ -306,10 +327,12 @@ class PoseProcessor:
         raise MotionRuntimeError(_RUNTIME_MESSAGE)
 
     def _detect(self, session: Any, source: np.ndarray) -> list[tuple[float, float, float, float]]:
+        ratio = 1.0
         if hasattr(session, "detect"):
             raw = session.detect(source)
         else:
-            raw = self._session_input(session, self._image_tensor(session, source))[0]
+            tensor, ratio = self._yolox_tensor(session, source)
+            raw = self._session_input(session, tensor)[0]
         array = np.asarray(raw, dtype=np.float32)
         while array.ndim > 2 and array.shape[0] == 1:
             array = array[0]
@@ -317,23 +340,71 @@ class PoseProcessor:
             return []
         if array.ndim != 2 or array.shape[1] < 5 or not np.isfinite(array).all():
             raise MotionRuntimeError(_RUNTIME_MESSAGE)
-        boxes = []
-        for row in array:
-            if row.shape[0] >= 85:
-                score = float(row[4] * np.max(row[5:]))
-                x, y, width, height = row[:4]
-                coordinates = (x - width / 2, y - height / 2, x + width / 2, y + height / 2)
-            else:
-                score = float(row[4])
-                coordinates = tuple(row[:4])
-            if score < self._confidence_threshold:
+        # Five-column detections exist only as a test-double seam; the pinned
+        # YOLOX ONNX model always enters the raw-head branch below.
+        if array.shape[1] == 5:
+            return self._clip_boxes(array[:, :4], source, array[:, 4])
+        if array.shape[1] < 85:
+            raise MotionRuntimeError(_RUNTIME_MESSAGE)
+        decoded = self._decode_yolox_head(array[:, :85])
+        scores = decoded[:, 4] * decoded[:, 5]  # COCO class zero is person.
+        source_boxes = decoded[:, :4].copy()
+        source_boxes[:, [0, 2]] /= ratio
+        source_boxes[:, [1, 3]] /= ratio
+        keep = self._nms(source_boxes, scores, _YOLOX_NMS_THRESHOLD)
+        return self._clip_boxes(source_boxes[keep], source, scores[keep])
+
+    def _clip_boxes(self, coordinates: np.ndarray, source: np.ndarray, scores: np.ndarray) -> list[tuple[float, float, float, float]]:
+        boxes: list[tuple[float, float, float, float]] = []
+        for coordinate, score in zip(coordinates, scores):
+            if float(score) < self._confidence_threshold:
                 continue
-            left, top, right, bottom = coordinates
-            left, right = sorted((max(0.0, float(left)), min(float(source.shape[1]), float(right))))
-            top, bottom = sorted((max(0.0, float(top)), min(float(source.shape[0]), float(bottom))))
+            left, top, right, bottom = coordinate
+            left, right = max(0.0, float(left)), min(float(source.shape[1]), float(right))
+            top, bottom = max(0.0, float(top)), min(float(source.shape[0]), float(bottom))
             if right > left and bottom > top:
                 boxes.append((left, top, right, bottom))
         return boxes
+
+    @staticmethod
+    def _decode_yolox_head(raw: np.ndarray) -> np.ndarray:
+        grids, strides = [], []
+        for stride in (8, 16, 32):
+            cells = _YOLOX_INPUT_SIZE[0] // stride
+            grid_y, grid_x = np.meshgrid(np.arange(cells), np.arange(cells), indexing="ij")
+            grids.append(np.stack((grid_x, grid_y), axis=-1).reshape(-1, 2))
+            strides.append(np.full((cells * cells, 1), stride, dtype=np.float32))
+        grid = np.concatenate(grids).astype(np.float32)
+        expanded_strides = np.concatenate(strides)
+        if raw.shape[0] != len(grid):
+            raise MotionRuntimeError(_RUNTIME_MESSAGE)
+        decoded = raw.copy()
+        decoded[:, :2] = (decoded[:, :2] + grid) * expanded_strides
+        decoded[:, 2:4] = np.exp(np.clip(decoded[:, 2:4], -20.0, 20.0)) * expanded_strides
+        center = decoded[:, :2].copy()
+        decoded[:, 0:2] = center - decoded[:, 2:4] / 2
+        decoded[:, 2:4] = center + decoded[:, 2:4] / 2
+        return decoded
+
+    @staticmethod
+    def _nms(boxes: np.ndarray, scores: np.ndarray, threshold: float) -> np.ndarray:
+        order = scores.argsort()[::-1]
+        areas = np.maximum(0.0, boxes[:, 2] - boxes[:, 0]) * np.maximum(0.0, boxes[:, 3] - boxes[:, 1])
+        kept: list[int] = []
+        while len(order):
+            index = int(order[0])
+            kept.append(index)
+            if len(order) == 1:
+                break
+            others = order[1:]
+            left = np.maximum(boxes[index, 0], boxes[others, 0])
+            top = np.maximum(boxes[index, 1], boxes[others, 1])
+            right = np.minimum(boxes[index, 2], boxes[others, 2])
+            bottom = np.minimum(boxes[index, 3], boxes[others, 3])
+            overlap = np.maximum(0.0, right - left) * np.maximum(0.0, bottom - top)
+            union = areas[index] + areas[others] - overlap
+            order = others[np.divide(overlap, union, out=np.zeros_like(overlap), where=union > 0) <= threshold]
+        return np.asarray(kept, dtype=int)
 
     @staticmethod
     def _image_tensor(session: Any, image: np.ndarray) -> np.ndarray:
@@ -348,19 +419,94 @@ class PoseProcessor:
         resized = image[rows][:, columns].astype(np.float32) / 255.0
         return np.moveaxis(resized, -1, 0)[None]
 
-    def _estimate_pose(self, session: Any, source: np.ndarray, bbox: tuple[float, float, float, float]) -> np.ndarray:
-        left, top, right, bottom = (
-            int(np.floor(bbox[0])), int(np.floor(bbox[1])), int(np.ceil(bbox[2])), int(np.ceil(bbox[3]))
-        )
-        crop = source[top:bottom, left:right]
-        if crop.size == 0:
+    @staticmethod
+    def _onnx_input_size(session: Any, fallback: tuple[int, int]) -> tuple[int, int]:
+        if hasattr(session, "get_inputs"):
+            shape = getattr(session.get_inputs()[0], "shape", ())
+            if len(shape) == 4 and isinstance(shape[2], int) and isinstance(shape[3], int):
+                return int(shape[2]), int(shape[3])
+        return fallback
+
+    def _yolox_tensor(self, session: Any, source: np.ndarray) -> tuple[np.ndarray, float]:
+        target_height, target_width = self._onnx_input_size(session, _YOLOX_INPUT_SIZE)
+        if (target_height, target_width) != _YOLOX_INPUT_SIZE:
             raise MotionRuntimeError(_RUNTIME_MESSAGE)
-        raw = session.estimate(crop) if hasattr(session, "estimate") else self._session_input(session, self._image_tensor(session, crop))
-        values = raw if isinstance(raw, (tuple, list)) else (raw,)
-        return self._decode_keypoints(values, bbox)
+        height, width = source.shape[:2]
+        ratio = min(target_height / height, target_width / width)
+        resized = self._resize_image(source[..., ::-1], int(width * ratio), int(height * ratio))
+        padded = np.full((target_height, target_width, 3), 114, dtype=np.float32)
+        padded[:resized.shape[0], :resized.shape[1]] = resized
+        return np.ascontiguousarray(np.moveaxis(padded, -1, 0)[None]), ratio
 
     @staticmethod
-    def _decode_keypoints(values: Sequence[Any], bbox: tuple[float, float, float, float]) -> np.ndarray:
+    def _resize_image(image: np.ndarray, width: int, height: int) -> np.ndarray:
+        try:
+            import cv2
+            return cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
+        except ImportError:
+            rows = np.linspace(0, image.shape[0] - 1, height).astype(int)
+            columns = np.linspace(0, image.shape[1] - 1, width).astype(int)
+            return image[rows][:, columns]
+
+    def _estimate_pose(self, session: Any, source: np.ndarray, bbox: tuple[float, float, float, float]) -> np.ndarray:
+        if hasattr(session, "estimate"):
+            left, top, right, bottom = (
+                int(np.floor(bbox[0])), int(np.floor(bbox[1])), int(np.ceil(bbox[2])), int(np.ceil(bbox[3]))
+            )
+            crop = source[top:bottom, left:right]
+            if crop.size == 0:
+                raise MotionRuntimeError(_RUNTIME_MESSAGE)
+            raw = session.estimate(crop)
+            return self._decode_keypoints(raw if isinstance(raw, (tuple, list)) else (raw,), None)
+        tensor, inverse_affine = self._pose_tensor(session, source, bbox)
+        raw = self._session_input(session, tensor)
+        values = raw if isinstance(raw, (tuple, list)) else (raw,)
+        return self._decode_keypoints(values, inverse_affine)
+
+    def _pose_tensor(self, session: Any, source: np.ndarray, bbox: tuple[float, float, float, float]) -> tuple[np.ndarray, np.ndarray]:
+        input_height, input_width = self._onnx_input_size(session, (384, 288))
+        left, top, right, bottom = bbox
+        width, height = right - left, bottom - top
+        if width <= 0 or height <= 0:
+            raise MotionRuntimeError(_RUNTIME_MESSAGE)
+        aspect = input_width / input_height
+        if width > aspect * height:
+            height = width / aspect
+        elif width < aspect * height:
+            width = height * aspect
+        width *= _POSE_PADDING
+        height *= _POSE_PADDING
+        center_x, center_y = (left + right) / 2, (top + bottom) / 2
+        affine = np.array([
+            [input_width / width, 0.0, input_width / 2 - center_x * input_width / width],
+            [0.0, input_height / height, input_height / 2 - center_y * input_height / height],
+        ], dtype=np.float32)
+        warped, inverse_affine = self._warp_affine(source[..., ::-1], affine, input_width, input_height)
+        normalized = (warped - _POSE_MEAN) / _POSE_STD
+        return np.ascontiguousarray(np.moveaxis(normalized, -1, 0)[None]), inverse_affine
+
+    @staticmethod
+    def _warp_affine(image: np.ndarray, affine: np.ndarray, width: int, height: int) -> tuple[np.ndarray, np.ndarray]:
+        """Use OpenCV's official transform when available; retain a test-only NumPy fallback."""
+        try:
+            import cv2
+            return (
+                cv2.warpAffine(image, affine, (width, height), flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0)).astype(np.float32),
+                cv2.invertAffineTransform(affine),
+            )
+        except ImportError:
+            inverse = np.linalg.inv(np.vstack((affine, (0.0, 0.0, 1.0))))[:2].astype(np.float32)
+            grid_y, grid_x = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+            source_points = np.stack((grid_x, grid_y, np.ones_like(grid_x)), axis=-1) @ inverse.T
+            source_x = np.rint(source_points[..., 0]).astype(int)
+            source_y = np.rint(source_points[..., 1]).astype(int)
+            warped = np.zeros((height, width, image.shape[2]), dtype=np.float32)
+            valid = (source_x >= 0) & (source_x < image.shape[1]) & (source_y >= 0) & (source_y < image.shape[0])
+            warped[valid] = image[source_y[valid], source_x[valid]]
+            return warped, inverse
+
+    @staticmethod
+    def _decode_keypoints(values: Sequence[Any], inverse_affine: np.ndarray | None) -> np.ndarray:
         arrays = [np.asarray(value, dtype=np.float32) for value in values]
         if not arrays:
             raise MotionRuntimeError(_RUNTIME_MESSAGE)
@@ -378,14 +524,13 @@ class PoseProcessor:
             y_scores = y_scores[0]
         if x_scores.ndim != 2 or y_scores.ndim != 2 or x_scores.shape[0] != y_scores.shape[0]:
             raise MotionRuntimeError(_RUNTIME_MESSAGE)
-        width, height = bbox[2] - bbox[0], bbox[3] - bbox[1]
         x_index, y_index = np.argmax(x_scores, axis=1), np.argmax(y_scores, axis=1)
-        confidence = np.minimum(np.max(x_scores, axis=1), np.max(y_scores, axis=1))
-        return np.stack((
-            bbox[0] + width * x_index / max(1, x_scores.shape[1] - 1),
-            bbox[1] + height * y_index / max(1, y_scores.shape[1] - 1),
-            confidence,
-        ), axis=1).astype(np.float32)
+        confidence = np.maximum(np.max(x_scores, axis=1), np.max(y_scores, axis=1))
+        if inverse_affine is None:
+            raise MotionRuntimeError(_RUNTIME_MESSAGE)
+        model_points = np.stack((x_index / _SIMCC_SPLIT_RATIO, y_index / _SIMCC_SPLIT_RATIO), axis=1).astype(np.float32)
+        source_points = model_points @ inverse_affine[:, :2].T + inverse_affine[:, 2]
+        return np.concatenate((source_points, confidence[:, None]), axis=1).astype(np.float32)
 
     def _encode(
         self, frames: Sequence[PoseFrame], frame_store: SharedFrameStore, output_path: Path,
@@ -396,7 +541,7 @@ class PoseProcessor:
         def rendered() -> Any:
             for index, frame in enumerate(frames):
                 self._check_cancelled(cancelled)
-                yield render_pose_frame(frame, frame_store.metadata.width, frame_store.metadata.height)
+                yield render_pose_frame(frame, frame_store.metadata.width, frame_store.metadata.height, self._confidence_threshold)
                 reporter.report(0.68 + 0.31 * (index + 1) / total)
 
         self._check_cancelled(cancelled)
