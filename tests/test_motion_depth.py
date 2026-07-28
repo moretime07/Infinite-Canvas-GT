@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from motion_extractor import media
-from motion_extractor.depth import DepthProcessor
+from motion_extractor.depth import DepthProcessor, _VDAWindowAdapter
 from motion_extractor.errors import MotionMediaError, MotionOutOfMemory, MotionRuntimeError
 
 
@@ -51,6 +51,84 @@ class FakeWindowedDepthModel:
         if self.error is not None:
             raise self.error
         return np.stack([self.depths[min(start + index, len(self.depths) - 1)] for index in range(32)])
+
+
+class FakeTensor:
+    def __init__(self, array: np.ndarray) -> None:
+        self.array = array
+
+    @property
+    def dtype(self) -> np.dtype:
+        return self.array.dtype
+
+    def unsqueeze(self, dimension: int) -> "FakeTensor":
+        return FakeTensor(np.expand_dims(self.array, dimension))
+
+    def to(self, _target: object) -> "FakeTensor":
+        return self
+
+    def detach(self) -> "FakeTensor":
+        return self
+
+    def cpu(self) -> "FakeTensor":
+        return self
+
+    def numpy(self) -> np.ndarray:
+        return self.array
+
+    def __getitem__(self, key: object) -> "FakeTensor":
+        return FakeTensor(self.array[key])
+
+    def __setitem__(self, key: object, value: "FakeTensor") -> None:
+        self.array[key] = value.array
+
+
+class FakeTorch:
+    class _Context:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+            return None
+
+    class _Functional:
+        @staticmethod
+        def interpolate(value: FakeTensor, *, size: tuple[int, int], **_options: object) -> FakeTensor:
+            return FakeTensor(np.zeros((*value.array.shape[:2], *size), dtype=value.array.dtype))
+
+    class _NN:
+        def __init__(self) -> None:
+            self.functional = FakeTorch._Functional()
+
+    @staticmethod
+    def from_numpy(value: np.ndarray) -> FakeTensor:
+        return FakeTensor(value)
+
+    @staticmethod
+    def cat(values: list[FakeTensor], dim: int) -> FakeTensor:
+        return FakeTensor(np.concatenate([value.array for value in values], axis=dim))
+
+    @staticmethod
+    def no_grad() -> "FakeTorch._Context":
+        return FakeTorch._Context()
+
+    @staticmethod
+    def autocast(**_options: object) -> "FakeTorch._Context":
+        return FakeTorch._Context()
+
+
+FakeTorch.nn = FakeTorch._NN()
+
+
+class FakeTensorModel:
+    def __init__(self) -> None:
+        self.window_values: list[np.ndarray] = []
+        self.window_shapes: list[tuple[int, ...]] = []
+
+    def forward(self, inputs: FakeTensor) -> FakeTensor:
+        self.window_values.append(inputs.array[0, :, 0, 0, 0].copy())
+        self.window_shapes.append(inputs.array.shape)
+        return FakeTensor(inputs.array[:, :, 0, :2, :3])
 
 
 class MotionDepthTests(unittest.TestCase):
@@ -127,6 +205,60 @@ class MotionDepthTests(unittest.TestCase):
             self.assertFalse(model.calls[0]["fp32"])
             self.assertEqual(observed_depth_files, [(np.dtype(np.float16), (3, 2, 3))])
             self.assertFalse(list((directory / "work").glob("*.depth")))
+
+    def test_vda_adapter_hands_prior_keyframes_to_each_bounded_window(self) -> None:
+        """Dropping VDA's pre-input handoff changes cross-window temporal semantics."""
+        frames = np.stack([
+            np.full((4, 6, 3), index, dtype=np.uint8) for index in range(76)
+        ])
+        model = FakeTensorModel()
+        adapter = _VDAWindowAdapter(
+            model,
+            FakeTorch(),
+            type("FakeCV2", (), {"INTER_CUBIC": 1})(),
+            lambda _steps: lambda item: {"image": np.moveaxis(item["image"], -1, 0)},
+            (lambda **_options: None, lambda **_options: None, lambda: None),
+        )
+
+        for start in (0, 22, 44):
+            depth = adapter.infer_depth_window(frames, start, input_size=518, device="cuda", fp32=False)
+            self.assertEqual(depth.shape, (32, 2, 3))
+
+        first, second, third = model.window_values
+        expected_second = first[[0, 12, 24, 25, 26, 27, 28, 29, 30, 31]]
+        expected_third = second[[0, 12, 24, 25, 26, 27, 28, 29, 30, 31]]
+        self.assertTrue(np.array_equal(second[:10], expected_second))
+        self.assertTrue(np.array_equal(third[:10], expected_third))
+        self.assertEqual(model.window_shapes, [(1, 32, 3, 4, 6)] * 3)
+        self.assertEqual(adapter._pre_input.array.shape[1], 32)
+
+    def test_model_sized_depth_memmap_renders_back_to_high_source_resolution(self) -> None:
+        """Upscaling before persistence would make the task memmap source-sized."""
+        frames = np.zeros((2, 80, 120, 3), dtype=np.uint8)
+        depths = [np.full((5, 7), value, dtype=np.float32) for value in (0.1, 0.9)]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            store = self._store(directory, frames)
+            rendered: list[np.ndarray] = []
+            observed: list[tuple[int, ...]] = []
+            original_memmap = np.memmap
+
+            def inspect_memmap(*arguments: object, **keywords: object) -> np.memmap:
+                mapped = original_memmap(*arguments, **keywords)
+                if keywords.get("mode") == "w+":
+                    observed.append(mapped.shape)
+                return mapped
+
+            try:
+                with mock.patch("motion_extractor.depth.np.memmap", side_effect=inspect_memmap):
+                    result = self._processor(directory, FakeWindowedDepthModel(depths), rendered).run(
+                        store, directory / "depth.mp4", lambda _value: None, lambda: False
+                    )
+            finally:
+                store.close()
+            self.assertEqual(result.state, "completed")
+            self.assertEqual(observed, [(2, 5, 7)])
+            self.assertEqual([frame.shape for frame in rendered], [(80, 120, 3), (80, 120, 3)])
 
     def test_clip_global_normalization_keeps_equal_depth_equal_and_near_brighter(self) -> None:
         """Per-frame bounds or inverted depth makes this visual contract fail."""

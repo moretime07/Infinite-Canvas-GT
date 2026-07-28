@@ -34,6 +34,7 @@ _OVERLAP = 10
 _INTERPOLATION_LENGTH = 8
 _WINDOW_STEP = _INFER_LENGTH - _OVERLAP
 _ALIGNMENT_KEYFRAMES = (0, 12)
+_VDA_KEYFRAMES = (0, 12, 24, 25, 26, 27, 28, 29, 30, 31)
 
 
 @dataclass(frozen=True)
@@ -54,7 +55,7 @@ class _MonotonicProgress:
 
 
 class _VDAWindowAdapter:
-    """Pinned VDA inference reduced to one bounded, source-sized depth window."""
+    """Pinned VDA inference reduced to one bounded, model-sized depth window."""
 
     def __init__(self, model: Any, torch_module: Any, cv2_module: Any, compose: Any, transforms: tuple[Any, Any, Any]) -> None:
         self._model = model
@@ -62,6 +63,7 @@ class _VDAWindowAdapter:
         self._cv2 = cv2_module
         self._compose = compose
         self._resize, self._normalize, self._prepare = transforms
+        self._pre_input: Any | None = None
 
     def infer_depth_window(
         self,
@@ -90,13 +92,13 @@ class _VDAWindowAdapter:
             frame = np.asarray(frames[min(start + offset, len(frames) - 1)], dtype=np.float32) / 255.0
             tensors.append(self._torch.from_numpy(transform({"image": frame})["image"]).unsqueeze(0).unsqueeze(0))
         inputs = self._torch.cat(tensors, dim=1).to(device)
+        if self._pre_input is not None:
+            inputs[:, :_OVERLAP, ...] = self._pre_input[:, _VDA_KEYFRAMES, ...]
         with self._torch.no_grad():
             with self._torch.autocast(device_type=device, enabled=not fp32):
                 depth = self._model.forward(inputs).to(inputs.dtype)
-                depth = self._torch.nn.functional.interpolate(
-                    depth.flatten(0, 1).unsqueeze(1), size=(height, width), mode="bilinear", align_corners=True
-                )
-        return depth[:, 0].detach().cpu().numpy()
+        self._pre_input = inputs
+        return depth[0].detach().cpu().numpy()
 
 
 class DepthProcessor:
