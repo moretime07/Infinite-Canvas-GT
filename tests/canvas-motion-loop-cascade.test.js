@@ -117,6 +117,7 @@ function runtimeMotionContext(nodes, connections, fetch){
         videoRefsFromNode:node => node?.refs || [],
         imageRefsFromNode:() => [],
         motionVideoRefMetadata:() => ({}),
+        syncConnectedOutputsFromMotion:() => 0,
         render:() => {}, scheduleSave:() => {}, refreshNodes:() => {},
         tr:key => ({
             'canvas.motionFailed':'Motion task failed',

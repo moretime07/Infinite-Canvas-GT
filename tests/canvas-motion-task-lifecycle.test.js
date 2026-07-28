@@ -26,6 +26,7 @@ function lifecycleContext({nodes, fetch, saves}={}){
         fetch,
         scheduleSave:() => { saves.count += 1; },
         render:() => {},
+        syncConnectedOutputsFromMotion:() => 0,
         sleep:async ms => { context.delays.push(ms); },
         delays:[],
         tr:key => ({

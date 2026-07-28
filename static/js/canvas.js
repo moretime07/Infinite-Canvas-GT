@@ -2900,6 +2900,7 @@ function applyCanvasMotionTask(node, payload={}){
     if(Array.isArray(payload.warnings)) node.motionWarnings = payload.warnings.slice(0, 10).filter(Boolean).map(motionTaskSafeMessage).filter(Boolean);
     const branchError = node.depthError || node.poseError || '';
     node.motionError = state === 'failed' ? motionTaskSafeMessage(payload.error || payload.message || branchError, payload.error_code) : '';
+    syncConnectedOutputsFromMotion(node);
     return motionTaskPersist(node, before);
 }
 async function createCanvasMotionTask(node, sourceUrl, runToken=node?.motionRunToken){
@@ -3056,10 +3057,17 @@ async function runMotionExtractNode(nodeId, context={}){
     }
 }
 function resumePendingCanvasMotionTasks(){
-    nodes.filter(node => node?.type === 'motionExtract' && motionTaskIdIsSafe(node.motionTaskId) && motionTaskIsPolling(node.motionState)).forEach(node => {
+    let outputsChanged = false;
+    nodes.filter(node => node?.type === 'motionExtract').forEach(node => {
+        if(syncConnectedOutputsFromMotion(node) > 0) outputsChanged = true;
+        if(!motionTaskIdIsSafe(node.motionTaskId) || !motionTaskIsPolling(node.motionState)) return;
         node.motionRunToken = Number(node.motionRunToken || 0) + 1;
         pollCanvasMotionTask(node.id, node.motionTaskId, node.motionRunToken);
     });
+    if(outputsChanged){
+        render();
+        scheduleSave();
+    }
 }
 function startMotionExtract(nodeId){ return runMotionExtractNode(nodeId); }
 function retryMotionExtract(nodeId, itemKey=''){
@@ -10717,10 +10725,15 @@ function appendOutputImagesWithoutDuplicates(out, images, compareRef=null, metas
     appendOutputImages(out, unique, compareRef, metas, layout);
     return unique.length;
 }
-function syncLatestGeneratedOutputToConnection(fromId, toId){
+function syncLatestGeneratedOutputToConnection(fromId, toId, fromPort=''){
     const source = nodes.find(n => n.id === fromId);
     const out = nodes.find(n => n.id === toId);
-    if(!source || !out || out.type !== 'output' || !CANVAS_MEDIA_OUTPUT_TYPES.includes(source.type)) return false;
+    if(!source || !out || out.type !== 'output') return false;
+    if(source.type === 'motionExtract'){
+        const refs = motionOutputVideoRefs(source, fromPort);
+        return refs.length ? appendOutputImagesWithoutDuplicates(out, refs) > 0 : false;
+    }
+    if(!CANVAS_MEDIA_OUTPUT_TYPES.includes(source.type)) return false;
     const latest = latestGeneratedOutputItem(source);
     if(!latest) return false;
     return appendOutputImagesWithoutDuplicates(out, [latest]) > 0;
@@ -10730,6 +10743,17 @@ function syncConnectedOutputsFromGenerated(node, outputs){
     const list = (outputs || []).filter(item => outputUrlValue(item));
     if(!list.length) return;
     outputNodesForSource(node.id).forEach(out => appendOutputImagesWithoutDuplicates(out, list));
+}
+function syncConnectedOutputsFromMotion(node){
+    if(!node || node.type !== 'motionExtract') return 0;
+    let added = 0;
+    connections.filter(connection => connection.from === node.id).forEach(connection => {
+        const out = nodes.find(candidate => candidate.id === connection.to);
+        if(out?.type !== 'output') return;
+        const refs = motionOutputVideoRefs(node, normalizedFromPort(connection));
+        if(refs.length) added += appendOutputImagesWithoutDuplicates(out, refs);
+    });
+    return added;
 }
 function generatedImageRefs(node){
     const keepGeneratedMedia = ['rh','ltxDirector','video'].includes(node?.type);
@@ -14754,20 +14778,22 @@ function startLink(e, originId, originKind, originPort=''){
                     const connection = {id:uid('c'), from:fromId, to:toId};
                     if(fromPort) connection.fromPort = fromPort;
                     connections.push(connection);
-                    syncLatestGeneratedOutputToConnection(fromId, toId);
+                    syncLatestGeneratedOutputToConnection(fromId, toId, fromPort);
                 }
                 syncGeneratorInputs();
                 scheduleSave();
                 render();
             }
         } else if(originKind === 'out'){
-            if(source && CANVAS_GENERATOR_TYPES.includes(source.type)){
+            if(source && (CANVAS_GENERATOR_TYPES.includes(source.type) || source.type === 'motionExtract')){
                 const p = screenToWorld(e2.clientX, e2.clientY);
                 pushUndo();
                 const out = {id:uid('out'), type:'output', x:p.x, y:p.y - 63, images:[]};
                 nodes.push(out);
-                connections.push({id:uid('c'), from:source.id, to:out.id});
-                syncLatestGeneratedOutputToConnection(source.id, out.id);
+                const connection = {id:uid('c'), from:source.id, to:out.id};
+                if(originPort) connection.fromPort = originPort;
+                connections.push(connection);
+                syncLatestGeneratedOutputToConnection(source.id, out.id, originPort);
                 syncGeneratorInputs();
                 scheduleSave();
                 render();
@@ -14841,7 +14867,7 @@ function canConnect(fromId, toId){
         return false;
     }
     if(to.type === 'motionExtract') return ['image','group','output','loop'].includes(from.type) || CANVAS_MEDIA_OUTPUT_TYPES.includes(from.type);
-    if(from.type === 'motionExtract') return CANVAS_GENERATOR_TYPES.includes(to.type);
+    if(from.type === 'motionExtract') return to.type === 'output' || CANVAS_GENERATOR_TYPES.includes(to.type);
     if(to.type === 'llm') return ['prompt','loop','promptGroup','llm','image','group','output'].includes(from.type);
     if(from.type === 'llm') return CANVAS_GENERATOR_TYPES.includes(to.type);
     return CANVAS_GENERATOR_TYPES.includes(to.type) && ['image','prompt','loop','group','promptGroup','output','llm'].includes(from.type);

@@ -59,6 +59,7 @@ function connectionValidationContext(){
         nodes:[
             {id:'motion', type:'motionExtract', depthEnabled:true, poseEnabled:false},
             {id:'video', type:'video'},
+            {id:'output', type:'output'},
         ],
         connections:[{id:'depth-link', from:'motion', to:'video', fromPort:'depth'}],
         CANVAS_GENERATOR_TYPES:['video'],
@@ -79,6 +80,7 @@ function connectionValidationContext(){
 const validation = connectionValidationContext();
 assert.equal(validation.canConnect('motion', 'video'), true);
 assert.equal(validation.canConnect('video', 'motion'), true);
+assert.equal(validation.canConnect('motion', 'output'), true);
 validation.sanitizeConnections();
 assert.deepEqual(JSON.parse(JSON.stringify(validation.connections)), [
     {id:'depth-link', from:'motion', to:'video', fromPort:'depth'},
@@ -143,7 +145,7 @@ const rendered = renderContext();
 assert.deepEqual(rendered.portCalls[0], ['motion', 'out', 'depth']);
 assert.equal(rendered.appended.length, 3);
 
-function dragContext(poseEnabled=true){
+function dragContext(poseEnabled=true, connectToNode=true){
     const context = {
         nodes:[
             {id:'motion', type:'motionExtract', depthEnabled:true, poseEnabled},
@@ -151,17 +153,18 @@ function dragContext(poseEnabled=true){
             {id:'video', type:'video'},
         ],
         connections:[],
+        syncCalls:[],
         CANVAS_GENERATOR_TYPES:['video'],
         portPoint:() => ({x:0, y:0}),
         screenToWorld:(x, y) => ({x, y}),
-        nearestPort:() => ({dataset:{}, closest:() => ({dataset:{id:'video'}})}),
+        nearestPort:() => connectToNode ? ({dataset:{}, closest:() => ({dataset:{id:'video'}})}) : null,
         canConnect:() => true,
         nodeOutputPorts:helpers.nodeOutputPorts,
         normalizedFromPort:helpers.normalizedFromPort,
         connectionKey:helpers.connectionKey,
         uid:prefix => `${prefix}-${context.connections.length + 1}`,
         pushUndo:() => {},
-        syncLatestGeneratedOutputToConnection:() => {},
+        syncLatestGeneratedOutputToConnection:(...args) => { context.syncCalls.push(args); },
         syncGeneratorInputs:() => {},
         scheduleSave:() => {},
         render:() => {},
@@ -191,6 +194,10 @@ assert.deepEqual(
         {id:'c-2', from:'motion', to:'video', fromPort:'pose'},
     ]
 );
+assert.deepEqual(JSON.parse(JSON.stringify(drag.syncCalls.slice(0, 2))), [
+    ['motion', 'video', 'depth'],
+    ['motion', 'video', 'pose'],
+]);
 
 // Break caught: starting from a legacy output must never add an empty fromPort field.
 finishLink(drag, 'legacy');
@@ -204,5 +211,16 @@ const disabled = dragContext(false);
 disabled.startLink({stopPropagation:() => {}}, 'motion', 'out', 'pose');
 assert.equal(disabled.window.onmouseup, null);
 assert.equal(disabled.connections.length, 0);
+
+// Break caught: dropping a named motion result onto empty canvas must create an Output node without losing its branch identity.
+const blank = dragContext(true, false);
+finishLink(blank, 'motion', 'depth');
+assert.deepEqual(JSON.parse(JSON.stringify(blank.connections)), [
+    {id:'c-1', from:'motion', to:'out-1', fromPort:'depth'},
+]);
+assert.deepEqual(JSON.parse(JSON.stringify(blank.syncCalls)), [
+    ['motion', 'out-1', 'depth'],
+]);
+assert.equal(blank.nodes.find(node => node.id === 'out-1')?.type, 'output');
 
 console.log('Canvas motion output-port tests passed');
