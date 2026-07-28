@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -101,6 +102,83 @@ class MotionMediaTests(unittest.TestCase):
                 media.probe_video(path)
             self.assertNotIn(str(path), str(raised.exception))
             self.assertNotIn("not a video", str(raised.exception))
+
+    def test_decode_missing_or_corrupt_media_never_launches_ffmpeg_decode(self) -> None:
+        missing = self.fixture_dir / "missing-for-decode.mp4"
+        corrupt = self.fixture_dir / "corrupt-for-decode.mp4"
+        corrupt.write_bytes(b"not a video")
+        ffmpeg = shutil.which("ffmpeg")
+        original_run = media.subprocess.run
+
+        for path in (missing, corrupt):
+            calls: list[list[str]] = []
+
+            def record_run(command: list[str], *arguments: object, **keywords: object) -> subprocess.CompletedProcess[str]:
+                calls.append(command)
+                return original_run(command, *arguments, **keywords)
+
+            with self.subTest(path=path.name), tempfile.TemporaryDirectory() as temporary, \
+                    patch("motion_extractor.media.subprocess.run", side_effect=record_run):
+                with self.assertRaises(media.MotionMediaError):
+                    media.decode_video_once(path, Path(temporary))
+            self.assertFalse(any(command[0] == ffmpeg for command in calls))
+
+    def test_cleanup_failure_is_sanitized_without_raw_path_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            raw_path = Path(temporary) / "locked-frames.rgb"
+            raw_path.write_bytes(b"rgb")
+            frames = np.memmap(raw_path, mode="r+", dtype=np.uint8, shape=(1, 1, 1, 3))
+            store = media.SharedFrameStore(
+                media.VideoMetadata(1, 1, 1, 1, 1, 1.0, 0, False), raw_path, frames
+            )
+            with patch.object(Path, "unlink", side_effect=PermissionError(str(raw_path))):
+                with self.assertRaises(media.MotionMediaError) as raised:
+                    store.close()
+            self.assertNotIn(str(raw_path), str(raised.exception))
+            raw_path.unlink()
+
+    def test_decode_failure_removes_partial_rgb_artifact(self) -> None:
+        metadata = media.VideoMetadata(2, 2, 1, 1, 1, 1.0, 0, False)
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch("motion_extractor.media.probe_video", return_value=metadata):
+            work_dir = Path(temporary)
+
+            def fail_after_partial_decode(command: list[str], **_keywords: object) -> None:
+                partial = Path(command[-1])
+                partial.write_bytes(b"partial")
+                raise subprocess.CalledProcessError(1, command, stderr="decoder diagnostic")
+
+            with patch("motion_extractor.media.subprocess.run", side_effect=fail_after_partial_decode):
+                with self.assertRaises(media.MotionMediaError) as raised:
+                    media.decode_video_once(self.source, work_dir)
+            self.assertNotIn(str(work_dir), str(raised.exception))
+            self.assertFalse(list(work_dir.glob("*.rgb")))
+
+    def test_encode_failure_removes_partial_mp4_and_spool_without_diagnostics(self) -> None:
+        metadata = media.VideoMetadata(2, 2, 1, 1, 1, 1.0, 0, True)
+        frame = np.zeros((2, 2, 3), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            destination = directory / "published.mp4"
+
+            def fail_with_partial_output(
+                _frames: object,
+                _metadata: object,
+                temporary_destination: Path,
+                _source: object,
+                **_keywords: object,
+            ) -> bool:
+                temporary_destination.write_bytes(b"incomplete")
+                return False
+
+            with patch("motion_extractor.media._encode_attempt", side_effect=fail_with_partial_output):
+                with self.assertRaises(media.MotionMediaError) as raised:
+                    media.encode_rgb_frames([frame], metadata, destination, self.source, preserve_audio=True)
+            self.assertNotIn(str(directory), str(raised.exception))
+            self.assertNotIn("incomplete", str(raised.exception))
+            self.assertFalse(destination.exists())
+            self.assertFalse(list(directory.glob("*.rgb")))
+            self.assertFalse(list(directory.glob("*.tmp.mp4")))
 
     def test_duration_over_thirty_seconds_is_rejected_before_decode(self) -> None:
         with self.assertRaises(media.MotionMediaError):

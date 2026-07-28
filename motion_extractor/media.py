@@ -31,6 +31,17 @@ class MotionMediaError(Exception):
     """A stable, path-free error for invalid local media."""
 
 
+def _cleanup_artifact(path: Path | None, *, preserve_failure: bool = False) -> None:
+    """Remove one task artifact without allowing its path to escape in errors."""
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        if not preserve_failure:
+            raise _media_error() from None
+
+
 @dataclass(frozen=True)
 class VideoMetadata:
     width: int
@@ -73,8 +84,10 @@ class SharedFrameStore:
             mapping = getattr(self.frames, "_mmap", None)
             if mapping is not None:
                 mapping.close()
-        finally:
-            self.raw_path.unlink(missing_ok=True)
+        except OSError:
+            _cleanup_artifact(self.raw_path, preserve_failure=True)
+            raise _media_error() from None
+        _cleanup_artifact(self.raw_path)
 
 
 def _media_error() -> MotionMediaError:
@@ -259,10 +272,10 @@ def decode_video_once(path: Path, work_dir: Path) -> SharedFrameStore:
         )
         return SharedFrameStore(actual_metadata, raw_path, frames)
     except MotionMediaError:
-        raw_path.unlink(missing_ok=True)
+        _cleanup_artifact(raw_path, preserve_failure=True)
         raise
     except (OSError, subprocess.SubprocessError, ValueError):
-        raw_path.unlink(missing_ok=True)
+        _cleanup_artifact(raw_path, preserve_failure=True)
         raise _media_error() from None
 
 
@@ -281,10 +294,10 @@ def _spool_frames(frames: Iterable[np.ndarray], metadata: VideoMetadata, spool_p
                 handle.write(_frame_bytes(frame, metadata))
                 count += 1
     except (OSError, ValueError, TypeError, MotionMediaError):
-        spool_path.unlink(missing_ok=True)
+        _cleanup_artifact(spool_path, preserve_failure=True)
         raise _media_error() from None
     if count != metadata.frame_count:
-        spool_path.unlink(missing_ok=True)
+        _cleanup_artifact(spool_path, preserve_failure=True)
         raise _media_error()
 
 
@@ -384,17 +397,17 @@ def encode_rgb_frames(
             if copied and copied_codec in _MP4_STREAM_COPY_AUDIO_CODECS:
                 audio_transcoded = False
             else:
-                temporary_destination.unlink(missing_ok=True)
+                _cleanup_artifact(temporary_destination)
                 if not _encode_attempt(
                     _spooled_frames(spool_path, metadata), metadata, temporary_destination, audio_source, copy_audio=False
                 ):
                     raise _media_error()
                 audio_transcoded = True
+        _cleanup_artifact(spool_path)
+        spool_path = None
         os.replace(temporary_destination, target)
         return EncodeResult(destination=target, audio_transcoded=audio_transcoded)
     except (OSError, MotionMediaError):
-        temporary_destination.unlink(missing_ok=True)
+        _cleanup_artifact(temporary_destination, preserve_failure=True)
+        _cleanup_artifact(spool_path, preserve_failure=True)
         raise _media_error() from None
-    finally:
-        if spool_path is not None:
-            spool_path.unlink(missing_ok=True)
