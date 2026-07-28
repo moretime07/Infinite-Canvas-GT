@@ -2097,6 +2097,7 @@ async function openCanvas(id){
         render();
         resumeCanvasImageTasks();
         resumeCanvasVideoTasks();
+        if(typeof resumePendingCanvasMotionTasks === 'function') resumePendingCanvasMotionTasks();
         resumeRunningHubTasks();
         startCanvasRemotePolling();
         setStatus('Ready');
@@ -2139,6 +2140,7 @@ function applyRemoteCanvasData(remote){
         render();
         resumeCanvasImageTasks();
         resumeCanvasVideoTasks();
+        if(typeof resumePendingCanvasMotionTasks === 'function') resumePendingCanvasMotionTasks();
         resumeRunningHubTasks();
         if(currentCanvasTitle) currentCanvasTitle.textContent = canvas.title || tr('canvas.untitled');
         if(currentCanvasTime) currentCanvasTime.textContent = formatCanvasTime(canvas.updated_at || canvas.created_at);
@@ -2709,25 +2711,188 @@ function resolveMotionInputVideo(node, context={}){
     if(refs.length > 1) return {video:null, error:tr('canvas.motionOnlyOneVideo')};
     return {video:null, error:tr(refs.hasImageInput ? 'canvas.motionImageInputRejected' : 'canvas.motionNeedVideo')};
 }
-function startMotionExtract(nodeId){
-    const node = nodes.find(candidate => candidate.id === nodeId && candidate.type === 'motionExtract');
-    if(!node) return false;
-    const resolution = resolveMotionInputVideo(node);
-    node.motionError = resolution.error;
-    if(!resolution.error) node.motionError = tr('canvas.motionBackendPending');
+function motionTaskIsTerminal(state){ return ['partial', 'completed', 'failed', 'cancelled'].includes(state); }
+function motionTaskIsPolling(state){ return ['queued', 'downloading', 'running'].includes(state); }
+function motionTaskSafeUrl(value){
+    const url = typeof value === 'string' ? value : '';
+    return /^\/(?:assets|output)\//.test(url) ? url : '';
+}
+function motionTaskSafeMessage(value){
+    const text = String(value || '').trim();
+    if(!text || /(?:[A-Za-z]:[\\/]|\\\\|\bsk-[A-Za-z0-9_-]+\b|data:|api[_ -]?key|token\s*[=:])/i.test(text)) return tr('canvas.motionFailed');
+    return text.slice(0, 500);
+}
+function motionTaskNode(nodeId){ return nodes.find(candidate => candidate.id === nodeId && candidate.type === 'motionExtract') || null; }
+function motionTaskPersist(node, before){
+    const after = JSON.stringify({
+        motionTaskId:node.motionTaskId || '', motionState:node.motionState || '', motionStage:node.motionStage || '',
+        motionProgress:Number(node.motionProgress) || 0, motionQueuePosition:Number(node.motionQueuePosition) || 0,
+        depthState:node.depthState || '', depthUrl:node.depthUrl || '', depthError:node.depthError || '',
+        poseState:node.poseState || '', poseUrl:node.poseUrl || '', poseError:node.poseError || '',
+        motionWarnings:node.motionWarnings || [], motionError:node.motionError || '',
+    });
+    if(after === before) return false;
     render();
     scheduleSave();
-    return false;
+    return true;
 }
-function retryMotionExtract(nodeId){ return startMotionExtract(nodeId); }
-function cancelMotionExtract(nodeId){
-    const node = nodes.find(candidate => candidate.id === nodeId && candidate.type === 'motionExtract');
+function applyCanvasMotionTask(node, payload={}){
+    if(!node || node.type !== 'motionExtract' || !payload || typeof payload !== 'object') return false;
+    const before = JSON.stringify({
+        motionTaskId:node.motionTaskId || '', motionState:node.motionState || '', motionStage:node.motionStage || '',
+        motionProgress:Number(node.motionProgress) || 0, motionQueuePosition:Number(node.motionQueuePosition) || 0,
+        depthState:node.depthState || '', depthUrl:node.depthUrl || '', depthError:node.depthError || '',
+        poseState:node.poseState || '', poseUrl:node.poseUrl || '', poseError:node.poseError || '',
+        motionWarnings:node.motionWarnings || [], motionError:node.motionError || '',
+    });
+    const taskId = typeof payload.task_id === 'string' ? payload.task_id : node.motionTaskId || '';
+    const isSameTask = !node.motionTaskId || node.motionTaskId === taskId;
+    if(!taskId || !isSameTask) return false;
+    const state = typeof payload.state === 'string' ? payload.state : node.motionState || 'queued';
+    const isNewTask = node.motionTaskId !== taskId;
+    node.motionTaskId = taskId;
+    node.motionState = state;
+    node.motionStage = typeof payload.stage === 'string' ? payload.stage : state;
+    const reportedProgress = Math.max(0, Math.min(100, Number(payload.progress) || 0));
+    node.motionProgress = isNewTask ? reportedProgress : Math.max(Number(node.motionProgress) || 0, reportedProgress);
+    node.motionQueuePosition = motionTaskIsPolling(state) ? Math.max(0, Number(payload.queue_position) || 0) : 0;
+    ['depth', 'pose'].forEach(branch => {
+        const stateKey = `${branch}_state`;
+        const urlKey = `${branch}_url`;
+        const errorKey = `${branch}_error`;
+        const nodeState = `${branch}State`;
+        const nodeUrl = `${branch}Url`;
+        const nodeError = `${branch}Error`;
+        if(typeof payload[stateKey] === 'string') node[nodeState] = payload[stateKey];
+        if(Object.hasOwn(payload, urlKey) || node[nodeState] !== 'completed') node[nodeUrl] = node[nodeState] === 'completed' ? motionTaskSafeUrl(payload[urlKey]) : '';
+        if(Object.hasOwn(payload, errorKey)) node[nodeError] = payload[errorKey] ? motionTaskSafeMessage(payload[errorKey]) : '';
+    });
+    if(Array.isArray(payload.warnings)) node.motionWarnings = payload.warnings.filter(Boolean).map(motionTaskSafeMessage).filter(Boolean);
+    node.motionError = state === 'failed' ? motionTaskSafeMessage(payload.error || payload.message) : '';
+    return motionTaskPersist(node, before);
+}
+async function createCanvasMotionTask(node, sourceUrl, runToken=node?.motionRunToken){
+    const payload = {
+        source_url:sourceUrl,
+        depth_enabled:node?.depthEnabled !== false,
+        pose_enabled:node?.poseEnabled === true,
+        preserve_audio:Boolean(node?.preserveAudio),
+    };
+    const res = await fetch('/api/canvas-motion-tasks', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if(node?.motionRunToken !== runToken) return null;
+    if(!res.ok){
+        const before = JSON.stringify({motionState:node.motionState || '', motionError:node.motionError || ''});
+        node.motionState = 'failed';
+        node.motionError = motionTaskSafeMessage(data?.detail || data?.error || data?.message);
+        if(JSON.stringify({motionState:node.motionState || '', motionError:node.motionError || ''}) !== before){ render(); scheduleSave(); }
+        throw new Error(node.motionError);
+    }
+    if(!data?.task_id) throw new Error(tr('canvas.motionFailed'));
+    applyCanvasMotionTask(node, data);
+    return data;
+}
+async function pollCanvasMotionTask(nodeId, taskId, runToken=null){
+    const node = motionTaskNode(nodeId);
+    const token = runToken ?? node?.motionRunToken;
+    if(!node || !taskId || node.motionTaskId !== taskId) return 'stale';
+    let attempt = 0;
+    while(node.motionRunToken === token && node.motionTaskId === taskId){
+        try {
+            const res = await fetch(`/api/canvas-motion-tasks/${encodeURIComponent(taskId)}`);
+            const data = await res.json().catch(() => ({}));
+            if(node.motionRunToken !== token || node.motionTaskId !== taskId) return 'stale';
+            if(!res.ok) throw new Error(motionTaskSafeMessage(data?.detail || data?.error || data?.message));
+            applyCanvasMotionTask(node, data);
+            if(motionTaskIsTerminal(data?.state)) return data.state;
+            if(!motionTaskIsPolling(data?.state)) return data?.state || 'unknown';
+        } catch(error) {
+            if(node.motionRunToken !== token || node.motionTaskId !== taskId) return 'stale';
+            const before = JSON.stringify({motionState:node.motionState || '', motionError:node.motionError || ''});
+            node.motionState = 'failed';
+            node.motionError = motionTaskSafeMessage(error?.message);
+            if(JSON.stringify({motionState:node.motionState || '', motionError:node.motionError || ''}) !== before){ render(); scheduleSave(); }
+            return 'failed';
+        }
+        const delays = [800, 1200, 1800, 2500, 3000];
+        await sleep(delays[Math.min(attempt++, delays.length - 1)]);
+    }
+    return 'stale';
+}
+async function cancelCanvasMotionTask(nodeId){
+    const node = motionTaskNode(nodeId);
+    const taskId = node?.motionTaskId;
+    if(!node || !taskId || motionTaskIsTerminal(node.motionState)) return false;
+    node.motionRunToken = Number(node.motionRunToken || 0) + 1;
+    const token = node.motionRunToken;
+    try {
+        const res = await fetch(`/api/canvas-motion-tasks/${encodeURIComponent(taskId)}/cancel`, {method:'POST'});
+        const data = await res.json().catch(() => ({}));
+        if(node.motionRunToken !== token || node.motionTaskId !== taskId) return false;
+        if(!res.ok) throw new Error(motionTaskSafeMessage(data?.detail || data?.error || data?.message));
+        applyCanvasMotionTask(node, data);
+        return true;
+    } catch(error) {
+        if(node.motionRunToken !== token || node.motionTaskId !== taskId) return false;
+        const before = JSON.stringify({motionState:node.motionState || '', motionError:node.motionError || ''});
+        node.motionState = 'failed';
+        node.motionError = motionTaskSafeMessage(error?.message);
+        if(JSON.stringify({motionState:node.motionState || '', motionError:node.motionError || ''}) !== before){ render(); scheduleSave(); }
+        return false;
+    }
+}
+async function runMotionExtractNode(nodeId, context={}){
+    const node = motionTaskNode(nodeId);
     if(!node) return false;
-    node.motionError = tr('canvas.motionBackendPending');
+    const resolution = resolveMotionInputVideo(node, context);
+    if(resolution.error){
+        const changed = node.motionError !== resolution.error;
+        node.motionError = resolution.error;
+        if(changed){ render(); scheduleSave(); }
+        return false;
+    }
+    const sourceUrl = motionTaskSafeUrl(resolution.video?.url);
+    if(!sourceUrl){
+        node.motionError = tr('canvas.motionFailed');
+        render(); scheduleSave();
+        return false;
+    }
+    node.motionRunToken = Number(node.motionRunToken || 0) + 1;
+    const token = node.motionRunToken;
+    node.motionTaskId = '';
+    node.motionState = 'queued';
+    node.motionStage = 'queued';
+    node.motionProgress = 0;
+    node.motionQueuePosition = 0;
+    node.depthState = node.depthEnabled !== false ? 'pending' : 'disabled';
+    node.depthUrl = '';
+    node.depthError = '';
+    node.poseState = node.poseEnabled === true ? 'pending' : 'disabled';
+    node.poseUrl = '';
+    node.poseError = '';
+    node.motionWarnings = [];
+    node.motionError = '';
     render();
     scheduleSave();
-    return false;
+    try {
+        const task = await createCanvasMotionTask(node, sourceUrl, token);
+        if(!task || node.motionRunToken !== token) return false;
+        return await pollCanvasMotionTask(nodeId, task.task_id, token);
+    } catch(_error) {
+        return false;
+    }
 }
+function resumePendingCanvasMotionTasks(){
+    nodes.filter(node => node?.type === 'motionExtract' && node.motionTaskId && !motionTaskIsTerminal(node.motionState)).forEach(node => {
+        node.motionRunToken = Number(node.motionRunToken || 0) + 1;
+        pollCanvasMotionTask(node.id, node.motionTaskId, node.motionRunToken);
+    });
+}
+function startMotionExtract(nodeId){ return runMotionExtractNode(nodeId); }
+function retryMotionExtract(nodeId){ return runMotionExtractNode(nodeId); }
+function cancelMotionExtract(nodeId){ return cancelCanvasMotionTask(nodeId); }
 function addRhNode(point){
     const p = point || defaultPoint(180, 0);
     return addNode({
@@ -8669,12 +8834,12 @@ function updateMotionSourceMetadata(node, source, media){
     scheduleSave();
     return true;
 }
-function renderMotionResultCard(branch, enabled, state, url){
+function renderMotionResultCard(branch, enabled, state, url, error=''){
     const label = branch === 'depth' ? tr('canvas.motionDepth') : tr('canvas.motionPose');
     if(!enabled) return `<div class="motion-result-card disabled"><div class="motion-result-head"><span>${escapeHtml(label)}</span><span>${escapeHtml(tr('canvas.motionDisabled'))}</span></div></div>`;
     if(state === 'completed' && url) return `<div class="motion-result-card"><div class="motion-result-head"><span>${escapeHtml(label)}</span><span>${escapeHtml(tr('canvas.motionCompleted'))}</span></div>${canvasVideoPreviewHtml(url, 480, 'data-video-fallback-attrs="controls"')}</div>`;
     const stateKey = state === 'failed' ? 'canvas.motionFailed' : 'canvas.motionPending';
-    return `<div class="motion-result-card"><div class="motion-result-head"><span>${escapeHtml(label)}</span><span>${escapeHtml(tr(stateKey))}</span></div><div class="motion-result-empty">${escapeHtml(tr(stateKey))}</div></div>`;
+    return `<div class="motion-result-card"><div class="motion-result-head"><span>${escapeHtml(label)}</span><span>${escapeHtml(tr(stateKey))}</span></div><div class="motion-result-empty">${escapeHtml(error || tr(stateKey))}</div></div>`;
 }
 function renderMotionExtractBody(node){
     const wrap = document.createElement('div');
@@ -8685,7 +8850,7 @@ function renderMotionExtractBody(node){
         ? `<div class="motion-source-card">${canvasVideoPreviewHtml(sourceDisplay.url, 480, 'data-video-fallback-attrs="controls"')}${canvasVideoFallbackHtml(sourceDisplay.url, 'class="motion-source-metadata-probe" aria-hidden="true" tabindex="-1"')}<div class="motion-source-meta"><strong>${escapeHtml(sourceDisplay.name || tr('canvas.motionVideoSource'))}</strong><span data-motion-source-meta>${escapeHtml(motionSourceMeta(sourceDisplay))}</span></div></div>`
         : `<div class="motion-source-empty">${escapeHtml(tr('canvas.motionSourceHint'))}</div>`;
     const progress = Math.max(0, Math.min(100, Number(node.motionProgress) || 0));
-    const action = ['queued', 'running'].includes(node.motionState)
+    const action = ['queued', 'downloading', 'running'].includes(node.motionState)
         ? `<button class="motion-action secondary" type="button" data-motion-cancel>${escapeHtml(tr('canvas.motionCancel'))}</button>`
         : node.motionState === 'failed'
             ? `<button class="motion-action" type="button" data-motion-retry>${escapeHtml(tr('canvas.motionRetry'))}</button>`
@@ -8698,7 +8863,7 @@ function renderMotionExtractBody(node){
             <label><input type="checkbox" data-motion-audio ${node.preserveAudio ? 'checked' : ''}><span>${escapeHtml(tr('canvas.motionPreserveAudio'))}</span></label>
         </div>
         <div class="motion-progress" aria-label="${escapeAttr(tr('canvas.motionProgress'))}"><div class="motion-progress-meta"><span>${escapeHtml(node.motionStage || tr('canvas.motionWaiting'))}${node.motionQueuePosition ? ` · ${escapeHtml(trf('canvas.motionQueuePosition', {n:node.motionQueuePosition}))}` : ''}</span><span>${progress}%</span></div><div class="motion-progress-track"><span style="width:${progress}%"></span></div></div>
-        <div class="motion-results">${renderMotionResultCard('depth', node.depthEnabled !== false, node.depthState, node.depthUrl)}${renderMotionResultCard('pose', node.poseEnabled === true, node.poseState, node.poseUrl)}</div>
+        <div class="motion-results">${renderMotionResultCard('depth', node.depthEnabled !== false, node.depthState, node.depthUrl, node.depthError)}${renderMotionResultCard('pose', node.poseEnabled === true, node.poseState, node.poseUrl, node.poseError)}</div>
         ${node.motionWarnings?.length ? `<div class="motion-warnings">${node.motionWarnings.map(warning => `<div>${escapeHtml(warning)}</div>`).join('')}</div>` : ''}
         ${node.motionError ? `<div class="motion-error">${escapeHtml(node.motionError)}</div>` : ''}
         <div class="motion-actions">${action}</div>
