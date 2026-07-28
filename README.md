@@ -29,6 +29,32 @@ Then open:
 http://127.0.0.1:3000/
 ```
 
+## Local motion-reference extraction (Windows/NVIDIA)
+
+The canvas `动作提取` node is a local Windows workflow for an NVIDIA RTX GPU. Use Windows 10 or 11, a current NVIDIA driver, and the repository's `.venv` environment. After the base environment exists, run the one-time installer from the repository root and restart the app:
+
+```bat
+安装动作提取环境.bat
+```
+
+The web API never installs Python packages. If the node reports that the local motion environment is unavailable, close the app, run `安装动作提取环境.bat`, confirm that both CUDA checks succeed, and restart the app.
+
+On first use, the local worker downloads and SHA-256 verifies approximately 468 MB of pinned model weights. Allow additional free space for download staging. The cache stays under the repository-relative `data/motion_models/` directory; no user-specific absolute cache path is published. The task may enter `downloading`/`preparing`, show the current model name and progress when reported, and then continue automatically after verification. A cancelled or failed download is never accepted as a model.
+
+A new node starts with:
+
+- `深度白模` enabled;
+- `骨骼姿态` disabled;
+- `保留原始音频` disabled.
+
+At least one visual processor must remain enabled. Turn on `骨骼姿态` to publish a second pose video, and turn on `保留原始音频` when both generated MP4 files should carry the source audio. Inputs are limited to one local video of 30 seconds or less.
+
+Connect the named `DEPTH` and `POSE` output ports independently to choose the reference role for each downstream video node. `DEPTH` and `POSE` publish separate browser-safe MP4 URLs; enabling one does not replace the other. Existing legacy canvas connections without a saved `fromPort` retain their previous behavior.
+
+Use `取消` while a task is queued or running. After cancellation or a branch failure, use `重试` to submit a fresh local task with the current switches. Cancellation cleans task-local decoded frames and incomplete outputs; already completed branch results remain distinguishable from disabled or failed branches.
+
+Motion extraction never uses an API-provider key and never falls back to a paid or cloud media service. Source video, decoded frames, model inference, and MP4 publication remain on the local machine.
+
 ## Notes
 
 Runtime configuration, API keys, generated media, local history, user canvases, and bundled Python files are intentionally excluded from Git.

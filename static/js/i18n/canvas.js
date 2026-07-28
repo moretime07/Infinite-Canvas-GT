@@ -100,6 +100,7 @@
         "canvas.motionDepthUnavailable": { zh: "\u6df1\u5ea6\u7ed3\u679c\u4e0d\u53ef\u7528", en: "Depth result is unavailable" },
         "canvas.motionPoseUnavailable": { zh: "\u59ff\u6001\u7ed3\u679c\u4e0d\u53ef\u7528", en: "Pose result is unavailable" },
         "canvas.motionResultPortRequired": { zh: "\u8bf7\u9009\u62e9\u6df1\u5ea6\u6216\u59ff\u6001\u8f93\u51fa\u7aef\u53e3", en: "Select the depth or pose output port" },
+        "canvas.motionRuntimeUnavailable": { zh: "\u672c\u5730\u52a8\u4f5c\u63d0\u53d6\u73af\u5883\u4e0d\u53ef\u7528\u3002\u8bf7\u8fd0\u884c\u201c\u5b89\u88c5\u52a8\u4f5c\u63d0\u53d6\u73af\u5883.bat\u201d\u5e76\u91cd\u542f\u5e94\u7528\u3002", en: "Local motion extraction is unavailable. Run \u5b89\u88c5\u52a8\u4f5c\u63d0\u53d6\u73af\u5883.bat, then restart the app." },
         "canvas.motionBackendPending": { zh: "\u52a8\u4f5c\u63d0\u53d6\u670d\u52a1\u6b63\u5728\u63a5\u5165", en: "Motion extraction service is being connected" },
         "canvas.group": { zh: "分组", en: "Group" },
         "canvas.logs": { zh: "日志", en: "Logs" },

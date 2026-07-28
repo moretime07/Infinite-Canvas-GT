@@ -2807,6 +2807,7 @@ function motionTaskSafeUrl(value){
 }
 function motionTaskSafeMessage(value){
     const text = typeof value === 'string' ? value.trim() : '';
+    if(text === 'Local motion processing failed.') return tr('canvas.motionRuntimeUnavailable');
     const normalized = text.replace(/%2f/gi, '/').replace(/%5c/gi, '\\');
     let hasAbsolutePath = false;
     for(let index = 0; index < normalized.length; index += 1){
@@ -2873,7 +2874,8 @@ function applyCanvasMotionTask(node, payload={}){
         if(Object.hasOwn(payload, errorKey)) node[nodeError] = payload[errorKey] ? motionTaskSafeMessage(payload[errorKey]) : '';
     });
     if(Array.isArray(payload.warnings)) node.motionWarnings = payload.warnings.slice(0, 10).filter(Boolean).map(motionTaskSafeMessage).filter(Boolean);
-    node.motionError = state === 'failed' ? motionTaskSafeMessage(payload.error || payload.message) : '';
+    const branchError = node.depthError || node.poseError || '';
+    node.motionError = state === 'failed' ? motionTaskSafeMessage(payload.error || payload.message || branchError) : '';
     return motionTaskPersist(node, before);
 }
 async function createCanvasMotionTask(node, sourceUrl, runToken=node?.motionRunToken){
