@@ -150,6 +150,37 @@ def _decode_rgb(path: Path, width: int, height: int) -> np.ndarray:
     )
 
 
+def _source_subject_centers(frame: np.ndarray) -> tuple[float, float]:
+    image = np.asarray(frame, dtype=np.int16)
+    white = np.all(image > 170, axis=2)
+    cyan = (
+        (image[..., 0] < 80)
+        & (image[..., 1] > 100)
+        & (image[..., 2] > 150)
+    )
+    centers = []
+    for mask in (white, cyan):
+        _rows, columns = np.nonzero(mask)
+        if not len(columns):
+            raise AssertionError("synthetic moving subject was not decoded")
+        centers.append(float(np.mean(columns)))
+    return tuple(sorted(centers))
+
+
+def _pose_subject_centers(frame: np.ndarray) -> tuple[float, ...]:
+    bright = np.asarray(frame).max(axis=2) > 120
+    active = np.count_nonzero(bright, axis=0) >= 8
+    regions: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, value in enumerate((*active, False)):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            regions.append((start, index))
+            start = None
+    return tuple((left + right - 1) / 2 for left, right in regions)
+
+
 def _encode_branch(
     frames: object,
     frame_store: media.SharedFrameStore,
@@ -210,19 +241,32 @@ class FakePoseProcessor:
     ) -> BranchResult:
         def pose_frames():
             progress(0.0)
-            for index in range(frame_store.metadata.frame_count):
+            for index, source in enumerate(frame_store.frames):
                 if cancelled():
                     return
                 canvas = np.zeros(
                     (frame_store.metadata.height, frame_store.metadata.width, 3),
                     dtype=np.uint8,
                 )
-                first_x = 18 + index
-                second_x = 72 - index
-                canvas[24:78, first_x : first_x + 2] = 255
-                canvas[38:40, first_x - 8 : first_x + 10] = 224
-                canvas[92:142, second_x : second_x + 2] = 255
-                canvas[108:110, second_x - 9 : second_x + 10] = 224
+                image = np.asarray(source, dtype=np.int16)
+                masks = (
+                    np.all(image > 170, axis=2),
+                    (
+                        (image[..., 0] < 80)
+                        & (image[..., 1] > 100)
+                        & (image[..., 2] > 150)
+                    ),
+                )
+                for mask in masks:
+                    rows, columns = np.nonzero(mask)
+                    if not len(columns):
+                        raise AssertionError("fake pose lost a decoded subject")
+                    center_x = int(round(float(np.mean(columns))))
+                    top, bottom = int(rows.min()), int(rows.max())
+                    left, right = int(columns.min()), int(columns.max())
+                    middle_y = (top + bottom) // 2
+                    canvas[top : bottom + 1, center_x : center_x + 2] = 255
+                    canvas[middle_y : middle_y + 2, left : right + 1] = 224
                 yield canvas
                 progress((index + 1) / frame_store.metadata.frame_count)
 
@@ -239,7 +283,10 @@ class MotionPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "-f",
             "lavfi",
             "-i",
-            "color=c=0x101820:size=96x160:rate=12:duration=1.5",
+            (
+                "color=c=0x101820:size=128x176:rate=12:duration=1.5,"
+                "drawgrid=width=13:height=17:thickness=2:color=0x405060"
+            ),
             "-f",
             "lavfi",
             "-i",
@@ -254,8 +301,9 @@ class MotionPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "sine=frequency=660:sample_rate=44100:duration=1.5",
             "-filter_complex",
             (
-                "[0:v][1:v]overlay=x='6+20*t':y='18+8*t':shortest=1[v1];"
-                "[v1][2:v]overlay=x='64-15*t':y='112-10*t':shortest=1[v]"
+                "[0:v]crop=96:160:x='8+floor(n/3)':y=8[base];"
+                "[base][1:v]overlay=x='6+12*t':y='18+6*t':shortest=1[v1];"
+                "[v1][2:v]overlay=x='68-8*t':y='112-6*t':shortest=1[v]"
             ),
             "-map",
             "[v]",
@@ -391,10 +439,66 @@ class MotionPipelineIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertLessEqual(depth_channel_delta, 2)
 
+        source_frames = _decode_rgb(self.source, 96, 160)
+        source_gray = np.asarray(source_frames, dtype=np.uint16).mean(axis=3)
+        for index in (0, len(source_frames) - 1):
+            source_depth_delta = np.mean(
+                np.abs(
+                    depth_frames[index, :16, :, 0].astype(np.int16)
+                    - source_gray[index, :16].astype(np.int16)
+                )
+            )
+            self.assertLess(
+                float(source_depth_delta),
+                8.0,
+                "depth output stopped following decoded source camera pixels",
+            )
+        camera_change = np.abs(
+            depth_frames[-1, :16, :, 0].astype(np.int16)
+            - depth_frames[0, :16, :, 0].astype(np.int16)
+        )
+        self.assertGreater(
+            int(np.count_nonzero(camera_change > 6)),
+            100,
+            "depth output lost source camera/background motion",
+        )
+
         pose_frames = _decode_rgb(silent_paths[1], 96, 160)
         brightness = pose_frames.max(axis=3)
         self.assertGreater(int(np.count_nonzero(brightness > 160)), 100)
         self.assertGreater(float(np.mean(brightness < 16)), 0.9)
+        source_centers = tuple(_source_subject_centers(frame) for frame in source_frames)
+        pose_centers = tuple(_pose_subject_centers(frame) for frame in pose_frames)
+        self.assertEqual(len(source_centers), len(pose_centers))
+        for frame_index, (expected, actual) in enumerate(
+            zip(source_centers, pose_centers)
+        ):
+            self.assertEqual(
+                len(actual),
+                2,
+                f"pose frame {frame_index} did not retain two separated subjects",
+            )
+            for expected_x, actual_x in zip(expected, actual):
+                self.assertAlmostEqual(
+                    actual_x,
+                    expected_x,
+                    delta=3.0,
+                    msg=f"pose frame {frame_index} stopped following decoded source motion",
+                )
+        for subject_index in (0, 1):
+            trajectory = tuple(
+                frame_centers[subject_index] for frame_centers in pose_centers
+            )
+            self.assertGreater(
+                len({round(value) for value in trajectory}),
+                3,
+                "pose output repeated frames instead of preserving temporal motion",
+            )
+            self.assertGreater(
+                abs(trajectory[-1] - trajectory[0]),
+                6.0,
+                "pose subject did not move across the clip",
+            )
 
         _created, audio_record, audio_paths = await self._run_service(
             preserve_audio=True,
@@ -473,36 +577,62 @@ vm.runInContext(
         .join('\n'),
     context,
 );
-const node = {
-    id:'motion-1',
-    type:'motionExtract',
-    motionTaskId:'canvas_motion_11111111111111111111111111111111',
-    motionState:'running',
-    motionStage:'depth',
-    motionProgress:50,
-    depthState:'running',
-    depthUrl:'',
-    depthError:'',
-    poseState:'disabled',
-    poseUrl:'',
-    poseError:'',
-    motionWarnings:[],
-    motionError:'',
-};
-context.applyCanvasMotionTask(node, {
-    task_id:node.motionTaskId,
+function failedNode(taskId){
+    return {
+        id:taskId,
+        type:'motionExtract',
+        motionTaskId:taskId,
+        motionState:'running',
+        motionStage:'depth',
+        motionProgress:50,
+        depthState:'running',
+        depthUrl:'',
+        depthError:'',
+        poseState:'disabled',
+        poseUrl:'',
+        poseError:'',
+        motionWarnings:[],
+        motionError:'',
+    };
+}
+const unavailable = failedNode('canvas_motion_11111111111111111111111111111111');
+const generic = failedNode('canvas_motion_22222222222222222222222222222222');
+context.applyCanvasMotionTask(unavailable, {
+    task_id:unavailable.motionTaskId,
     state:'failed',
     stage:'failed',
     progress:100,
     depth_state:'failed',
     depth_error:'Local motion processing failed.',
+    depth_error_code:'runtime_unavailable',
+    pose_state:'disabled',
+    warnings:[],
+});
+context.applyCanvasMotionTask(generic, {
+    task_id:generic.motionTaskId,
+    state:'failed',
+    stage:'failed',
+    progress:100,
+    depth_state:'failed',
+    depth_error:'Local motion processing failed.',
+    depth_error_code:null,
     pose_state:'disabled',
     warnings:[],
 });
 process.stdout.write(JSON.stringify({
-    safe:context.motionTaskSafeMessage('Local motion processing failed.'),
-    branch:node.depthError,
-    task:node.motionError,
+    unavailable:{
+        safe:context.motionTaskSafeMessage(
+            'Local motion processing failed.',
+            'runtime_unavailable',
+        ),
+        branch:unavailable.depthError,
+        task:unavailable.motionError,
+    },
+    generic:{
+        safe:context.motionTaskSafeMessage('Local motion processing failed.'),
+        branch:generic.depthError,
+        task:generic.motionError,
+    },
 }));
 """
         result = subprocess.run(
@@ -526,7 +656,18 @@ process.stdout.write(JSON.stringify({
         )
         self.assertEqual(
             json.loads(result.stdout.decode("utf-8")),
-            {"safe": expected, "branch": expected, "task": expected},
+            {
+                "unavailable": {
+                    "safe": expected,
+                    "branch": expected,
+                    "task": expected,
+                },
+                "generic": {
+                    "safe": "Local motion processing failed.",
+                    "branch": "Local motion processing failed.",
+                    "task": "Local motion processing failed.",
+                },
+            },
         )
 
 

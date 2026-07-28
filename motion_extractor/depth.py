@@ -10,10 +10,17 @@ from typing import Any, Literal
 
 import numpy as np
 
-from .errors import MotionCancelled, MotionMediaError, MotionOutOfMemory, MotionRuntimeError
+from .errors import (
+    MotionCancelled,
+    MotionMediaError,
+    MotionOutOfMemory,
+    MotionRuntimeError,
+    MotionRuntimeUnavailable,
+)
 from .media import EncodeResult, SharedFrameStore, encode_rgb_frames
 from .models import (
     MotionCancelled as AssetPreparationCancelled,
+    MotionAssetError,
     ensure_depth_assets,
     verified_source_imports,
 )
@@ -168,8 +175,12 @@ class DepthProcessor:
             raise
         except MotionMediaError:
             raise
+        except MotionRuntimeUnavailable:
+            raise
         except MotionRuntimeError:
             raise
+        except (MotionAssetError, ImportError):
+            raise MotionRuntimeUnavailable(_RUNTIME_MESSAGE) from None
         except RuntimeError as error:
             if self._is_cuda_oom(error):
                 raise MotionOutOfMemory(_OOM_MESSAGE) from None
@@ -185,7 +196,7 @@ class DepthProcessor:
 
             return bool(torch.cuda.is_available())
         except ImportError:
-            return False
+            raise MotionRuntimeUnavailable(_RUNTIME_MESSAGE) from None
 
     def _load_model(
         self,

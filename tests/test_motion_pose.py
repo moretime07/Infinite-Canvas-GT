@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from motion_extractor import media, models
+from motion_extractor import errors as motion_errors
 from motion_extractor.pose import PersonPose, PoseFrame, PoseProcessor, render_pose_frame, smooth_pose_sequence
 
 
@@ -393,6 +394,35 @@ class MotionPoseTests(unittest.TestCase):
                 "artifact_names": ("yolox_l.onnx", "dw-ll_ucoco_384.onnx"),
             },
         )
+
+    def test_invalid_pose_asset_is_typed_as_runtime_unavailable(self) -> None:
+        """A failed verified model/source preparation is distinct from inference bugs."""
+        unavailable_type = getattr(motion_errors, "MotionRuntimeUnavailable", None)
+        self.assertIsNotNone(unavailable_type)
+        frames = np.zeros((1, 16, 16, 3), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            store = self._store(directory, frames)
+            processor = PoseProcessor(
+                cache_root=directory / "cache",
+                work_dir=directory / "work",
+            )
+            try:
+                with mock.patch(
+                    "motion_extractor.pose.ensure_pose_assets",
+                    side_effect=models.MotionIntegrityError(
+                        r"invalid model at C:\private\model.onnx"
+                    ),
+                ), self.assertRaises(unavailable_type) as raised:
+                    processor.run(
+                        store,
+                        directory / "pose.mp4",
+                        lambda _value: None,
+                        lambda: False,
+                    )
+            finally:
+                store.close()
+        self.assertNotIn("private", str(raised.exception).lower())
 
 
 if __name__ == "__main__":

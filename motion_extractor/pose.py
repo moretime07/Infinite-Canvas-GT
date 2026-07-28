@@ -12,8 +12,14 @@ import warnings
 import numpy as np
 
 from .depth import BranchResult, _MonotonicProgress
-from .errors import MotionCancelled, MotionMediaError, MotionRuntimeError
+from .errors import (
+    MotionCancelled,
+    MotionMediaError,
+    MotionRuntimeError,
+    MotionRuntimeUnavailable,
+)
 from .media import EncodeResult, SharedFrameStore, encode_rgb_frames
+from .models import MotionAssetError
 from .models import MotionCancelled as AssetPreparationCancelled
 from .models import ensure_pose_assets
 
@@ -257,8 +263,12 @@ class PoseProcessor:
             return BranchResult("cancelled", None, _CANCELLED_MESSAGE)
         except MotionMediaError:
             raise
+        except MotionRuntimeUnavailable:
+            raise
         except MotionRuntimeError:
             raise
+        except (MotionAssetError, ImportError):
+            raise MotionRuntimeUnavailable(_RUNTIME_MESSAGE) from None
         except Exception:
             raise MotionRuntimeError(_RUNTIME_MESSAGE) from None
 

@@ -15,6 +15,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import main
+from motion_extractor import errors as motion_errors
 from motion_extractor.depth import BranchResult
 from motion_extractor.errors import MotionCancelled, MotionMediaError, MotionOutOfMemory, MotionRuntimeError
 from motion_extractor.media import VideoMetadata
@@ -337,8 +338,38 @@ class CanvasMotionTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(record["pose_url"])
         self.assertEqual(decode_count, 1)
         self.assertEqual(observations[0][1], observations[1][1])
+        self.assertEqual(record["pose_error"], "Local motion processing failed.")
+        self.assertIn("pose_error_code", record)
+        self.assertIsNone(record["pose_error_code"])
         self.assertNotIn("private", record["pose_error"].lower())
         self.assertNotIn("sk-", record["pose_error"].lower())
+
+    async def test_missing_runtime_branch_has_a_structured_code_without_raw_details(self):
+        unavailable_type = getattr(motion_errors, "MotionRuntimeUnavailable", None)
+        self.assertIsNotNone(
+            unavailable_type,
+            "missing dependencies/assets need a distinct public-safe exception",
+        )
+
+        class MissingRuntimeDepth:
+            def run(self, _store, _output_path, _progress, _cancelled, input_size=518):
+                raise unavailable_type(r"dependency missing at C:\private\model.pth")
+
+        service = self.make_service(depth_factory=MissingRuntimeDepth)
+        created = await service.submit(
+            "/assets/input/source.mp4",
+            self.source,
+            True,
+            False,
+            False,
+        )
+        record = await self.wait_for_state(service, created["task_id"], {"failed"})
+
+        self.assertEqual(record["depth_error"], "Local motion processing failed.")
+        self.assertEqual(record["depth_error_code"], "runtime_unavailable")
+        serialized = json.dumps(record)
+        self.assertNotIn("dependency missing", serialized)
+        self.assertNotIn("private", serialized.lower())
 
     async def test_cancel_cleans_incomplete_pose_and_preserves_published_depth(self):
         pose_started = threading.Event()

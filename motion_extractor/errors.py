@@ -19,6 +19,10 @@ class MotionRuntimeError(MotionError):
     """The local inference runtime failed without exposing diagnostics."""
 
 
+class MotionRuntimeUnavailable(MotionRuntimeError):
+    """A verified local dependency or model asset is unavailable."""
+
+
 class MotionOutOfMemory(MotionRuntimeError):
     """Local CUDA memory is insufficient for the requested inference."""
 

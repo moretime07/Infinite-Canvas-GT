@@ -24,6 +24,7 @@ from .errors import (
     MotionMediaError,
     MotionOutOfMemory,
     MotionRuntimeError,
+    MotionRuntimeUnavailable,
     MotionValidationError,
 )
 from .media import SharedFrameStore, VideoMetadata, decode_video_once, probe_video
@@ -34,6 +35,7 @@ _TERMINAL_STATES = frozenset({"partial", "completed", "failed", "cancelled"})
 _BRANCHES = ("depth", "pose")
 _PUBLIC_MEDIA_ERROR = "The video could not be processed."
 _PUBLIC_RUNTIME_ERROR = "Local motion processing failed."
+_PUBLIC_RUNTIME_UNAVAILABLE_CODE = "runtime_unavailable"
 _PUBLIC_OOM_ERROR = "Insufficient local GPU memory."
 _PUBLIC_CANCELLED = "Task cancelled."
 _PUBLIC_WARNING = "Motion processing completed with a warning."
@@ -234,9 +236,11 @@ class MotionTaskService:
                 "depth_state": "pending" if depth_enabled else "disabled",
                 "depth_url": None,
                 "depth_error": None,
+                "depth_error_code": None,
                 "pose_state": "pending" if pose_enabled else "disabled",
                 "pose_url": None,
                 "pose_error": None,
+                "pose_error_code": None,
                 "warnings": [],
                 "low_memory_retry": False,
             }
@@ -476,6 +480,7 @@ class MotionTaskService:
                 state="failed",
                 url=None,
                 error=self._public_error(error),
+                error_code=self._public_error_code(error),
             )
         finally:
             _safe_unlink(temporary_output)
@@ -580,12 +585,14 @@ class MotionTaskService:
         state: str,
         url: str | None = None,
         error: str | None = None,
+        error_code: str | None = None,
     ) -> None:
         async with self._lock:
             record = self._records[task_id]
             record[f"{branch}_state"] = state
             record[f"{branch}_url"] = url
             record[f"{branch}_error"] = error
+            record[f"{branch}_error_code"] = error_code
 
     async def _append_warning(self, task_id: str, warning: str) -> None:
         async with self._lock:
@@ -621,6 +628,7 @@ class MotionTaskService:
                     record[f"{branch}_state"] = "failed"
                     record[f"{branch}_url"] = None
                     record[f"{branch}_error"] = public_error
+                    record[f"{branch}_error_code"] = self._public_error_code(error)
         changes = {"state": state, "stage": state, "queue_position": 0}
         if state != "cancelled":
             changes["progress"] = 100.0
@@ -640,6 +648,7 @@ class MotionTaskService:
                 record[f"{branch}_state"] = "cancelled"
                 record[f"{branch}_url"] = None
                 record[f"{branch}_error"] = None
+                record[f"{branch}_error_code"] = None
 
     @staticmethod
     def _raise_if_cancelled(private: _PrivateTask) -> None:
@@ -696,6 +705,12 @@ class MotionTaskService:
         if isinstance(error, (MotionRuntimeError, MotionError)):
             return _PUBLIC_RUNTIME_ERROR
         return _PUBLIC_RUNTIME_ERROR
+
+    @staticmethod
+    def _public_error_code(error: Exception) -> str | None:
+        if isinstance(error, MotionRuntimeUnavailable):
+            return _PUBLIC_RUNTIME_UNAVAILABLE_CODE
+        return None
 
     @staticmethod
     def _public_warning(warning: object) -> str:

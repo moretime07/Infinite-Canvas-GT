@@ -14,7 +14,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from motion_extractor import media
+from motion_extractor import errors as motion_errors
+from motion_extractor import media, models
 from motion_extractor.depth import DepthProcessor, _VDAWindowAdapter
 from motion_extractor.errors import MotionMediaError, MotionOutOfMemory, MotionRuntimeError
 
@@ -449,6 +450,36 @@ class MotionDepthTests(unittest.TestCase):
                     ).run(store, directory / "depth.mp4", lambda _value: None, lambda: False)
             finally:
                 store.close()
+
+    def test_missing_depth_dependency_is_typed_as_runtime_unavailable(self) -> None:
+        """Only verified dependency/asset preparation failures earn installer guidance."""
+        unavailable_type = getattr(motion_errors, "MotionRuntimeUnavailable", None)
+        self.assertIsNotNone(unavailable_type)
+        frames = np.zeros((1, 4, 6, 3), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            store = self._store(directory, frames)
+            processor = DepthProcessor(
+                cache_root=directory / "cache",
+                work_dir=directory / "work",
+                cuda_available=lambda: True,
+            )
+            try:
+                with mock.patch(
+                    "motion_extractor.depth.ensure_depth_assets",
+                    side_effect=models.MotionDependencyError(
+                        r"missing dependency at C:\private\package"
+                    ),
+                ), self.assertRaises(unavailable_type) as raised:
+                    processor.run(
+                        store,
+                        directory / "depth.mp4",
+                        lambda _value: None,
+                        lambda: False,
+                    )
+            finally:
+                store.close()
+        self.assertNotIn("private", str(raised.exception).lower())
 
     def test_cancellation_inside_encode_generator_aborts_without_publishing_output(self) -> None:
         """Checking only before encode allows a cancelled frame stream to publish an MP4."""

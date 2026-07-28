@@ -2805,9 +2805,9 @@ function motionTaskSafeUrl(value){
         return '';
     }
 }
-function motionTaskSafeMessage(value){
+function motionTaskSafeMessage(value, errorCode=''){
     const text = typeof value === 'string' ? value.trim() : '';
-    if(text === 'Local motion processing failed.') return tr('canvas.motionRuntimeUnavailable');
+    if(errorCode === 'runtime_unavailable') return tr('canvas.motionRuntimeUnavailable');
     const normalized = text.replace(/%2f/gi, '/').replace(/%5c/gi, '\\');
     let hasAbsolutePath = false;
     for(let index = 0; index < normalized.length; index += 1){
@@ -2866,16 +2866,17 @@ function applyCanvasMotionTask(node, payload={}){
         const stateKey = `${branch}_state`;
         const urlKey = `${branch}_url`;
         const errorKey = `${branch}_error`;
+        const errorCodeKey = `${branch}_error_code`;
         const nodeState = `${branch}State`;
         const nodeUrl = `${branch}Url`;
         const nodeError = `${branch}Error`;
         if(Object.hasOwn(payload, stateKey)) node[nodeState] = motionTaskSafeBranchState(payload[stateKey]);
         if(Object.hasOwn(payload, urlKey) || node[nodeState] !== 'completed') node[nodeUrl] = node[nodeState] === 'completed' ? motionTaskSafeUrl(payload[urlKey]) : '';
-        if(Object.hasOwn(payload, errorKey)) node[nodeError] = payload[errorKey] ? motionTaskSafeMessage(payload[errorKey]) : '';
+        if(Object.hasOwn(payload, errorKey)) node[nodeError] = payload[errorKey] ? motionTaskSafeMessage(payload[errorKey], payload[errorCodeKey]) : '';
     });
     if(Array.isArray(payload.warnings)) node.motionWarnings = payload.warnings.slice(0, 10).filter(Boolean).map(motionTaskSafeMessage).filter(Boolean);
     const branchError = node.depthError || node.poseError || '';
-    node.motionError = state === 'failed' ? motionTaskSafeMessage(payload.error || payload.message || branchError) : '';
+    node.motionError = state === 'failed' ? motionTaskSafeMessage(payload.error || payload.message || branchError, payload.error_code) : '';
     return motionTaskPersist(node, before);
 }
 async function createCanvasMotionTask(node, sourceUrl, runToken=node?.motionRunToken){
