@@ -47,6 +47,7 @@
         "canvas.loopImageEmpty": { zh: "把图片或图片组连接到左侧输入口", en: "Connect images or image groups to the left input" },
         "canvas.loopImageLabel": { zh: "循环图片 {n}", en: "Loop image {n}" },
         "canvas.loopVideoToggle": { zh: "视频", en: "Videos" },
+        "canvas.loopVideoStart": { zh: "起始计数", en: "Start index" },
         "canvas.loopVideoWillOutput": { zh: "当前会输出 {n} 个视频", en: "Will output {n} videos" },
         "canvas.loopVideoEmpty": { zh: "把视频或视频组连接到左侧输入口", en: "Connect videos or video groups to the left input" },
         "canvas.loopVideoLabel": { zh: "循环视频 {n}", en: "Loop video {n}" },

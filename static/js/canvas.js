@@ -2664,6 +2664,64 @@ function motionOutputVideoRefs(node, portName=''){
     refs.push({url, name:`${branch}.mp4`, kind:'video', ...motionVideoRefMetadata(branch === 'depth' ? node?.depthMeta : node?.poseMeta)});
     return refs;
 }
+function motionLoopItemState(node, context={}){
+    const loop = context.loopContext || node?._activeLoopCtx || loopContext || null;
+    const index = Number(loop?.index);
+    if(!node || !loop?.nodeId || !Number.isInteger(index) || index < 1) return null;
+    const current = loop.currentVideoRef || loop.currentMediaRef || loop.videoRef || null;
+    const sourceUrl = typeof current === 'string' ? current : current?.url || '';
+    const key = `${loop.nodeId}:${index}:${sourceUrl}`;
+    if(!node.motionLoopItems || typeof node.motionLoopItems !== 'object') node.motionLoopItems = {};
+    if(!node.motionLoopItems[key]){
+        node.motionLoopItems[key] = {key, loopNodeId:loop.nodeId, index, sourceUrl, taskId:'', status:'idle', error:'', depthUrl:'', poseUrl:''};
+    }
+    return node.motionLoopItems[key];
+}
+function persistMotionLoopItem(node, item){
+    if(!node || !item?.key) return false;
+    if(!node.motionLoopItems || typeof node.motionLoopItems !== 'object') node.motionLoopItems = {};
+    node.motionLoopItems[item.key] = item;
+    return true;
+}
+function snapshotMotionLoopItem(node, item){
+    if(!item) return false;
+    item.taskId = node.motionTaskId || '';
+    item.status = node.motionState || 'idle';
+    item.error = node.motionError || '';
+    item.depthUrl = node.depthState === 'completed' ? node.depthUrl || '' : '';
+    item.poseUrl = node.poseState === 'completed' ? node.poseUrl || '' : '';
+    return persistMotionLoopItem(node, item);
+}
+function motionCascadeSelectedBranches(node, targetId=''){
+    const branches = new Set();
+    const runnable = canvasRunTypes();
+    const reachesTarget = startId => {
+        if(!targetId) return true;
+        const seen = new Set();
+        const visit = id => {
+            if(id === targetId) return true;
+            if(seen.has(id)) return false;
+            seen.add(id);
+            return connections.filter(connection => connection.from === id).some(connection => visit(connection.to));
+        };
+        return visit(startId);
+    };
+    connections.filter(connection => connection.from === node?.id).forEach(connection => {
+        const target = nodes.find(candidate => candidate.id === connection.to);
+        if(runnable.includes(target?.type) && reachesTarget(target.id)) branches.add(normalizedFromPort(connection));
+        if(target?.type === 'output' && reachesTarget(target.id) && connections.some(next => next.from === target.id && runnable.includes(nodes.find(candidate => candidate.id === next.to)?.type))){
+            branches.add(normalizedFromPort(connection));
+        }
+    });
+    return [...branches].filter(branch => branch === 'depth' || branch === 'pose');
+}
+function assertMotionCascadeBranches(node, targetId=''){
+    motionCascadeSelectedBranches(node, targetId).forEach(branch => {
+        const refs = motionOutputVideoRefs(node, branch);
+        if(!refs.length) throw new Error(refs.error || tr('canvas.motionFailed'));
+    });
+    return true;
+}
 function motionLoopCurrentVideoRef(refs, context=null){
     if(!context || !refs.length) return null;
     const explicit = context.currentVideoRef || context.currentMediaRef || context.videoRef || null;
@@ -2894,17 +2952,27 @@ async function cancelCanvasMotionTask(nodeId){
 async function runMotionExtractNode(nodeId, context={}){
     const node = motionTaskNode(nodeId);
     if(!node) return false;
+    const loopItem = motionLoopItemState(node, context);
+    const resumesCurrentItem = !loopItem || loopItem.taskId === node.motionTaskId;
+    if(resumesCurrentItem && motionTaskIdIsSafe(node.motionTaskId) && motionTaskIsPolling(node.motionState)){
+        node.motionRunToken = Number(node.motionRunToken || 0) + 1;
+        const state = await pollCanvasMotionTask(nodeId, node.motionTaskId, node.motionRunToken);
+        snapshotMotionLoopItem(node, loopItem);
+        return state;
+    }
     const resolution = resolveMotionInputVideo(node, context);
     if(resolution.error){
         const changed = node.motionError !== resolution.error;
         node.motionError = resolution.error;
         if(changed){ render(); scheduleSave(); }
+        snapshotMotionLoopItem(node, loopItem);
         return false;
     }
     const sourceUrl = motionTaskSafeUrl(resolution.video?.url);
     if(!sourceUrl){
         node.motionError = tr('canvas.motionFailed');
         render(); scheduleSave();
+        snapshotMotionLoopItem(node, loopItem);
         return false;
     }
     node.motionRunToken = Number(node.motionRunToken || 0) + 1;
@@ -2927,9 +2995,12 @@ async function runMotionExtractNode(nodeId, context={}){
     try {
         const task = await createCanvasMotionTask(node, sourceUrl, token);
         if(!task || node.motionRunToken !== token) return false;
+        if(snapshotMotionLoopItem(node, loopItem)) scheduleSave();
         return await pollCanvasMotionTask(nodeId, task.task_id, token);
     } catch(_error) {
         return false;
+    } finally {
+        snapshotMotionLoopItem(node, loopItem);
     }
 }
 function resumePendingCanvasMotionTasks(){
@@ -6532,7 +6603,7 @@ function renderNode(node){
         startNodeDrag(e, node);
     };
     const namedOutputPorts = nodeOutputPorts(node);
-    const canInput = ['generator','comfy','ltxDirector','output','llm','msgen','video','rh','motionExtract'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
+    const canInput = ['generator','comfy','ltxDirector','output','llm','msgen','video','rh','motionExtract'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.videoInput || node.showPrompt));
     const canOutput = namedOutputPorts.length || ['image','prompt','loop','group','promptGroup','generator','comfy','ltxDirector','llm','msgen','video','rh','output'].includes(node.type);
     if(canInput) el.insertAdjacentHTML('beforeend', `<div class="port in" title="${tr('canvas.connectHere')}"></div>`);
     if(namedOutputPorts.length){
@@ -6899,10 +6970,10 @@ function autoSizeLoopNode(node, opening){
 function autoSizeLoopForPanels(node){
     if(!node) return;
     node.w = Math.max(Number(node.w || 0), 336);
-    const panels = (node.showPrompt ? 1 : 0) + (node.imageInput ? 1 : 0);
+    const panels = (node.showPrompt ? 1 : 0) + (node.imageInput ? 1 : 0) + (node.videoInput ? 1 : 0);
     if(panels === 0) { delete node.h; return; }
     if(panels === 1) node.h = node.showPrompt ? 330 : 320;
-    else if(panels === 2) node.h = (node.showPrompt && node.imageInput) ? 390 : 380;
+    else if(panels === 2) node.h = (node.showPrompt && (node.imageInput || node.videoInput)) ? 390 : 380;
     else node.h = 460;
 }
 function loopTokenChipHtml(token){
@@ -8002,8 +8073,10 @@ function renderLoopBody(node){
     node.mode = node.mode === 'parallel' ? 'parallel' : 'serial';
     node.showPrompt = Boolean(node.showPrompt);
     node.imageInput = Boolean(node.imageInput);
-    node.videoInput = false;
+    node.videoInput = Boolean(node.videoInput);
+    node.videoBatchSize = Math.max(1, Math.min(100, Number(node.videoBatchSize) || 1));
     const imageInputCount = loopInputImageRefs(node, {index:node.loopStart}).length;
+    const videoInputCount = loopInputVideoRefs(node, {index:node.loopStart}).length;
     const promptItemCount = node.showPrompt ? loopInputPromptItems(node).length : 0;
     const hasUpstreamPrompt = promptItemCount > 0;
     const loopTargetId = findLoopCascadeTarget(node.id);
@@ -8026,6 +8099,7 @@ function renderLoopBody(node){
             </div>
             <div class="loop-toggle-row">
                 <button class="loop-toggle loop-image-toggle ${node.imageInput ? 'active' : ''}" type="button"><i data-lucide="image" class="w-3.5 h-3.5"></i>${tr('canvas.loopImageToggle')}</button>
+                <button class="loop-toggle loop-video-toggle ${node.videoInput ? 'active' : ''}" type="button"><i data-lucide="video" class="w-3.5 h-3.5"></i>${tr('canvas.loopVideoToggle')}</button>
                 <button class="loop-toggle loop-prompt-toggle ${node.showPrompt ? 'active' : ''}" type="button"><i data-lucide="text-cursor-input" class="w-3.5 h-3.5"></i>${tr('canvas.loopPromptToggle')}</button>
             </div>
         </div>
@@ -8037,6 +8111,15 @@ function renderLoopBody(node){
                 <input class="loop-count-input loop-batch-input" type="number" min="1" max="100" step="1" value="${node.imageBatchSize}">
             </div>
             <div class="loop-image-hint loop-image-hint-only">${imageInputCount ? trf('canvas.loopImageWillOutput', {n:imageInputCount}) : tr('canvas.loopImageEmpty')}</div>
+        </div>` : ''}
+        ${node.videoInput ? `<div class="loop-image-panel loop-video-panel">
+            <div class="loop-image-row">
+                <span class="loop-count-label">${tr('canvas.loopVideoStart')}</span>
+                <input class="loop-count-input loop-video-start-input" type="number" min="1" max="9999" step="1" value="${node.loopStart}">
+                <span class="loop-count-label">${tr('canvas.loopBatchSize')}</span>
+                <input class="loop-count-input loop-video-batch-input" type="number" min="1" max="100" step="1" value="${node.videoBatchSize}">
+            </div>
+            <div class="loop-image-hint loop-video-hint-only">${videoInputCount ? trf('canvas.loopVideoWillOutput', {n:videoInputCount}) : tr('canvas.loopVideoEmpty')}</div>
         </div>` : ''}
         ${node.showPrompt ? `<div class="loop-prompt-panel ${hasUpstreamPrompt ? 'has-upstream' : ''}">
             <div class="loop-field">
@@ -8055,6 +8138,7 @@ function renderLoopBody(node){
     const variable = wrap.querySelector('.loop-variable-editor');
     const toggle = wrap.querySelector('.loop-prompt-toggle');
     const imageToggle = wrap.querySelector('.loop-image-toggle');
+    const videoToggle = wrap.querySelector('.loop-video-toggle');
     if(variable) {
         variable.onmousedown = e => e.stopPropagation();
         variable.onclick = e => e.stopPropagation();
@@ -8070,8 +8154,14 @@ function renderLoopBody(node){
         const count = loopInputImageRefs(node, {index:node.loopStart}).length;
         hint.textContent = count ? trf('canvas.loopImageWillOutput', {n:count}) : tr('canvas.loopImageEmpty');
     };
+    const refreshVideoHint = () => {
+        const hint = wrap.querySelector('.loop-video-hint-only');
+        if(!hint) return;
+        const count = loopInputVideoRefs(node, {index:node.loopStart}).length;
+        hint.textContent = count ? trf('canvas.loopVideoWillOutput', {n:count}) : tr('canvas.loopVideoEmpty');
+    };
     const syncStartInputs = source => {
-        wrap.querySelectorAll('.loop-image-start-input, .loop-start-input').forEach(input => {
+        wrap.querySelectorAll('.loop-image-start-input, .loop-video-start-input, .loop-start-input').forEach(input => {
             if(input !== source && input.value !== String(node.loopStart)) input.value = node.loopStart;
         });
     };
@@ -8106,6 +8196,7 @@ function renderLoopBody(node){
         startInput.oninput = e => {
             node.loopStart = Math.max(1, Number(e.target.value) || 1);
             refreshImageHint();
+            refreshVideoHint();
             syncStartInputs(e.target);
             scheduleSave();
             syncGeneratorInputs();
@@ -8119,6 +8210,21 @@ function renderLoopBody(node){
         imageStartInput.oninput = e => {
             node.loopStart = Math.max(1, Number(e.target.value) || 1);
             refreshImageHint();
+            refreshVideoHint();
+            syncStartInputs(e.target);
+            scheduleSave();
+            syncGeneratorInputs();
+            refreshGeneratorInputViews();
+        };
+    }
+    const videoStartInput = wrap.querySelector('.loop-video-start-input');
+    if(videoStartInput){
+        videoStartInput.onmousedown = e => e.stopPropagation();
+        videoStartInput.onclick = e => e.stopPropagation();
+        videoStartInput.oninput = e => {
+            node.loopStart = Math.max(1, Number(e.target.value) || 1);
+            refreshImageHint();
+            refreshVideoHint();
             syncStartInputs(e.target);
             scheduleSave();
             syncGeneratorInputs();
@@ -8133,6 +8239,19 @@ function renderLoopBody(node){
             node.imageBatchSize = Math.max(1, Math.min(100, Number(e.target.value) || 1));
             e.target.value = node.imageBatchSize;
             refreshImageHint();
+            scheduleSave();
+            syncGeneratorInputs();
+            refreshGeneratorInputViews();
+        };
+    }
+    const videoBatchInput = wrap.querySelector('.loop-video-batch-input');
+    if(videoBatchInput){
+        videoBatchInput.onmousedown = e => e.stopPropagation();
+        videoBatchInput.onclick = e => e.stopPropagation();
+        videoBatchInput.oninput = e => {
+            node.videoBatchSize = Math.max(1, Math.min(100, Number(e.target.value) || 1));
+            e.target.value = node.videoBatchSize;
+            refreshVideoHint();
             scheduleSave();
             syncGeneratorInputs();
             refreshGeneratorInputViews();
@@ -8202,6 +8321,23 @@ function renderLoopBody(node){
             if(node.imageInput){
                 node.loopStart = Math.max(1, Number(node.loopStart) || 1);
                 node.imageBatchSize = Math.max(1, Math.min(100, Number(node.imageBatchSize) || 1));
+            } else {
+                connections = connections.filter(c => c.to !== node.id || canConnect(c.from, node.id));
+            }
+            autoSizeLoopForPanels(node);
+            render();
+            scheduleSave();
+            syncGeneratorInputs();
+            refreshGeneratorInputViews();
+        };
+    }
+    if(videoToggle){
+        videoToggle.onclick = e => {
+            e.stopPropagation();
+            node.videoInput = !node.videoInput;
+            if(node.videoInput){
+                node.loopStart = Math.max(1, Number(node.loopStart) || 1);
+                node.videoBatchSize = Math.max(1, Math.min(100, Number(node.videoBatchSize) || 1));
             } else {
                 connections = connections.filter(c => c.to !== node.id || canConnect(c.from, node.id));
             }
@@ -11989,6 +12125,13 @@ function runCascadeNodeByType(node, opts={}){
     if(node.type === 'llm') return runLLMNode(node.id, runOpts);
     if(node.type === 'video') return runVideoNode(node.id, runOpts);
     if(node.type === 'rh') return runRhNode(node.id, runOpts);
+    if(node.type === 'motionExtract'){
+        const loopCtx = runOpts.loopContext || node._activeLoopCtx || loopContext || null;
+        return Promise.resolve(runMotionExtractNode(node.id, {...runOpts, loopContext:loopCtx})).then(result => {
+            assertMotionCascadeBranches(node, runOpts.cascadeTargetId || '');
+            return result;
+        });
+    }
     return Promise.resolve();
 }
 async function runCascadeNodeWithLoopContext(node, ctx, opts={}){
@@ -12007,6 +12150,7 @@ async function runCascadeNodeWithLoopContext(node, ctx, opts={}){
     }
 }
 function cascadeParallelLimit(order, totalRounds){
+    if(order.some(id => nodes.find(n => n.id === id)?.type === 'motionExtract')) return 1;
     const hasComfy = order.some(id => nodes.find(n => n.id === id)?.type === 'comfy');
     if(hasComfy) return Math.max(1, Math.min(totalRounds, comfyBackendCount || 1));
     return Math.max(1, Math.min(totalRounds, 6));
@@ -12022,7 +12166,7 @@ async function runLimitedCascadeRounds(rounds, limit, runner){
     return Promise.allSettled(workers);
 }
 function canvasRunTypes(){
-    return ['generator','msgen','comfy','ltxDirector','llm','video','rh'];
+    return ['generator','msgen','comfy','ltxDirector','llm','video','rh','motionExtract'];
 }
 function canvasWorkflowEdges(){
     const runTypes = canvasRunTypes();
@@ -12139,7 +12283,8 @@ async function runNodeCascade(nodeId){
     const totalRounds = loop?.count || 1;
     const startIdx = Math.max(1, Number(loop?.node?.loopStart) || 1);
     const loopImageStride = loop?.node?.imageInput ? Math.max(1, Math.min(100, Number(loop?.node?.imageBatchSize) || 1)) : 0;
-    const loopBatchSize = Math.max(1, loopImageStride);
+    const loopVideoStride = loop?.node?.videoInput ? Math.max(1, Math.min(100, Number(loop?.node?.videoBatchSize) || 1)) : 0;
+    const loopBatchSize = Math.max(1, loopVideoStride || loopImageStride);
     const endIdx = startIdx + (totalRounds - 1) * loopBatchSize;
     const ctx = beginCascade(nodeId, order, {serial:true, mode:loop?.mode || 'serial'});
     refreshNodes(cascadeUiNodeIds(nodeId, order));
@@ -12158,7 +12303,7 @@ async function runNodeCascade(nodeId){
         const limit = cascadeParallelLimit(order, totalRounds);
         const results = await runLimitedCascadeRounds(rounds, limit, async ({index}) => {
             ensureCascadeActive(nodeId, ctx.message);
-            const loopCtx = {index, total:endIdx, nodeId:loop.node.id};
+            const loopCtx = {index, total:endIdx, nodeId:loop.node.id, currentVideoRef:loopInputVideoRefs(loop.node, {index})[0] || null};
             for(let i = 0; i < order.length; i++){
                 ensureCascadeActive(nodeId, ctx.message);
                 const id = order[i];
@@ -12169,7 +12314,16 @@ async function runNodeCascade(nodeId){
                 node.runStatus = 'running';
                 node._cascadeIdx = `${order.indexOf(id)+1}/${order.length} · ${index}/${endIdx}`;
                 refreshNodes([id]);
-                await runCascadeNodeWithLoopContext(node, loopCtx, {cascadeTargetId:nodeId});
+                try {
+                    await runCascadeNodeWithLoopContext(node, loopCtx, {cascadeTargetId:nodeId});
+                } catch(error) {
+                    if(node.type !== 'motionExtract') throw error;
+                    node.runStatus = 'failed';
+                    node.runError = error.message || String(error);
+                    node._cascadeFailed = true;
+                    refreshNodes([id]);
+                    return;
+                }
                 ensureCascadeActive(nodeId, ctx.message);
                 node.runStatus = 'done';
                 refreshNodes([id]);
@@ -12203,12 +12357,13 @@ async function runNodeCascade(nodeId){
     for(let round = 1; round <= totalRounds; round++){
         ensureCascadeActive(nodeId, ctx.message);
         const loopIndex = startIdx + (round - 1) * loopBatchSize;
-        loopContext = loop ? {index:loopIndex, total:endIdx, nodeId:loop.node.id} : null;
+        loopContext = loop ? {index:loopIndex, total:endIdx, nodeId:loop.node.id, currentVideoRef:loopInputVideoRefs(loop.node, {index:loopIndex})[0] || null} : null;
         order.forEach(id => {
             const n = nodes.find(x => x.id === id);
             if(n){ n.runStatus = 'queued'; n.runError = ''; n._cascadeFailed = false; n._cascadeIdx = `${order.indexOf(id)+1}/${order.length}${totalRounds > 1 ? ` · ${loopIndex}/${endIdx}` : ''}`; }
         });
         refreshNodes(cascadeUiNodeIds(nodeId, order));
+        let loopItemFailed = false;
         for(let i = 0; i < order.length; i++){
             const id = order[i];
             const node = nodes.find(n => n.id === id);
@@ -12231,6 +12386,10 @@ async function runNodeCascade(nodeId){
                 node.runStatus = 'failed';
                 node.runError = `${totalRounds > 1 ? `${tr('canvas.loopRound')} ${round}/${totalRounds}: ` : ''}${err.message || String(err)}`;
                 node._cascadeFailed = true;
+                if(loop && node.type === 'motionExtract'){
+                    loopItemFailed = true;
+                    break;
+                }
                 for(let j = i + 1; j < order.length; j++){
                     const n2 = nodes.find(x => x.id === order[j]);
                     if(n2){ n2.runStatus = ''; n2._cascadeIdx = ''; }
@@ -12239,6 +12398,7 @@ async function runNodeCascade(nodeId){
                 return;
             }
         }
+        if(loopItemFailed) continue;
     }
     loopContext = null;
     finalizeCascade(nodeId, 'done', {order});
@@ -12260,13 +12420,7 @@ async function runOneCascadePass(order, options={}){
         node.runStatus = 'running';
         refreshNodes([id]);
         try {
-            if(node.type === 'generator') await runGenerator(id, {cascade:true, cascadeTargetId:targetId});
-            else if(node.type === 'msgen') await runMsGenNode(id, {cascade:true, cascadeTargetId:targetId});
-            else if(node.type === 'comfy') await runComfyNode(id, {cascade:true, cascadeTargetId:targetId});
-            else if(node.type === 'ltxDirector') await runLTXDirectorNode(id, {cascade:true, cascadeTargetId:targetId});
-            else if(node.type === 'llm') await runLLMNode(id, {cascade:true, cascadeTargetId:targetId});
-            else if(node.type === 'video') await runVideoNode(id, {cascade:true, cascadeTargetId:targetId});
-            else if(node.type === 'rh') await runRhNode(id, {cascade:true, cascadeTargetId:targetId});
+            await runCascadeNodeByType(node, {cascadeTargetId:targetId});
             if(targetId) ensureCascadeActive(targetId);
             node.runStatus = 'done';
             refreshNodes([id]);
@@ -14593,6 +14747,12 @@ function canConnect(fromId, toId){
     const from = nodes.find(n => n.id === fromId);
     const to = nodes.find(n => n.id === toId);
     if(!from || !to) return false;
+    if(to.type === 'loop'){
+        const allowImage = Boolean(to.imageInput) && ['image','group','output'].includes(from.type);
+        const allowPrompt = Boolean(to.showPrompt) && ['prompt','promptGroup','loop','llm'].includes(from.type);
+        const allowVideo = Boolean(to.videoInput) && ['image','group','output','loop','generator','msgen','comfy','ltxDirector','video','rh','motionExtract'].includes(from.type);
+        return allowImage || allowVideo || allowPrompt;
+    }
     if(CANVAS_GENERATOR_TYPES.includes(from.type)){
         if(to.type === 'motionExtract') return CANVAS_MEDIA_OUTPUT_TYPES.includes(from.type);
         if(to.type === 'output') return true;
@@ -14603,11 +14763,6 @@ function canConnect(fromId, toId){
     }
     if(to.type === 'motionExtract') return ['image','group','output','loop'].includes(from.type) || CANVAS_MEDIA_OUTPUT_TYPES.includes(from.type);
     if(from.type === 'motionExtract') return CANVAS_GENERATOR_TYPES.includes(to.type);
-    if(to.type === 'loop'){
-        const allowImage = Boolean(to.imageInput) && ['image','group','output'].includes(from.type);
-        const allowPrompt = Boolean(to.showPrompt) && ['prompt','promptGroup','loop','llm'].includes(from.type);
-        return allowImage || allowPrompt;
-    }
     if(to.type === 'llm') return ['prompt','loop','promptGroup','llm','image','group','output'].includes(from.type);
     if(from.type === 'llm') return CANVAS_GENERATOR_TYPES.includes(to.type);
     return CANVAS_GENERATOR_TYPES.includes(to.type) && ['image','prompt','loop','group','promptGroup','output','llm'].includes(from.type);
