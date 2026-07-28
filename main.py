@@ -28,6 +28,7 @@ import html
 import ipaddress
 import socket
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from threading import Lock, Thread
 import httpx
@@ -39,6 +40,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
+from motion_extractor.errors import MotionError, MotionValidationError
+from motion_extractor.service import MotionTaskService
 
 QUIET_ACCESS_PATHS = {
     "/api/queue_status",
@@ -242,6 +245,10 @@ API_PROVIDERS_FILE = os.path.join(DATA_DIR, "api_providers.json")
 RUNNINGHUB_WORKFLOW_STORE_FILE = os.path.join(DATA_DIR, "runninghub_workflows.json")
 SHARED_FOLDERS_FILE = os.path.join(DATA_DIR, "shared_folders.json")
 GLOBAL_CONFIG_FILE = os.path.join(BASE_DIR, "global_config.json")
+MOTION_TASK_SERVICE = MotionTaskService(
+    output_dir=Path(OUTPUT_OUTPUT_DIR) / "motion",
+    work_dir=Path(DATA_DIR) / "motion_tasks",
+)
 CANVAS_TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
 LOCAL_IMAGE_IMPORT_MAX_BYTES = int(os.getenv("LOCAL_IMAGE_IMPORT_MAX_BYTES", str(50 * 1024 * 1024)))
 LOCAL_IMAGE_IMPORT_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -2510,6 +2517,12 @@ class CanvasVideoRequest(BaseModel):
     generate_audio: bool = False
     multimodal: bool = False
     trusted_asset: bool = False
+
+class CanvasMotionTaskRequest(BaseModel):
+    source_url: str
+    depth_enabled: bool = True
+    pose_enabled: bool = False
+    preserve_audio: bool = False
 
 class TempShUploadRequest(BaseModel):
     url: str = ""
@@ -13832,6 +13845,44 @@ async def run_canvas_video_task(task_id: str, payload: CanvasVideoRequest):
                     "upstream_task_id": str(upstream_task_id or ""),
                     "updated_at": time.time(),
                 })
+
+
+@app.post("/api/canvas-motion-tasks", status_code=202)
+async def create_canvas_motion_task(payload: CanvasMotionTaskRequest):
+    if not payload.depth_enabled and not payload.pose_enabled:
+        raise HTTPException(status_code=422, detail="At least one motion processor must be enabled.")
+    source_path = output_file_from_url(payload.source_url)
+    if not source_path:
+        raise HTTPException(status_code=422, detail="A valid local application video is required.")
+    try:
+        MOTION_TASK_SERVICE.preflight(Path(source_path))
+        return await MOTION_TASK_SERVICE.submit(
+            payload.source_url,
+            Path(source_path),
+            payload.depth_enabled,
+            payload.pose_enabled,
+            payload.preserve_audio,
+        )
+    except MotionValidationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    except MotionError:
+        raise HTTPException(status_code=422, detail="The source video is invalid or unsupported.") from None
+
+
+@app.get("/api/canvas-motion-tasks/{task_id}")
+async def get_canvas_motion_task(task_id: str):
+    task = await MOTION_TASK_SERVICE.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Motion task not found.")
+    return task
+
+
+@app.post("/api/canvas-motion-tasks/{task_id}/cancel")
+async def cancel_canvas_motion_task(task_id: str):
+    task = await MOTION_TASK_SERVICE.cancel(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Motion task not found.")
+    return task
 
 
 @app.post("/api/canvas-video-tasks")
