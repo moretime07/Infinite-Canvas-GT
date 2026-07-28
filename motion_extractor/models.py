@@ -122,6 +122,10 @@ def _source_directory(cache_root: Path) -> Path:
     return _cache_path(cache_root, "motion_models", "sources")
 
 
+def _source_bytecode_directory(cache_root: Path) -> Path:
+    return _cache_path(cache_root, "motion_models", "source_bytecode")
+
+
 def _cache_path(cache_root: Path, *parts: str) -> Path:
     root = Path(cache_root).resolve()
     candidate = root.joinpath(*parts)
@@ -216,60 +220,6 @@ def ensure_model_artifact(
     return _download_artifact(cache_root, artifact, destination, progress, cancelled)
 
 
-def _verified_bytecode_source(checkout: Path, relative_path: str) -> Path | None:
-    bytecode = checkout / relative_path
-    if (
-        bytecode.suffix != ".pyc"
-        or bytecode.parent.name != "__pycache__"
-        or bytecode.is_symlink()
-        or not _is_within(bytecode, checkout)
-    ):
-        return None
-    try:
-        source = Path(importlib.util.source_from_cache(str(bytecode)))
-        expected_bytecode = Path(importlib.util.cache_from_source(str(source)))
-        with bytecode.open("rb") as bytecode_file:
-            header = bytecode_file.read(16)
-    except (OSError, ValueError):
-        return None
-    if (
-        bytecode.resolve() != expected_bytecode.resolve()
-        or not source.is_file()
-        or source.is_symlink()
-        or not _is_within(source, checkout)
-        or len(header) != 16
-        or header[:4] != importlib.util.MAGIC_NUMBER
-        or int.from_bytes(header[4:8], "little") != 0
-    ):
-        return None
-    source_stat = source.stat()
-    if (
-        int.from_bytes(header[8:12], "little") != int(source_stat.st_mtime)
-        or int.from_bytes(header[12:16], "little") != source_stat.st_size
-    ):
-        return None
-    return source
-
-
-def _has_only_verified_generated_bytecode(checkout: Path, status_output: str) -> bool:
-    records = [record.strip() for record in status_output.split("\0") if record.strip()]
-    if not records:
-        return True
-    for record in records:
-        if not record.startswith(("?? ", "!! ")):
-            return False
-        source = _verified_bytecode_source(checkout, record[3:])
-        if source is None:
-            return False
-        subprocess.run(
-            ["git", "-C", str(checkout), "ls-files", "--error-unmatch", "--", str(source.relative_to(checkout))],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    return True
-
-
 def verify_source_checkout(checkout: Path, source: GitSource, source_root: Path) -> None:
     """Reject a checkout unless it is clean, contained, and at its pinned commit."""
     if (
@@ -292,12 +242,11 @@ def verify_source_checkout(checkout: Path, source: GitSource, source_root: Path)
             capture_output=True,
             text=True,
         )
-        status_is_safe = _has_only_verified_generated_bytecode(checkout, status.stdout)
     except (OSError, subprocess.CalledProcessError) as error:
         raise MotionSourceError(f"Unable to verify pinned source {source.name}") from error
     if head.stdout.strip().lower() != source.commit.lower():
         raise MotionSourceError(f"Source {source.name} is not at its pinned commit")
-    if not status_is_safe:
+    if status.stdout.strip():
         raise MotionSourceError(f"Source {source.name} contains local modifications")
 
 
@@ -375,6 +324,9 @@ def ensure_motion_assets(
         _is_cancelled(cancelled)
         checkout = ensure_source_checkout(cache_root, source)
         verify_source_checkout(checkout, source, _source_directory(cache_root))
+        source_bytecode_directory = _source_bytecode_directory(cache_root)
+        source_bytecode_directory.mkdir(parents=True, exist_ok=True)
+        sys.pycache_prefix = str(source_bytecode_directory)
         checkout_string = str(checkout)
         if checkout_string not in sys.path:
             sys.path.insert(0, checkout_string)
