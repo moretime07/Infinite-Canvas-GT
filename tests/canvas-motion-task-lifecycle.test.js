@@ -31,6 +31,7 @@ function lifecycleContext({nodes, fetch, saves}={}){
         tr:key => ({
             'canvas.motionFailed':'Motion task failed',
             'canvas.motionNeedVideo':'Connect one video input',
+            'canvas.motionRuntimeUnavailable':'Install the local motion runtime, then restart the app.',
         }[key] || key),
         encodeURIComponent,
         JSON,
@@ -54,6 +55,7 @@ function lifecycleContext({nodes, fetch, saves}={}){
         'motionTaskCanTransition',
         'motionTaskSafeUrl',
         'motionTaskSafeMessage',
+        'motionTaskResponseError',
         'motionTaskNode',
         'motionTaskPersist',
         'applyCanvasMotionTask',
@@ -109,6 +111,21 @@ function motionNode(overrides={}){
     assert.equal(node.motionState, 'failed');
     assert.equal(node.motionTaskId, '');
     assert.equal(node.motionError.includes('private'), false);
+}
+
+// Break caught: a native prerequisite failure during preflight must use only the structured runtime-unavailable guidance.
+{
+    const saves = {count:0};
+    const node = motionNode();
+    const context = lifecycleContext({nodes:[node], saves, fetch:async () => response(false, {
+        detail:{
+            message:String.raw`ffprobe missing at C:\private\bin`,
+            error_code:'runtime_unavailable',
+        },
+    }, 503)});
+    await assert.rejects(() => context.createCanvasMotionTask(node, '/assets/input/original.mp4'));
+    assert.equal(node.motionError, 'Install the local motion runtime, then restart the app.');
+    assert.equal(JSON.stringify(node).includes('private'), false);
 }
 
 // Break caught: a lower-progress queued response or an omitted queue position would make the visible task status move backwards or lose its queue placement.
@@ -300,6 +317,14 @@ function motionNode(overrides={}){
     assert.equal(calls, 0);
 }
 
+// Break caught: branch-specific asset preparation must remain visible instead of collapsing to the generic downloading fallback.
+{
+    const saves = {count:0};
+    const context = lifecycleContext({nodes:[], saves, fetch:async () => response(true, {})});
+    assert.equal(context.motionTaskSafeStage('preparing_depth', 'downloading'), 'preparing_depth');
+    assert.equal(context.motionTaskSafeStage('preparing_pose', 'running'), 'preparing_pose');
+}
+
 // Break caught: terminal responses are valid from queued or downloading even if a poll missed intermediate snapshots.
 {
     const saves = {count:0};
@@ -325,6 +350,65 @@ function motionNode(overrides={}){
     assert.equal(await context.pollCanvasMotionTask('motion-1', TASK_ONE), 'completed');
     assert.equal(calls, 2);
     assert.equal(node.motionState, 'completed');
+}
+
+// Break caught: transport, 5xx, and malformed snapshots are transient and must keep polling the authoritative task instead of failing it.
+{
+    const saves = {count:0};
+    const node = motionNode({motionTaskId:TASK_ONE, motionRunToken:1, motionState:'running', motionStage:'decoding'});
+    const replies = [
+        response(false, {detail:'temporary'}, 503),
+        response(true, {state:'running', stage:'decoding', progress:40}),
+        response(true, {
+            task_id:TASK_ONE, state:'completed', stage:'completed', progress:100,
+            depth_state:'completed', depth_url:'/assets/output/motion/depth.mp4',
+            pose_state:'disabled', warnings:[],
+        }),
+    ];
+    const requests = [];
+    const context = lifecycleContext({nodes:[node], saves, fetch:async (url, options={}) => {
+        requests.push({url, options});
+        return replies.shift();
+    }});
+    assert.equal(await context.pollCanvasMotionTask('motion-1', TASK_ONE), 'completed');
+    assert.equal(node.motionTaskId, TASK_ONE);
+    assert.equal(node.motionState, 'completed');
+    assert.deepEqual(requests.map(request => request.options.method || 'GET'), ['GET', 'GET', 'GET']);
+    assert.deepEqual(context.delays.slice(0, 2), [800, 1200]);
+}
+
+// Break caught: exhausting bounded transient retries must preserve a polling task ID, and a later retry may only GET that task.
+{
+    const saves = {count:0};
+    const node = motionNode({motionTaskId:TASK_ONE, motionRunToken:1, motionState:'running', motionStage:'decoding'});
+    let available = false;
+    const requests = [];
+    const context = lifecycleContext({nodes:[node], saves, fetch:async (url, options={}) => {
+        requests.push({url, options});
+        if(!available) return response(false, {detail:'temporary'}, 503);
+        return response(true, {
+            task_id:TASK_ONE, state:'completed', stage:'completed', progress:100,
+            depth_state:'completed', depth_url:'/assets/output/motion/depth.mp4',
+            pose_state:'disabled', warnings:[],
+        });
+    }});
+    assert.equal(await context.pollCanvasMotionTask('motion-1', TASK_ONE), 'unresolved');
+    assert.equal(node.motionTaskId, TASK_ONE);
+    assert.equal(node.motionState, 'running');
+    available = true;
+    assert.equal(await context.pollCanvasMotionTask('motion-1', TASK_ONE), 'completed');
+    assert.equal(requests.every(request => (request.options.method || 'GET') === 'GET'), true);
+}
+
+// Break caught: a 404 explicitly resolves a saved task as missing rather than treating it like an ambiguous transport failure.
+{
+    const saves = {count:0};
+    const node = motionNode({motionTaskId:TASK_ONE, motionRunToken:1, motionState:'running', motionStage:'decoding'});
+    const context = lifecycleContext({nodes:[node], saves, fetch:async () => response(false, {detail:'not found'}, 404)});
+    assert.equal(await context.pollCanvasMotionTask('motion-1', TASK_ONE), 'missing');
+    assert.equal(node.motionTaskId, TASK_ONE);
+    assert.equal(node.motionState, 'failed');
+    assert.equal(node.motionTaskMissing, true);
 }
 
 // Break caught: an asset-looking traversal URL is not a public output URL and must be discarded before persistence.

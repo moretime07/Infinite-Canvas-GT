@@ -2631,8 +2631,12 @@ function addMotionExtractNode(point){
         motionError:''
     });
 }
+function motionTaskConfigurationLocked(node){
+    return Boolean(node?.type === 'motionExtract' && motionTaskIsPolling(node.motionState));
+}
 function setMotionExtractProcessorEnabled(node, processor, enabled){
     if(!node || node.type !== 'motionExtract' || !['depth', 'pose'].includes(processor)) return false;
+    if(motionTaskConfigurationLocked(node)) return false;
     const property = processor === 'depth' ? 'depthEnabled' : 'poseEnabled';
     if(!enabled && node.depthEnabled === (processor === 'depth') && node.poseEnabled === (processor === 'pose')){
         alert(tr('canvas.motionProcessorRequired'));
@@ -2645,6 +2649,14 @@ function setMotionExtractProcessorEnabled(node, processor, enabled){
     node[stateProperty] = enabled ? 'pending' : 'disabled';
     node.motionError = '';
     render();
+    scheduleSave();
+    return true;
+}
+function setMotionExtractAudioEnabled(node, enabled){
+    if(!node || node.type !== 'motionExtract' || motionTaskConfigurationLocked(node)) return false;
+    const next = Boolean(enabled);
+    if(Boolean(node.preserveAudio) === next) return false;
+    node.preserveAudio = next;
     scheduleSave();
     return true;
 }
@@ -2666,15 +2678,17 @@ function motionOutputVideoRefs(node, portName=''){
 }
 function motionLoopItemState(node, context={}){
     const loop = context.loopContext || node?._activeLoopCtx || loopContext || null;
-    const index = Number(loop?.index);
-    if(!node || !loop?.nodeId || !Number.isInteger(index) || index < 1) return null;
+    const index = Number(loop?.videoIndex ?? loop?.index);
+    const loopNodeId = typeof loop?.nodeId === 'string' && /^[A-Za-z0-9_-]{1,96}$/.test(loop.nodeId) ? loop.nodeId : '';
+    if(!node || !loopNodeId || !Number.isInteger(index) || index < 1) return null;
     const current = loop.currentVideoRef || loop.currentMediaRef || loop.videoRef || null;
-    const sourceUrl = typeof current === 'string' ? current : current?.url || '';
-    const key = `${loop.nodeId}:${index}:${sourceUrl}`;
+    const sourceUrl = motionTaskSafeUrl(typeof current === 'string' ? current : current?.url);
+    if(!sourceUrl) return null;
+    const key = `${loopNodeId}:${index}:${sourceUrl}`;
     if(!node.motionLoopItems || typeof node.motionLoopItems !== 'object') node.motionLoopItems = {};
     if(!node.motionLoopItems[key]){
         node.motionLoopItems[key] = {
-            key, loopNodeId:loop.nodeId, index, sourceUrl, taskId:'', status:'idle', error:'',
+            key, loopNodeId, index, sourceUrl, taskId:'', status:'idle', error:'',
             depthState:node.depthEnabled === false ? 'disabled' : 'pending', depthUrl:'', depthError:'',
             poseState:node.poseEnabled === true ? 'pending' : 'disabled', poseUrl:'', poseError:'',
         };
@@ -2783,7 +2797,7 @@ function motionTaskIsPolling(state){ return ['queued', 'downloading', 'running']
 function motionTaskStateIsKnown(state){ return motionTaskIsPolling(state) || motionTaskIsTerminal(state); }
 function motionTaskSafeState(state){ return motionTaskStateIsKnown(state) ? state : 'failed'; }
 function motionTaskSafeStage(stage, state){
-    const known = ['queued', 'preparing', 'decoding', 'depth', 'pose', 'publishing', 'partial', 'completed', 'failed', 'cancelled'];
+    const known = ['queued', 'preparing', 'preparing_depth', 'preparing_pose', 'decoding', 'depth', 'pose', 'publishing', 'partial', 'completed', 'failed', 'cancelled'];
     const fallback = {queued:'queued', downloading:'preparing', running:'decoding', partial:'partial', completed:'completed', failed:'failed', cancelled:'cancelled'};
     return typeof stage === 'string' && known.includes(stage) ? stage : (fallback[state] || 'failed');
 }
@@ -2826,6 +2840,14 @@ function motionTaskSafeMessage(value, errorCode=''){
     if(!text || text.length > 240 || hasAbsolutePath || unsafe.test(text)) return tr('canvas.motionFailed');
     return text;
 }
+function motionTaskResponseError(data){
+    const detail = data?.detail;
+    const message = detail && typeof detail === 'object'
+        ? detail.message || detail.error || ''
+        : detail || data?.error || data?.message || '';
+    const errorCode = data?.error_code || (detail && typeof detail === 'object' ? detail.error_code : '') || '';
+    return motionTaskSafeMessage(message, errorCode);
+}
 function motionTaskNode(nodeId){ return nodes.find(candidate => candidate.id === nodeId && candidate.type === 'motionExtract') || null; }
 function motionTaskPersist(node, before){
     const after = JSON.stringify({
@@ -2856,6 +2878,7 @@ function applyCanvasMotionTask(node, payload={}){
     const isNewTask = node.motionTaskId !== taskId;
     if(!isNewTask && !motionTaskCanTransition(node.motionState, state)) return false;
     node.motionTaskId = taskId;
+    node.motionTaskMissing = false;
     node.motionState = state;
     node.motionStage = motionTaskSafeStage(payload.stage, state);
     const reportedProgress = Math.max(0, Math.min(100, Number(payload.progress) || 0));
@@ -2894,7 +2917,7 @@ async function createCanvasMotionTask(node, sourceUrl, runToken=node?.motionRunT
     if(!res.ok){
         const before = JSON.stringify({motionState:node.motionState || '', motionError:node.motionError || ''});
         node.motionState = 'failed';
-        node.motionError = motionTaskSafeMessage(data?.detail || data?.error || data?.message);
+        node.motionError = motionTaskResponseError(data);
         if(JSON.stringify({motionState:node.motionState || '', motionError:node.motionError || ''}) !== before){ render(); scheduleSave(); }
         throw new Error(node.motionError);
     }
@@ -2915,26 +2938,43 @@ async function pollCanvasMotionTask(nodeId, taskId, runToken=null){
     if(motionTaskIsTerminal(node.motionState)) return node.motionState;
     if(!motionTaskIsPolling(node.motionState)) return 'stale';
     let attempt = 0;
+    let transientFailures = 0;
+    const delays = [800, 1200, 1800, 2500, 3000];
     while(node.motionRunToken === token && node.motionTaskId === taskId){
         try {
             const res = await fetch(`/api/canvas-motion-tasks/${encodeURIComponent(taskId)}`);
             const data = await res.json().catch(() => ({}));
             if(node.motionRunToken !== token || node.motionTaskId !== taskId) return 'stale';
-            if(!res.ok) throw new Error(motionTaskSafeMessage(data?.detail || data?.error || data?.message));
-            if(!motionTaskIdIsSafe(data?.task_id) || data.task_id !== taskId) return 'stale';
+            if(res.status === 404){
+                const before = JSON.stringify({motionState:node.motionState || '', motionStage:node.motionStage || '', motionTaskMissing:Boolean(node.motionTaskMissing), motionError:node.motionError || ''});
+                node.motionState = 'failed';
+                node.motionStage = 'failed';
+                node.motionTaskMissing = true;
+                node.motionError = motionTaskResponseError(data);
+                if(JSON.stringify({motionState:node.motionState || '', motionStage:node.motionStage || '', motionTaskMissing:Boolean(node.motionTaskMissing), motionError:node.motionError || ''}) !== before){ render(); scheduleSave(); }
+                return 'missing';
+            }
+            if(!res.ok){
+                if(res.status >= 500 || [408, 425, 429].includes(res.status)) throw new Error('transient');
+                const before = JSON.stringify({motionState:node.motionState || '', motionStage:node.motionStage || '', motionError:node.motionError || ''});
+                node.motionState = 'failed';
+                node.motionStage = 'failed';
+                node.motionTaskMissing = false;
+                node.motionError = motionTaskResponseError(data);
+                if(JSON.stringify({motionState:node.motionState || '', motionStage:node.motionStage || '', motionError:node.motionError || ''}) !== before){ render(); scheduleSave(); }
+                return 'failed';
+            }
+            if(!motionTaskIdIsSafe(data?.task_id) || data.task_id !== taskId || !motionTaskStateIsKnown(data?.state)) throw new Error('transient');
             const applied = applyCanvasMotionTask(node, data);
+            transientFailures = 0;
             if(motionTaskIsTerminal(node.motionState)) return node.motionState;
             if(!applied && !(motionTaskIsPolling(node.motionState) && motionTaskIsPolling(data?.state))) return 'stale';
             if(!motionTaskIsPolling(node.motionState)) return 'stale';
-        } catch(error) {
+        } catch(_error) {
             if(node.motionRunToken !== token || node.motionTaskId !== taskId) return 'stale';
-            const before = JSON.stringify({motionState:node.motionState || '', motionError:node.motionError || ''});
-            node.motionState = 'failed';
-            node.motionError = motionTaskSafeMessage(error?.message);
-            if(JSON.stringify({motionState:node.motionState || '', motionError:node.motionError || ''}) !== before){ render(); scheduleSave(); }
-            return 'failed';
+            transientFailures += 1;
+            if(transientFailures >= delays.length) return 'unresolved';
         }
-        const delays = [800, 1200, 1800, 2500, 3000];
         await sleep(delays[Math.min(attempt++, delays.length - 1)]);
     }
     return 'stale';
@@ -2949,7 +2989,7 @@ async function cancelCanvasMotionTask(nodeId){
         const res = await fetch(`/api/canvas-motion-tasks/${encodeURIComponent(taskId)}/cancel`, {method:'POST'});
         const data = await res.json().catch(() => ({}));
         if(node.motionRunToken !== token || node.motionTaskId !== taskId) return false;
-        if(!res.ok) throw new Error(motionTaskSafeMessage(data?.detail || data?.error || data?.message));
+        if(!res.ok) throw new Error(motionTaskResponseError(data));
         return applyCanvasMotionTask(node, data);
     } catch(error) {
         if(node.motionRunToken !== token || node.motionTaskId !== taskId) return false;
@@ -2989,6 +3029,7 @@ async function runMotionExtractNode(nodeId, context={}){
     node.motionRunToken = Number(node.motionRunToken || 0) + 1;
     const token = node.motionRunToken;
     node.motionTaskId = '';
+    node.motionTaskMissing = false;
     node.motionState = 'queued';
     node.motionStage = 'queued';
     node.motionProgress = 0;
@@ -6908,7 +6949,7 @@ function loopInputImageRefs(node, ctx=loopContext){
     if(!allRefs.length) return [];
     const startBase = Math.max(1, Number(node.loopStart) || 1);
     const batchSize = Math.max(1, Math.min(100, Number(node.imageBatchSize) || 1));
-    const currentIndex = Math.max(1, Number(ctx?.index || startBase) || startBase);
+    const currentIndex = Math.max(1, Number(ctx?.imageIndex ?? ctx?.index ?? startBase) || startBase);
     const start = Math.max(0, currentIndex - 1);
     return allRefs.slice(start, start + batchSize);
 }
@@ -6967,7 +7008,7 @@ function loopInputVideoRefs(node, ctx=loopContext){
     if(!allRefs.length) return [];
     const startBase = Math.max(1, Number(node.loopStart) || 1);
     const batchSize = Math.max(1, Math.min(100, Number(node.videoBatchSize) || 1));
-    const currentIndex = Math.max(1, Number(ctx?.index || startBase) || startBase);
+    const currentIndex = Math.max(1, Number(ctx?.videoIndex ?? ctx?.index ?? startBase) || startBase);
     const start = Math.max(0, currentIndex - 1);
     return allRefs.slice(start, start + batchSize);
 }
@@ -9015,16 +9056,18 @@ function motionSourceMeta(ref){
 }
 function updateMotionSourceMetadata(node, source, media){
     if(!node || node.type !== 'motionExtract' || !source?.url || !media) return false;
+    const sourceUrl = motionTaskSafeUrl(source.url);
+    if(!sourceUrl) return false;
     const current = resolveMotionInputVideo(node).video;
-    if(!current || current.url !== source.url) return false;
+    if(!current || motionTaskSafeUrl(current.url) !== sourceUrl) return false;
     const positiveNumber = value => {
         const number = Number(value);
         return Number.isFinite(number) && number > 0 ? number : undefined;
     };
-    const existing = node.motionSourceMeta?.url === source.url ? node.motionSourceMeta : {};
+    const existing = node.motionSourceMeta?.url === sourceUrl ? node.motionSourceMeta : {};
     const next = {
         ...existing,
-        url:source.url,
+        url:sourceUrl,
         ...motionVideoRefMetadata(source),
     };
     const duration = positiveNumber(media.duration);
@@ -9055,6 +9098,7 @@ function renderMotionExtractBody(node){
         : `<div class="motion-source-empty">${escapeHtml(tr('canvas.motionSourceHint'))}</div>`;
     const progress = Math.max(0, Math.min(100, Number(node.motionProgress) || 0));
     const hasFailedLoopItem = Object.values(node.motionLoopItems || {}).some(item => item?.status === 'failed');
+    const configurationLocked = motionTaskConfigurationLocked(node);
     const action = ['queued', 'downloading', 'running'].includes(node.motionState)
         ? `<button class="motion-action secondary" type="button" data-motion-cancel>${escapeHtml(tr('canvas.motionCancel'))}</button>`
         : node.motionState === 'failed' || hasFailedLoopItem
@@ -9063,9 +9107,9 @@ function renderMotionExtractBody(node){
     wrap.innerHTML = `
         ${sourceHtml}
         <div class="motion-switches">
-            <label><input type="checkbox" data-motion-processor="depth" ${node.depthEnabled !== false ? 'checked' : ''}><span>${escapeHtml(tr('canvas.motionDepth'))}</span></label>
-            <label><input type="checkbox" data-motion-processor="pose" ${node.poseEnabled === true ? 'checked' : ''}><span>${escapeHtml(tr('canvas.motionPose'))}</span></label>
-            <label><input type="checkbox" data-motion-audio ${node.preserveAudio ? 'checked' : ''}><span>${escapeHtml(tr('canvas.motionPreserveAudio'))}</span></label>
+            <label><input type="checkbox" data-motion-processor="depth" ${node.depthEnabled !== false ? 'checked' : ''} ${configurationLocked ? 'disabled' : ''}><span>${escapeHtml(tr('canvas.motionDepth'))}</span></label>
+            <label><input type="checkbox" data-motion-processor="pose" ${node.poseEnabled === true ? 'checked' : ''} ${configurationLocked ? 'disabled' : ''}><span>${escapeHtml(tr('canvas.motionPose'))}</span></label>
+            <label><input type="checkbox" data-motion-audio ${node.preserveAudio ? 'checked' : ''} ${configurationLocked ? 'disabled' : ''}><span>${escapeHtml(tr('canvas.motionPreserveAudio'))}</span></label>
         </div>
         <div class="motion-progress" aria-label="${escapeAttr(tr('canvas.motionProgress'))}"><div class="motion-progress-meta"><span>${escapeHtml(node.motionStage || tr('canvas.motionWaiting'))}${node.motionQueuePosition ? ` · ${escapeHtml(trf('canvas.motionQueuePosition', {n:node.motionQueuePosition}))}` : ''}</span><span>${progress}%</span></div><div class="motion-progress-track"><span style="width:${progress}%"></span></div></div>
         <div class="motion-results">${renderMotionResultCard('depth', node.depthEnabled !== false, node.depthState, node.depthUrl, node.depthError)}${renderMotionResultCard('pose', node.poseEnabled === true, node.poseState, node.poseUrl, node.poseError)}</div>
@@ -9077,8 +9121,7 @@ function renderMotionExtractBody(node){
         input.onchange = () => setMotionExtractProcessorEnabled(node, input.dataset.motionProcessor, input.checked);
     });
     wrap.querySelector('[data-motion-audio]')?.addEventListener('change', event => {
-        node.preserveAudio = event.target.checked;
-        scheduleSave();
+        if(!setMotionExtractAudioEnabled(node, event.target.checked)) event.target.checked = Boolean(node.preserveAudio);
     });
     wrap.querySelector('[data-motion-start]')?.addEventListener('click', () => startMotionExtract(node.id));
     wrap.querySelector('[data-motion-retry]')?.addEventListener('click', () => retryMotionExtract(node.id));
@@ -12288,6 +12331,21 @@ function resolveCascadeLoop(targetId){
     const loop = loops[loops.length - 1];
     return {node:loop, count:loopCount(loop), mode:loop.mode === 'parallel' ? 'parallel' : 'serial'};
 }
+function loopCascadeContextForRound(loopNode, round, totalRounds){
+    const start = Math.max(1, Number(loopNode?.loopStart) || 1);
+    const roundNumber = Math.max(1, Number(round) || 1);
+    const rounds = Math.max(1, Number(totalRounds) || 1);
+    const offset = roundNumber - 1;
+    const imageStride = Math.max(1, Math.min(100, Number(loopNode?.imageBatchSize) || 1));
+    const videoStride = Math.max(1, Math.min(100, Number(loopNode?.videoBatchSize) || 1));
+    return {
+        index:start + offset,
+        total:start + rounds - 1,
+        nodeId:loopNode?.id || '',
+        ...(loopNode?.imageInput ? {imageIndex:start + offset * imageStride} : {}),
+        ...(loopNode?.videoInput ? {videoIndex:start + offset * videoStride} : {}),
+    };
+}
 function cascadeUiNodeIds(targetId, order=null){
     const ids = new Set([targetId, ...(order || computeCascadeOrder(targetId))]);
     const loop = resolveCascadeLoop(targetId);
@@ -12303,10 +12361,7 @@ async function runNodeCascade(nodeId){
     const loop = resolveCascadeLoop(nodeId);
     const totalRounds = loop?.count || 1;
     const startIdx = Math.max(1, Number(loop?.node?.loopStart) || 1);
-    const loopImageStride = loop?.node?.imageInput ? Math.max(1, Math.min(100, Number(loop?.node?.imageBatchSize) || 1)) : 0;
-    const loopVideoStride = loop?.node?.videoInput ? Math.max(1, Math.min(100, Number(loop?.node?.videoBatchSize) || 1)) : 0;
-    const loopBatchSize = Math.max(1, loopVideoStride || loopImageStride);
-    const endIdx = startIdx + (totalRounds - 1) * loopBatchSize;
+    const endIdx = startIdx + totalRounds - 1;
     const ctx = beginCascade(nodeId, order, {serial:true, mode:loop?.mode || 'serial'});
     refreshNodes(cascadeUiNodeIds(nodeId, order));
     order.forEach(id => {
@@ -12320,11 +12375,13 @@ async function runNodeCascade(nodeId){
         });
         refreshNodes(cascadeUiNodeIds(nodeId, order));
         let done = 0;
-        const rounds = Array.from({length:totalRounds}, (_, idx) => ({idx, index:startIdx + idx * loopBatchSize}));
+        const rounds = Array.from({length:totalRounds}, (_, idx) => ({round:idx + 1}));
         const limit = cascadeParallelLimit(order, totalRounds);
-        const results = await runLimitedCascadeRounds(rounds, limit, async ({index}) => {
+        const results = await runLimitedCascadeRounds(rounds, limit, async ({round}) => {
             ensureCascadeActive(nodeId, ctx.message);
-            const loopCtx = {index, total:endIdx, nodeId:loop.node.id, currentVideoRef:loopInputVideoRefs(loop.node, {index})[0] || null};
+            const loopCtx = loopCascadeContextForRound(loop.node, round, totalRounds);
+            loopCtx.currentVideoRef = loopInputVideoRefs(loop.node, loopCtx)[0] || null;
+            const index = loopCtx.index;
             for(let i = 0; i < order.length; i++){
                 ensureCascadeActive(nodeId, ctx.message);
                 const id = order[i];
@@ -12377,8 +12434,9 @@ async function runNodeCascade(nodeId){
     refreshNodes(cascadeUiNodeIds(nodeId, order));
     for(let round = 1; round <= totalRounds; round++){
         ensureCascadeActive(nodeId, ctx.message);
-        const loopIndex = startIdx + (round - 1) * loopBatchSize;
-        loopContext = loop ? {index:loopIndex, total:endIdx, nodeId:loop.node.id, currentVideoRef:loopInputVideoRefs(loop.node, {index:loopIndex})[0] || null} : null;
+        loopContext = loop ? loopCascadeContextForRound(loop.node, round, totalRounds) : null;
+        if(loopContext) loopContext.currentVideoRef = loopInputVideoRefs(loop.node, loopContext)[0] || null;
+        const loopIndex = loopContext?.index || startIdx;
         order.forEach(id => {
             const n = nodes.find(x => x.id === id);
             if(n){ n.runStatus = 'queued'; n.runError = ''; n._cascadeFailed = false; n._cascadeIdx = `${order.indexOf(id)+1}/${order.length}${totalRounds > 1 ? ` · ${loopIndex}/${endIdx}` : ''}`; }

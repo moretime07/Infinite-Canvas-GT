@@ -20,7 +20,7 @@ function productionFunction(name){
 function contextFor(nodes, connections){
     const context = {
         nodes, connections, loopContext:null, comfyBackendCount:4,
-        Math, Number, String, Array, Object, Set, Promise,
+        Math, Number, String, Array, Object, Set, Promise, URL,
         normalizedFromPort:connection => connection.fromPort || '',
         tr:key => ({
             'canvas.motionDepthUnavailable':'Depth result is unavailable',
@@ -43,6 +43,7 @@ function contextFor(nodes, connections){
     vm.runInContext([
         productionFunction('loopInputVideoRefs'),
         productionFunction('motionOutputVideoRefs'),
+        productionFunction('motionTaskSafeUrl'),
         productionFunction('motionLoopItemState'),
         productionFunction('persistMotionLoopItem'),
         productionFunction('motionCascadeSelectedBranches'),
@@ -50,6 +51,7 @@ function contextFor(nodes, connections){
         productionFunction('canvasRunTypes'),
         productionFunction('cascadeParallelLimit'),
         productionFunction('computeCascadeOrder'),
+        productionFunction('loopCascadeContextForRound'),
         productionFunction('runCascadeNodeByType'),
         'this.loopInputVideoRefs = loopInputVideoRefs;',
         'this.motionOutputVideoRefs = motionOutputVideoRefs;',
@@ -60,6 +62,7 @@ function contextFor(nodes, connections){
         'this.canvasRunTypes = canvasRunTypes;',
         'this.cascadeParallelLimit = cascadeParallelLimit;',
         'this.computeCascadeOrder = computeCascadeOrder;',
+        'this.loopCascadeContextForRound = loopCascadeContextForRound;',
         'this.runCascadeNodeByType = runCascadeNodeByType;',
     ].join('\n'), context);
     return context;
@@ -67,6 +70,43 @@ function contextFor(nodes, connections){
 
 function response(ok, payload, status=ok ? 200 : 422){
     return {ok, status, json:async () => payload};
+}
+
+function cascadeIndexContext(mode){
+    const loop = {
+        id:'loop', type:'loop', mode, count:3, loopStart:2,
+        imageInput:true, imageBatchSize:2, videoInput:true, videoBatchSize:3,
+    };
+    const target = {id:'target', type:'video', running:false};
+    const seen = [];
+    const context = {
+        nodes:[loop, target],
+        loopContext:null,
+        Math, Number, String, Array, Object, Promise, Error,
+        alert:message => { throw new Error(message); },
+        computeCascadeOrder:() => ['target'],
+        resolveCascadeLoop:() => ({node:loop, count:3, mode}),
+        beginCascade:() => ({message:'mixed loop', currentNodeId:''}),
+        refreshNodes:() => {},
+        cascadeUiNodeIds:() => ['loop', 'target'],
+        ensureCascadeActive:() => {},
+        cascadeParallelLimit:() => 3,
+        runLimitedCascadeRounds:async (rounds, _limit, worker) => Promise.allSettled(rounds.map(worker)),
+        runCascadeNodeWithLoopContext:async (_node, loopCtx) => {
+            seen.push(JSON.parse(JSON.stringify(loopCtx)));
+        },
+        loopInputVideoRefs:(_node, loopCtx) => [{url:`/assets/video-${loopCtx.videoIndex}.mp4`, kind:'video'}],
+        finalizeCascade:() => {},
+        isCascadeAbortError:() => false,
+        tr:key => key,
+    };
+    vm.createContext(context);
+    vm.runInContext([
+        productionFunction('loopCascadeContextForRound'),
+        productionFunction('runNodeCascade'),
+        'this.runNodeCascade = runNodeCascade;',
+    ].join('\n'), context);
+    return {context, seen};
 }
 
 function runtimeMotionContext(nodes, connections, fetch){
@@ -116,6 +156,7 @@ function runtimeMotionContext(nodes, connections, fetch){
         productionFunction('motionTaskCanTransition'),
         productionFunction('motionTaskSafeUrl'),
         productionFunction('motionTaskSafeMessage'),
+        productionFunction('motionTaskResponseError'),
         productionFunction('motionTaskNode'),
         productionFunction('motionTaskPersist'),
         productionFunction('applyCanvasMotionTask'),
@@ -129,6 +170,7 @@ function runtimeMotionContext(nodes, connections, fetch){
         productionFunction('computeCascadeOrder'),
         productionFunction('runCascadeNodeByType'),
         productionFunction('runCascadeNodeWithLoopContext'),
+        productionFunction('loopCascadeContextForRound'),
         productionFunction('runNodeCascade'),
         'this.runMotionExtractNode = runMotionExtractNode;',
         'this.retryMotionExtract = retryMotionExtract;',
@@ -147,6 +189,48 @@ function runtimeMotionContext(nodes, connections, fetch){
     assert.equal(loop.videoBatchSize, 2);
 }
 
+// Break caught: unequal image/video batch sizes must advance independent source indices in both serial and parallel cascades.
+{
+    for(const mode of ['serial', 'parallel']){
+        const loop = {
+            id:'loop', type:'loop', mode, loopStart:2, imageInput:true, imageBatchSize:2,
+            videoInput:true, videoBatchSize:3,
+        };
+        const context = contextFor([loop], []);
+        assert.deepEqual(
+            JSON.parse(JSON.stringify(context.loopCascadeContextForRound(loop, 1, 3))),
+            {index:2, total:4, nodeId:'loop', imageIndex:2, videoIndex:2},
+        );
+        assert.deepEqual(
+            JSON.parse(JSON.stringify(context.loopCascadeContextForRound(loop, 2, 3))),
+            {index:3, total:4, nodeId:'loop', imageIndex:4, videoIndex:5},
+        );
+        assert.deepEqual(
+            JSON.parse(JSON.stringify(context.loopCascadeContextForRound(loop, 3, 3))),
+            {index:4, total:4, nodeId:'loop', imageIndex:6, videoIndex:8},
+        );
+    }
+}
+
+// Break caught: both cascade execution branches must pass those independent indices to downstream nodes.
+for(const mode of ['serial', 'parallel']){
+    const {context, seen} = cascadeIndexContext(mode);
+    await context.runNodeCascade('target');
+    seen.sort((left, right) => left.index - right.index);
+    assert.deepEqual(
+        seen.map(item => ({
+            index:item.index, imageIndex:item.imageIndex, videoIndex:item.videoIndex,
+            currentVideo:item.currentVideoRef?.url,
+        })),
+        [
+            {index:2, imageIndex:2, videoIndex:2, currentVideo:'/assets/video-2.mp4'},
+            {index:3, imageIndex:4, videoIndex:5, currentVideo:'/assets/video-5.mp4'},
+            {index:4, imageIndex:6, videoIndex:8, currentVideo:'/assets/video-8.mp4'},
+        ],
+        mode,
+    );
+}
+
 // Break caught: each loop iteration must retain task state and branch URLs under its own identity rather than inheriting a preceding video result.
 {
     const motion = {id:'motion', type:'motionExtract'};
@@ -163,6 +247,28 @@ function runtimeMotionContext(nodes, connections, fetch){
     assert.equal(second.depthUrl, '');
     assert.equal(second.poseUrl, '');
     assert.equal(motion.motionLoopItems['loop:1:/assets/a.mp4'].depthUrl, '/assets/depth-a.mp4');
+}
+
+// Break caught: an unvalidated loop source must never become an object key, source field, or serialized canvas value.
+{
+    const unsafeSources = [
+        '/assets/a.mp4?token=secret',
+        '/assets/a.mp4#fragment',
+        'https://user:secret@example.invalid/a.mp4',
+        String.raw`C:\private\a.mp4`,
+    ];
+    for(const sourceUrl of unsafeSources){
+        const motion = {id:'motion', type:'motionExtract'};
+        const context = contextFor([motion], []);
+        assert.equal(
+            context.motionLoopItemState(motion, {
+                loopContext:{nodeId:'loop', index:1, currentVideoRef:{url:sourceUrl}},
+            }),
+            null,
+        );
+        assert.equal(JSON.stringify(motion).includes(sourceUrl), false);
+        assert.equal(Object.hasOwn(motion, 'motionLoopItems'), false);
+    }
 }
 
 // Break caught: motion extraction is a runnable cascade step but remains outside generator provider classification and is serialized with GPU work.

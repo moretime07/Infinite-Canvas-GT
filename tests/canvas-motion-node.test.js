@@ -27,9 +27,14 @@ function controlsContext(){
     vm.createContext(context);
     vm.runInContext([
         productionFunction('addMotionExtractNode'),
+        productionFunction('motionTaskIsPolling'),
+        productionFunction('motionTaskConfigurationLocked'),
         productionFunction('setMotionExtractProcessorEnabled'),
+        productionFunction('setMotionExtractAudioEnabled'),
         'this.addMotionExtractNode = addMotionExtractNode;',
+        'this.motionTaskConfigurationLocked = motionTaskConfigurationLocked;',
         'this.setMotionExtractProcessorEnabled = setMotionExtractProcessorEnabled;',
+        'this.setMotionExtractAudioEnabled = setMotionExtractAudioEnabled;',
     ].join('\n'), context);
     return {context, alerts};
 }
@@ -70,6 +75,23 @@ function controlsContext(){
     assert.equal(node.depthEnabled, false);
     assert.equal(node.depthUrl, '');
     assert.equal(node.depthState, 'disabled');
+}
+
+// Break caught: queued/running work must keep the processor and audio configuration that was submitted.
+{
+    const {context} = controlsContext();
+    for(const state of ['queued', 'downloading', 'running']){
+        const node = context.addMotionExtractNode({x:0, y:0});
+        node.motionState = state;
+        assert.equal(context.motionTaskConfigurationLocked(node), true);
+        assert.equal(context.setMotionExtractProcessorEnabled(node, 'pose', true), false);
+        assert.equal(context.setMotionExtractAudioEnabled(node, true), false);
+        assert.equal(node.poseEnabled, false);
+        assert.equal(node.preserveAudio, false);
+    }
+    const idle = context.addMotionExtractNode({x:0, y:0});
+    assert.equal(context.setMotionExtractAudioEnabled(idle, true), true);
+    assert.equal(idle.preserveAudio, true);
 }
 
 function resolverContext(nodes, connections, loopRefs=()=>[]){
@@ -194,21 +216,48 @@ function resolverContext(nodes, connections, loopRefs=()=>[]){
     let saves = 0;
     const node = {id:'motion', type:'motionExtract'};
     const context = {
-        resolveMotionInputVideo:() => ({video:{url:'/active.mp4', kind:'video'}}),
+        resolveMotionInputVideo:() => ({video:{url:'/assets/active.mp4', kind:'video'}}),
         scheduleSave:() => { saves += 1; },
+        URL,
     };
     vm.createContext(context);
     vm.runInContext([
         productionFunction('motionVideoRefMetadata'),
+        productionFunction('motionTaskSafeUrl'),
         productionFunction('updateMotionSourceMetadata'),
         'this.updateMotionSourceMetadata = updateMotionSourceMetadata;',
     ].join('\n'), context);
-    assert.equal(context.updateMotionSourceMetadata(node, {url:'/active.mp4', fps:24}, {duration:3.5, videoWidth:1280, videoHeight:720}), true);
-    assert.deepEqual(JSON.parse(JSON.stringify(node.motionSourceMeta)), {url:'/active.mp4', duration:3.5, width:1280, height:720, fps:24});
+    assert.equal(context.updateMotionSourceMetadata(node, {url:'/assets/active.mp4', fps:24}, {duration:3.5, videoWidth:1280, videoHeight:720}), true);
+    assert.deepEqual(JSON.parse(JSON.stringify(node.motionSourceMeta)), {url:'/assets/active.mp4', duration:3.5, width:1280, height:720, fps:24});
     assert.equal(saves, 1);
     assert.equal(context.updateMotionSourceMetadata(node, {url:'/old.mp4'}, {duration:9, videoWidth:640, videoHeight:480}), false);
-    assert.equal(node.motionSourceMeta.url, '/active.mp4');
+    assert.equal(node.motionSourceMeta.url, '/assets/active.mp4');
     assert.equal(saves, 1);
+}
+
+// Break caught: preview metadata must not persist a query, fragment, credential URL, or raw path before source validation.
+{
+    let saves = 0;
+    let activeUrl = '';
+    const node = {id:'motion', type:'motionExtract'};
+    const context = {
+        resolveMotionInputVideo:() => ({video:{url:activeUrl}}),
+        scheduleSave:() => { saves += 1; },
+        URL,
+    };
+    vm.createContext(context);
+    vm.runInContext([
+        productionFunction('motionVideoRefMetadata'),
+        productionFunction('motionTaskSafeUrl'),
+        productionFunction('updateMotionSourceMetadata'),
+        'this.updateMotionSourceMetadata = updateMotionSourceMetadata;',
+    ].join('\n'), context);
+    for(const url of ['/assets/a.mp4?secret=1', '/assets/a.mp4#x', 'https://user:secret@example.invalid/a.mp4', String.raw`C:\private\a.mp4`]){
+        activeUrl = url;
+        assert.equal(context.updateMotionSourceMetadata(node, {url}, {duration:1, videoWidth:80, videoHeight:48}), false);
+    }
+    assert.equal(Object.hasOwn(node, 'motionSourceMeta'), false);
+    assert.equal(saves, 0);
 }
 
 // Break caught: downstream consumers must receive only the completed branch selected by the named port.
