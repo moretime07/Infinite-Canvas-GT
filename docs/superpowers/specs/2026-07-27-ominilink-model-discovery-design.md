@@ -24,7 +24,7 @@ OminiLink 的专用视频协议真正完成文本生视频、图片生视频和�
 - Omni Flash 异步查询：`GET /v1/query/{model_id}/{id}`。
 - Gemini Omni Flash 模型 ID：`gemini-omni-flash-preview`。
 - Omni Flash 支持文本任务和视频输出；视频任务包括 `text_to_video`、
-  `image_to_video` 与 `edit`。
+  `image_to_video`、`reference_to_video` 与 `edit`。
 - Omni Flash 视频结果可能直接返回，也可能先返回任务 ID 后异步查询。
 - 视频大于 4 MB 时应使用 URI 交付；参考视频只允许一个，官方建议不超过 3 秒；
   不支持音频参考。
@@ -209,14 +209,16 @@ Content-Type: application/json
 - 无素材：任务为 `text_to_video`。
 - 一张参考图：转为带 MIME 类型的 base64 `image` 内容，任务为
   `image_to_video`。
+- 多张参考图：保持画布连接顺序并逐张转为 `image` 内容，任务为
+  `reference_to_video`；应用不截断图片数量，由上游模型返回实际能力限制。
 - 一个参考视频：转为带 MIME 类型的 base64 `video` 内容，任务为 `edit`。
 - 比例映射到 `response_format.aspect_ratio`。
 - 时长标准化为带 `s` 后缀的字符串，并限制在文档允许的 `3~10s`。
 - 交付方式固定为 `uri`。
 
-本阶段不把图片与视频同时提交；混合输入、超过一张图片、超过一个视频、音频输入、
-超过 3 秒的参考视频都在发起付费请求前给出中文校验错误。无法可靠读取本地视频时长
-时允许提交，但在错误提示中保留上游限制说明。
+本阶段不把图片与视频同时提交；混合输入、超过一个视频、音频输入、超过 3 秒的参考
+视频都在发起付费请求前给出中文校验错误。提示词和参考图数量不设应用层上限，也不做
+静默截断；无法可靠读取本地视频时长时允许提交，并由上游返回实际限制。
 
 ### 查询与结果解析
 

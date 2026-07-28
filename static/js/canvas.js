@@ -726,7 +726,6 @@ function omniFlashVideoValidationError(node, mediaRefs, provider){
         return 'Omni Flash 远程参考素材只支持安全的公网 HTTPS 媒体 URI。';
     }
     if(imageCount && videoCount) return 'Omni Flash 不能同时提交图片和视频参考。';
-    if(imageCount > 1) return 'Omni Flash 图片生视频只支持一张参考图。';
     if(videoCount > 1) return 'Omni Flash 视频编辑只支持一个参考视频。';
     return '';
 }
@@ -1407,7 +1406,7 @@ function scheduleViewportSave(){
     saveLocalViewport();
 }
 function refreshOutputTimer(){
-    const hasPending = nodes.some(n => n.type === 'output' && (n._pending || []).length);
+    const hasPending = nodes.some(n => n.type === 'output' && (n._pending || []).some(p => !p?.paused && !p?.failed));
     if(hasPending && !outputTimer){
         outputTimer = setInterval(() => {
             const pendingById = new Map();
@@ -2097,6 +2096,8 @@ async function openCanvas(id){
         renderCanvasList();
         render();
         resumeCanvasImageTasks();
+        resumeCanvasVideoTasks();
+        resumeRunningHubTasks();
         startCanvasRemotePolling();
         setStatus('Ready');
         if(defaultsChanged) scheduleSave();
@@ -2137,6 +2138,8 @@ function applyRemoteCanvasData(remote){
         renderCanvasList();
         render();
         resumeCanvasImageTasks();
+        resumeCanvasVideoTasks();
+        resumeRunningHubTasks();
         if(currentCanvasTitle) currentCanvasTitle.textContent = canvas.title || tr('canvas.untitled');
         if(currentCanvasTime) currentCanvasTime.textContent = formatCanvasTime(canvas.updated_at || canvas.created_at);
         setStatus('Synced');
@@ -5902,6 +5905,21 @@ function pendingOutputStyle(pending){
     return ` style="aspect-ratio:${Math.max(1, size.w)}/${Math.max(1, size.h)}"`;
 }
 function renderPendingOutput(pending){
+    if(pending?.paused){
+        const message = pending.pauseMessage || (langIsEn()
+            ? 'Waiting paused. The cloud task is still running.'
+            : '已暂停等待，云端任务仍在运行');
+        return `<div class="output-img-wrap loading-wrap recoverable paused" data-pending-id="${escapeAttr(pending.id)}"${pendingOutputStyle(pending)}>
+            <span class="output-time-pill">${langIsEn() ? 'Paused' : '已暂停'}</span>
+            <div class="output-recover-state">
+                <i data-lucide="pause-circle"></i>
+                <div class="output-recover-title">${langIsEn() ? 'Video task preserved' : '视频任务已保留'}</div>
+                <div class="output-recover-sub" title="${escapeAttr(message)}">${escapeHtml(message)}</div>
+                <button class="output-recover-query" type="button">${langIsEn() ? 'Resume waiting' : '继续等待'}</button>
+            </div>
+            <button class="output-del" title="${tr('common.delete')}">×</button>
+        </div>`;
+    }
     if(pending?.failed){
         const taskId = pending.recoverTaskId || '';
         const querying = Boolean(pending.querying);
@@ -6275,7 +6293,11 @@ function bindOutputWrap(wrap, node){
             e.preventDefault();
             e.stopPropagation();
             const pid = wrap.dataset.pendingId;
-            if(pid) queryRecoverPendingOutput(pid);
+            if(pid){
+                const pending = pendingById(node, pid);
+                if(pending?.canvasTaskType === 'video') resumeCanvasVideoPending(pid);
+                else queryRecoverPendingOutput(pid);
+            }
         };
     }
 }
@@ -8922,8 +8944,13 @@ function rhFieldRole(field){
 }
 function rhExtractFieldOptions(field){
     const candidates = [field?.fieldData, field?.options, field?.list, field?.values, field?.enum, field?.choices, field?.items, field?.selectOptions, field?.dropdown];
-    for(const candidate of candidates){
+    for(let candidate of candidates){
+        if(typeof candidate === 'string'){
+            try { candidate = JSON.parse(candidate); } catch(_) { continue; }
+        }
         if(!Array.isArray(candidate) || !candidate.length) continue;
+        // RunningHub LIST fields arrive as a JSON string containing [options, metadata].
+        if(Array.isArray(candidate[0])) candidate = candidate[0];
         if(candidate.every(x => ['string','number'].includes(typeof x))) return candidate.map(String);
         if(candidate.every(x => x && typeof x === 'object' && ('value' in x || 'label' in x || 'name' in x))){
             return candidate.map(x => x.value ?? x.label ?? x.name).filter(v => v !== undefined && v !== null).map(String);
@@ -8940,6 +8967,49 @@ function rhExtractFieldOptions(field){
         if(hit) return RH_KNOWN_FIELD_OPTIONS[hit].map(String);
     }
     return null;
+}
+function rhEmptyMediaValue(field){
+    const options = rhExtractFieldOptions(field) || [];
+    const emptyOption = options.find(value => String(value).trim().toLowerCase() === 'none');
+    return emptyOption == null ? '' : String(emptyOption);
+}
+function rhAppFieldsWithRawSchema(entry){
+    const savedFields = Array.isArray(entry?.fields) ? entry.fields : [];
+    const rawRoot = entry?.raw?.data && typeof entry.raw.data === 'object' ? entry.raw.data : entry?.raw;
+    const rawFields = Array.isArray(rawRoot?.nodeInfoList) ? rawRoot.nodeInfoList : [];
+    if(!rawFields.length) return savedFields;
+    const keyOf = field => `${field?.nodeId ?? ''}::${field?.fieldName ?? ''}`;
+    const rawByKey = new Map(rawFields.map(field => [keyOf(field), field]));
+    const savedKeys = new Set(savedFields.map(keyOf));
+    const merged = savedFields.map(field => {
+        const rawField = rawByKey.get(keyOf(field));
+        if(!rawField) return field;
+        return {
+            ...rawField,
+            ...field,
+            // Keep the provider schema even when an older saved field contains generic fallback options.
+            fieldData:rawField.fieldData ?? field.fieldData,
+        };
+    });
+    rawFields.forEach(field => {
+        if(!savedKeys.has(keyOf(field))) merged.push(field);
+    });
+    return merged;
+}
+function rhCoerceFieldOption(field, value){
+    const options = rhExtractFieldOptions(field);
+    if(!options?.length) return value;
+    const text = value === undefined || value === null ? '' : String(value);
+    if(options.includes(text)) return text;
+    let schemaDefault = '';
+    try {
+        const fieldData = typeof field?.fieldData === 'string' ? JSON.parse(field.fieldData) : field?.fieldData;
+        if(Array.isArray(fieldData) && fieldData[1] && typeof fieldData[1] === 'object'){
+            schemaDefault = String(fieldData[1].default ?? '');
+        }
+    } catch(_) {}
+    const configuredDefault = rhDefaultValue(field);
+    return [configuredDefault, schemaDefault, options[0]].find(candidate => options.includes(String(candidate ?? ''))) ?? options[0];
 }
 function rhDefaultValue(field){
     let value = field?.fieldValue;
@@ -9146,7 +9216,7 @@ function rhActiveFields(node){
         return sortFields(node.rhWorkflowInfo?.nodeInfoList || []);
     }
     const savedApp = currentRunningHubAppConfig(node);
-    if(Array.isArray(savedApp?.fields) && savedApp.fields.length) return sortFields(rhUsableFields(savedApp.fields));
+    if(Array.isArray(savedApp?.fields) && savedApp.fields.length) return sortFields(rhUsableFields(rhAppFieldsWithRawSchema(savedApp)));
     return sortFields(node.rhAppInfo?.nodeInfoList || []);
 }
 function currentRunningHubWorkflowConfig(node){
@@ -9234,12 +9304,32 @@ function rhFieldValue(node, field, media=null){
     }
     if(rhFieldRole(field) === 'prompt'){
         const upstreamPrompt = (media || rhMediaSources(node)).prompt || '';
-        return param?.value ?? (upstreamPrompt || rhDefaultValue(field));
+        const manualPrompt = String(param?.value ?? '').trim();
+        return manualPrompt ? param.value : (upstreamPrompt || rhDefaultValue(field));
     }
-    return param?.value ?? rhDefaultValue(field);
+    return rhCoerceFieldOption(field, param?.value ?? rhDefaultValue(field));
 }
 function rhRequiredLabel(field){
     return field?.label || field?.fieldName || `#${field?.nodeId || ''}`;
+}
+function rhFieldIsRequired(field){
+    if(field?.required === true) return true;
+    const text = [field?.descriptionEn, field?.descriptionCn, field?.description, field?.note, field?.label]
+        .filter(Boolean)
+        .join(' ');
+    if(/\boptional\b|选填|可选/i.test(text)) return false;
+    return /\brequired\b|必填|必需/i.test(text);
+}
+function rhPromptLimitForNode(node){
+    if(rhCurrentKind(node) !== 'app') return 0;
+    const appId = String(node?.webappId || '').trim();
+    return ['2058790334674587649', '2059985306476179457'].includes(appId) ? 2048 : 0;
+}
+function rhLimitPromptValue(node, value){
+    const limit = rhPromptLimitForNode(node);
+    if(!limit) return value;
+    const chars = Array.from(String(value ?? ''));
+    return chars.length > limit ? chars.slice(0, limit).join('') : value;
 }
 function rhPruneWorkflowForMissingFields(workflowJson, missingFields){
     if(!workflowJson || typeof workflowJson !== 'object' || !missingFields?.length) return null;
@@ -9613,16 +9703,38 @@ async function rhBuildNodeInfoList(node, media){
     const fields = rhActiveFields(node);
     const result = [];
     const indexes = rhFieldIndexes(fields);
+    const mode = rhCurrentKind(node);
     for(const field of fields){
         const kind = rhFieldKind(field);
         const key = rhParamKey(field.nodeId, field.fieldName);
-        if(rhCurrentKind(node) === 'workflow' && field.sourceFromUpstream === false && !['image','video','audio'].includes(kind)) continue;
-        if(rhCurrentKind(node) === 'workflow' && kind === 'image'){
+        if(mode === 'workflow' && field.sourceFromUpstream === false && !['image','video','audio'].includes(kind)) continue;
+        if(mode === 'workflow' && kind === 'image'){
             const idx = indexes[key] || 0;
             const hasInput = Boolean(media.image?.[idx]?.url);
             if(field.required !== true && !hasInput) continue;
         }
+        if(mode === 'app' && ['image','video','audio'].includes(kind)){
+            const idx = indexes[key] || 0;
+            const hasUpstream = Boolean(media[kind]?.[idx]?.url);
+            const param = node.rhParams?.[key];
+            const hasManualValue = param?.sourceFromUpstream === false && String(param.value || '').trim() !== '';
+            if(!hasUpstream && !hasManualValue){
+                if(rhFieldIsRequired(field)){
+                    throw new Error(`${rhRequiredLabel(field)} 必填（required）：请连接画布素材后再运行 RunningHub`);
+                }
+                const emptyValue = rhEmptyMediaValue(field);
+                if(emptyValue){
+                    result.push({
+                        nodeId:field.nodeId,
+                        fieldName:field.fieldName,
+                        fieldValue:emptyValue
+                    });
+                }
+                continue;
+            }
+        }
         let value = rhFieldValue(node, field, media);
+        if(rhFieldRole(field) === 'prompt') value = rhLimitPromptValue(node, value);
         if(['image','video','audio'].includes(kind)) value = await rhUploadValueIfNeeded(value, node);
         if(['number','slider'].includes(kind) && String(value ?? '').trim() !== '' && !Number.isNaN(Number(value))) value = Number(value);
         result.push({nodeId:field.nodeId, fieldName:field.fieldName, fieldValue:value});
@@ -10383,15 +10495,19 @@ async function runVideoNode(nodeId, opts={}){
     let out = outputForNode(node, 460);
     const pendingId = uid('p');
     const run = runSnapshot(node, prompt, refs);
-    if(out) out._pending = [...(out._pending || []), makePendingForRun(pendingId, run, node, {refs, cascadeTargetId})];
+    const pending = makePendingForRun(pendingId, run, node, {refs, cascadeTargetId});
+    if(out) out._pending = [...(out._pending || []), pending];
     if(!opts.cascade){ node.running = true; refreshRunNodes(node, out); }
     else refreshRunNodes(node, out);
     try {
-        const result = await cascadeFetch('/api/canvas-video', {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify(requestPayload)
-        }, {cascadeTargetId}).then(async r => { if(!r.ok) throw new Error(await responseErrorMessage(r, tr('canvas.videoFailed'))); return r.json(); });
+        const task = await createCanvasVideoTask(requestPayload, {cascadeTargetId});
+        pending.canvasTaskId = task.task_id;
+        pending.canvasTaskType = 'video';
+        pending.canvasTaskStatus = task.status || 'queued';
+        pending.providerId = requestProvider.providerId;
+        pending.paused = false;
+        scheduleSave();
+        const result = await waitCanvasVideoTaskResult(task.task_id, {cascadeTargetId});
         const meta = collectRunMeta(out, pendingId);
         if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
         const outputUrls = resultMediaUrls(result).map(item => {
@@ -10408,19 +10524,35 @@ async function runVideoNode(nodeId, opts={}){
         scheduleSave();
     } catch(err) {
         const meta = collectRunMeta(out, pendingId);
+        if(isCascadeAbortError(err) && pending.canvasTaskId){
+            pending.paused = true;
+            pending.canvasTaskStatus = 'paused';
+            pending.pauseMessage = langIsEn()
+                ? 'Waiting paused. The cloud task is still running; resume later to collect the result.'
+                : '已暂停等待；云端任务仍在运行，稍后可继续等待并取回结果。';
+            node.runStatus = '';
+            node.runError = '';
+            refreshRunNodes(node, out);
+            scheduleSave();
+            if(opts.cascade) throw err;
+            return;
+        }
         addGenerationLog({run, outputs:[], runMs:meta.runMs || 0, error:err.message || String(err)});
         if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
         if(isCascadeAbortError(err)){
+            scheduleSave();
             if(opts.cascade) throw err;
             return;
         }
         node.runStatus = 'failed'; node.runError = err.message || String(err);
         refreshRunNodes(node, out);
+        scheduleSave();
         if(opts.cascade) throw err;
         alert(err.message || tr('canvas.videoFailed'));
     } finally {
         node.running = false;
         refreshRunNodes(node, out);
+        scheduleSave();
     }
 }
 async function uploadCanvasUrlToComfy(url){
@@ -11281,6 +11413,8 @@ async function runLLMNode(nodeId, opts={}){
         if(!opts.cascade) node.running = false;
         node.runStatus = 'done'; node.runError = '';
         refreshNodes([node.id]);
+        syncGeneratorInputs();
+        refreshGeneratorInputViews();
         scheduleSave();
     } catch(err) {
         if(!opts.cascade) node.running = false;
@@ -12066,6 +12200,38 @@ async function createCanvasImageTask(payload, options={}){
     if(!res.ok) throw new Error(await responseErrorMessage(res, tr('canvas.generationFailed')));
     return res.json();
 }
+async function createCanvasVideoTask(payload, options={}){
+    const cascadeTargetId = cascadeTargetIdFromOptions(options);
+    const res = await cascadeFetch('/api/canvas-video-tasks', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(payload)
+    }, {cascadeTargetId});
+    if(!res.ok) throw new Error(await responseErrorMessage(res, tr('canvas.videoFailed')));
+    return res.json();
+}
+async function waitCanvasVideoTaskResult(taskId, options={}){
+    if(!taskId) throw new Error(tr('canvas.videoFailed'));
+    while(true){
+        const cascadeTargetId = cascadeTargetIdFromOptions(options);
+        if(cascadeTargetId) ensureCascadeActive(cascadeTargetId);
+        const res = await cascadeFetch(`/api/canvas-video-tasks/${encodeURIComponent(taskId)}`, {}, {cascadeTargetId});
+        if(!res.ok){
+            if(res.status === 404) throw new Error(langIsEn()
+                ? 'The video task is unavailable because the service restarted or the task expired.'
+                : '视频任务不存在，可能服务已重启或任务已过期。');
+            throw new Error(await responseErrorMessage(res, tr('canvas.videoFailed')));
+        }
+        const data = await res.json();
+        if(data.status === 'succeeded') return data.result || {};
+        if(data.status === 'failed'){
+            const error = new Error(data.error || tr('canvas.videoFailed'));
+            error.taskData = data;
+            throw error;
+        }
+        await sleep(1800);
+    }
+}
 async function createCanvasComfyTask(payload, options={}){
     const res = await cascadeFetch('/api/canvas-comfy-tasks', {
         method:'POST',
@@ -12289,6 +12455,188 @@ function resumeCanvasImageTasks(){
             if(p.canvasTaskType === 'online-image' && p.canvasTaskId && !p.failed) pollCanvasImageTask(p.canvasTaskId, {cascadeTargetId:p.cascadeTargetId || ''});
         });
     });
+}
+function runningHubPendingTaskId(pending){
+    if(pending?.run?.nodeType !== 'rh') return '';
+    return String(pending?.run?.request?.task_id || '').trim();
+}
+async function pollRunningHubPending(pendingId){
+    const initialOut = findOutputByPendingId(pendingId);
+    const initialPending = pendingById(initialOut, pendingId);
+    const taskId = runningHubPendingTaskId(initialPending);
+    if(!initialOut || !initialPending || !taskId) return 'missing';
+    const pollKey = `runninghub:${taskId}`;
+    if(activeCanvasTaskPolls.has(pollKey)) return 'running';
+    activeCanvasTaskPolls.add(pollKey);
+    try {
+        while(true){
+            const out = findOutputByPendingId(pendingId);
+            const pending = pendingById(out, pendingId);
+            if(!out || !pending) return 'missing';
+            const res = await fetch(`/api/runninghub/query?taskId=${encodeURIComponent(taskId)}`);
+            if(!res.ok) throw new Error(await responseErrorMessage(res, tr('canvas.rhFailed')));
+            const response = await res.json();
+            if(response.success === false) throw new Error(response.detail || response.error || tr('canvas.rhFailed'));
+            const data = response.data || response;
+            if(data.status === 'FAILED') throw new Error(data.failReason || tr('canvas.rhFailed'));
+            if(data.status === 'SUCCESS'){
+                const outputs = data.urls || [];
+                if(!outputs.length) throw new Error(tr('canvas.rhOutputsEmpty'));
+                const run = pending.run || {};
+                const meta = collectRunMeta(out, pendingId);
+                out._pending = (out._pending || []).filter(item => item.id !== pendingId);
+                appendOutputImages(out, outputs, run.refs?.[0], [meta]);
+                const gen = nodes.find(node => node.id === run?.node?.id);
+                if(gen){
+                    mergeGeneratedOutputs(gen, outputs, true);
+                    gen.runStatus = 'done';
+                    gen.runError = '';
+                    gen.running = false;
+                }
+                addGenerationLog({run, outputs, runMs:meta.runMs || 0});
+                refreshRunNodes(gen, out);
+                scheduleSave();
+                return 'succeeded';
+            }
+            await sleep(2500);
+        }
+    } catch(err) {
+        const out = findOutputByPendingId(pendingId);
+        const pending = pendingById(out, pendingId);
+        if(out && pending){
+            const run = pending.run || {};
+            const meta = collectRunMeta(out, pendingId);
+            out._pending = (out._pending || []).filter(item => item.id !== pendingId);
+            const gen = nodes.find(node => node.id === run?.node?.id);
+            if(gen){
+                gen.runStatus = 'failed';
+                gen.runError = err.message || String(err);
+                gen._cascadeFailed = Boolean(pending.cascadeTargetId);
+                gen.running = false;
+            }
+            addGenerationLog({run, outputs:[], runMs:meta.runMs || 0, error:err.message || String(err)});
+            refreshRunNodes(gen, out);
+            scheduleSave();
+        }
+        return 'failed';
+    } finally {
+        activeCanvasTaskPolls.delete(pollKey);
+    }
+}
+function resumeRunningHubTasks(){
+    nodes.filter(node => node.type === 'output').forEach(out => {
+        (out._pending || []).forEach(pending => {
+            if(pending?.run?.nodeType === 'rh' && runningHubPendingTaskId(pending)){
+                pollRunningHubPending(pending.id);
+            }
+        });
+    });
+}
+function completeCanvasVideoTask(taskId, result){
+    const found = findPendingTask(taskId);
+    if(!found) return;
+    const {out, pending} = found;
+    const meta = {
+        runMs:nowMs() - Number(pending.startedAt || nowMs()),
+        run:pending.run || {},
+    };
+    meta.run.request = requestMetaFromResult(result);
+    const videos = resultMediaUrls(result).map(item => {
+        const url = outputUrlValue(item);
+        return item && typeof item === 'object' ? {...item, url, kind:item.kind || 'video'} : {url, kind:'video'};
+    }).filter(item => item.url);
+    out._pending = (out._pending || []).filter(p => p.id !== pending.id);
+    const gen = nodes.find(n => n.id === meta.run?.node?.id);
+    if(videos.length){
+        appendOutputImages(out, videos, meta.run?.refs?.[0], [{...meta, kind:'video'}]);
+        if(gen) mergeGeneratedOutputs(gen, videos, Boolean(pending.appendGenerated));
+        addGenerationLog({run:meta.run, outputs:videos, runMs:meta.runMs || 0});
+    } else {
+        addGenerationLog({run:meta.run, outputs:[], runMs:meta.runMs || 0, error:tr('canvas.videoFailed')});
+    }
+    if(gen){
+        gen.runStatus = videos.length ? 'done' : 'failed';
+        gen.runError = videos.length ? '' : tr('canvas.videoFailed');
+        gen.running = false;
+    }
+    refreshRunNodes(gen, out);
+    scheduleSave();
+}
+function failCanvasVideoTask(taskId, message){
+    const found = findPendingTask(taskId);
+    if(!found) return;
+    const {out, pending} = found;
+    const run = pending.run || {};
+    const runMs = nowMs() - Number(pending.startedAt || nowMs());
+    out._pending = (out._pending || []).filter(p => p.id !== pending.id);
+    const gen = nodes.find(n => n.id === run?.node?.id);
+    if(gen){
+        gen.runStatus = 'failed';
+        gen.runError = message || tr('canvas.videoFailed');
+        gen.running = false;
+    }
+    addGenerationLog({run, outputs:[], runMs, error:message || tr('canvas.videoFailed')});
+    refreshRunNodes(gen, out);
+    scheduleSave();
+}
+async function pollCanvasVideoTask(taskId, options={}){
+    if(!taskId) return 'failed';
+    if(activeCanvasTaskPolls.has(taskId)) return 'running';
+    activeCanvasTaskPolls.add(taskId);
+    try {
+        const result = await waitCanvasVideoTaskResult(taskId, options);
+        completeCanvasVideoTask(taskId, result);
+        return 'succeeded';
+    } catch(err) {
+        if(isCascadeAbortError(err)) return 'aborted';
+        failCanvasVideoTask(taskId, err.message || String(err));
+        return 'failed';
+    } finally {
+        activeCanvasTaskPolls.delete(taskId);
+    }
+}
+async function resumeCanvasVideoPending(pendingId){
+    const out = findOutputByPendingId(pendingId);
+    const pending = pendingById(out, pendingId);
+    if(!out || !pending?.canvasTaskId || pending.querying) return;
+    pending.paused = false;
+    pending.querying = true;
+    pending.canvasTaskStatus = 'running';
+    delete pending.pauseMessage;
+    const gen = nodes.find(n => n.id === pending.run?.node?.id);
+    if(gen) gen.running = true;
+    refreshRunNodes(gen, out);
+    scheduleSave();
+    try {
+        await pollCanvasVideoTask(pending.canvasTaskId);
+    } finally {
+        const latest = pendingById(out, pendingId);
+        if(latest){
+            latest.querying = false;
+            refreshRunNodes(gen, out);
+            scheduleSave();
+        }
+    }
+}
+function resumeCanvasVideoTasks(){
+    let changed = false;
+    nodes.filter(n => n.type === 'output').forEach(out => {
+        const before = (out._pending || []).length;
+        out._pending = (out._pending || []).filter(p => {
+            const isLegacyVideo = p?.run?.nodeType === 'video' && !p.canvasTaskId;
+            return !isLegacyVideo;
+        });
+        if(out._pending.length !== before) changed = true;
+        (out._pending || []).forEach(p => {
+            if(p.canvasTaskType === 'video' && p.canvasTaskId && !p.failed && !p.paused){
+                pollCanvasVideoTask(p.canvasTaskId);
+            }
+        });
+    });
+    if(changed){
+        render();
+        scheduleSave();
+    }
 }
 function renderOutputMedia(item, useGridLayout=false){
     const url = outputUrlValue(item);
@@ -14159,35 +14507,38 @@ board.addEventListener('click', e => {
     if(nodeEl?.dataset?.id) exitZoomPreviewToNode(nodeEl.dataset.id);
     else exitZoomPreview(screenToWorld(e.clientX, e.clientY));
 }, true);
-function startBoardPan(e, opts={}){
+function isMiddleMouseButton(event){
+    return Number(event?.button) === 1;
+}
+function isMiddleMouseHeld(event){
+    return (Number(event?.buttons || 0) & 4) === 4;
+}
+function startBoardPan(e){
     if(!canvas) return false;
     if(isEditableTarget(e.target) || e.target.closest?.('#createMenu, #linkCreateMenu, #nodeInputMenu, #nodeOutputMenu, #imageNodeMenu, .minimap')) return false;
     e.preventDefault();
     e.stopPropagation();
     closeCreateMenu();
     if(document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
-    dragBoard = {sx:e.clientX, sy:e.clientY, ox:viewport.x, oy:viewport.y, moved:false, clearSelectionOnClick:Boolean(opts.clearSelectionOnClick)};
+    dragBoard = {sx:e.clientX, sy:e.clientY, ox:viewport.x, oy:viewport.y, moved:false};
     document.body.classList.add('canvas-board-pan');
     window.onmousemove = e2 => {
+        if(!isMiddleMouseHeld(e2)){
+            endDrag(e2);
+            return;
+        }
         if(Math.hypot(e2.clientX - dragBoard.sx, e2.clientY - dragBoard.sy) > 4) dragBoard.moved = true;
         viewport.x = dragBoard.ox + e2.clientX - dragBoard.sx;
         viewport.y = dragBoard.oy + e2.clientY - dragBoard.sy;
         applyViewport();
     };
-    window.onmouseup = e2 => {
-        const shouldClearSelection = dragBoard?.clearSelectionOnClick && !dragBoard.moved && selected.size;
-        if(shouldClearSelection){
-            selected.clear();
-            refreshSelectionVisuals();
-        }
-        endDrag(e2);
-    };
+    window.onmouseup = e2 => endDrag(e2);
     return true;
 }
 
 board.onmousedown = e => {
     if(!canvas) return;
-    if(e.button === 1){
+    if(isMiddleMouseButton(e)){
         startBoardPan(e);
         return;
     }
@@ -14207,7 +14558,11 @@ board.onmousedown = e => {
         startSelection(e);
         return;
     }
-    startBoardPan(e, {clearSelectionOnClick:true});
+    e.preventDefault();
+    if(selected.size){
+        selected.clear();
+        refreshSelectionVisuals();
+    }
 };
 board.addEventListener('mousemove', e => {
     const point = screenToWorld(e.clientX, e.clientY);

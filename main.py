@@ -523,7 +523,6 @@ APIMART_IMAGE_POLL_INTERVAL = float(os.getenv("APIMART_IMAGE_POLL_INTERVAL", "5"
 APIMART_IMAGE_INITIAL_POLL_DELAY = float(os.getenv("APIMART_IMAGE_INITIAL_POLL_DELAY", "10"))
 VIDEO_POLL_TIMEOUT = float(os.getenv("VIDEO_POLL_TIMEOUT", "1800"))
 ONLINE_IMAGE_PROMPT_MAX_LENGTH = int(os.getenv("ONLINE_IMAGE_PROMPT_MAX_LENGTH", "20000"))
-VIDEO_PROMPT_MAX_LENGTH = int(os.getenv("VIDEO_PROMPT_MAX_LENGTH", "4000"))
 LLM_MESSAGE_MAX_LENGTH = int(os.getenv("LLM_MESSAGE_MAX_LENGTH", "20000"))
 CHAT_ATTACHMENT_MAX = int(os.getenv("CHAT_ATTACHMENT_MAX", "20"))
 ONLINE_IMAGE_REFERENCE_MAX = int(os.getenv("ONLINE_IMAGE_REFERENCE_MAX", "20"))
@@ -2492,7 +2491,7 @@ CANVAS_TASKS: Dict[str, Dict[str, Any]] = {}
 CANVAS_TASK_LOCK = Lock()
 
 class CanvasVideoRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=VIDEO_PROMPT_MAX_LENGTH)
+    prompt: str = Field(min_length=1)
     provider_id: str = "comfly"
     model: str = "veo3-fast"
     duration: int = 5
@@ -7496,6 +7495,7 @@ async def save_remote_video_to_output(url, prefix="video_", category="output"):
         headers = {
             "User-Agent": "ComfyUI-API-Modelscope/1.0",
             "Accept": "video/*,application/octet-stream,*/*;q=0.8",
+            **remote_media_request_headers(url),
         }
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
             response = await client.get(url)
@@ -8156,6 +8156,22 @@ async def runninghub_store_remote_output(client, remote):
         f.write(response.content)
     return output_url_for(filename, "output")
 
+def humanize_runninghub_failure_message(message):
+    text = str(message or "").strip()
+    lower = text.lower()
+    if "video generation timed out" in lower or "errorcode: 1006" in lower:
+        error_code_match = re.search(r"errorCode\s*:\s*([^\],\s]+)", text, re.I)
+        task_id_match = re.search(r"taskId\s*:\s*([^\],\s]+)", text, re.I)
+        suffix = []
+        if error_code_match:
+            suffix.append(f"错误码 {error_code_match.group(1)}")
+        if task_id_match:
+            suffix.append(f"上游任务 {task_id_match.group(1)}")
+        metadata = f"（{'，'.join(suffix)}）" if suffix else ""
+        return f"RunningHub 视频生成超时，请稍后重试{metadata}。"
+    return text
+
+
 def runninghub_fail_reason(raw):
     data = raw.get("data") if isinstance(raw, dict) else None
     values = []
@@ -8169,7 +8185,25 @@ def runninghub_fail_reason(raw):
         if isinstance(value, str):
             return value
         if isinstance(value, dict):
-            return value.get("exception_message") or value.get("message") or json.dumps(value, ensure_ascii=False)
+            exception_message = str(value.get("exception_message") or "").strip()
+            generic_exception = exception_message.lower() in {
+                "",
+                "custom validation failed for node",
+            }
+            if exception_message and not generic_exception:
+                return humanize_runninghub_failure_message(exception_message)
+            traceback_value = value.get("traceback")
+            if isinstance(traceback_value, str) and traceback_value.strip():
+                try:
+                    parsed_traceback = json.loads(traceback_value)
+                except Exception:
+                    parsed_traceback = None
+                if isinstance(parsed_traceback, list):
+                    details = [str(item).strip() for item in parsed_traceback if str(item).strip()]
+                    if details:
+                        return "; ".join(details)[:800]
+                return traceback_value.strip()[:800]
+            return exception_message or value.get("message") or json.dumps(value, ensure_ascii=False)
         return str(value)
     return ""
 
@@ -8756,6 +8790,24 @@ def sanitize_runninghub_node_info_list(items):
         if rh_is_seed_like_name(clean.get("fieldName"), clean.get("label"), clean.get("note")):
             clean["fieldValue"] = normalize_seed_uint32(clean.get("fieldValue"))
         result.append(clean)
+    return result
+
+RUNNINGHUB_APP_PROMPT_LIMITS = {
+    "2058790334674587649": 2048,
+    "2059985306476179457": 2048,
+}
+
+def sanitize_runninghub_app_node_info_list(webapp_id, items):
+    result = sanitize_runninghub_node_info_list(items)
+    limit = RUNNINGHUB_APP_PROMPT_LIMITS.get(str(webapp_id or "").strip(), 0)
+    if not limit:
+        return result
+    for item in result:
+        if str(item.get("fieldName") or "").strip().lower() != "prompt":
+            continue
+        value = item.get("fieldValue")
+        if isinstance(value, str) and len(value) > limit:
+            item["fieldValue"] = value[:limit]
     return result
 
 def rh_random_field_value(field):
@@ -10373,7 +10425,7 @@ async def runninghub_submit(payload: RunningHubSubmitRequest):
     body = {
         "apiKey": api_key,
         "webappId": webapp_id,
-        "nodeInfoList": sanitize_runninghub_node_info_list(payload.nodeInfoList or []),
+        "nodeInfoList": sanitize_runninghub_app_node_info_list(webapp_id, payload.nodeInfoList or []),
     }
     instance_type = str(payload.instanceType or "").strip()
     if instance_type:
@@ -10645,16 +10697,33 @@ async def runninghub_upload_asset(payload: RunningHubUploadAssetRequest):
         upload_url = runninghub_endpoint_url(provider, "/task/openapi/upload")
         files = {"file": (filename, content, content_type)}
         data = {"apiKey": api_key, "fileType": "input"}
-        try:
+        for attempt in range(2):
             response = await client.post(upload_url, headers=runninghub_app_headers(False, payload.useWallet), data=data, files=files)
-            raw = response.json()
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"上传素材到 RunningHub 失败：{exc}") from exc
-    if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=json.dumps(raw, ensure_ascii=False)[:800])
-    if isinstance(raw, dict) and raw.get("code") in (0, "0") and isinstance(raw.get("data"), dict) and raw["data"].get("fileName"):
-        return {"success": True, "data": {"fileName": raw["data"]["fileName"], "fileType": raw["data"].get("fileType") or content_type}}
-    raise HTTPException(status_code=400, detail=(raw.get("msg") if isinstance(raw, dict) else "") or f"RunningHub 上传失败：{raw}")
+            response_text = str(getattr(response, "text", "") or "").strip()
+            try:
+                raw = response.json()
+            except Exception:
+                preview = response_text[:500]
+                detail = (
+                    f"RunningHub 上传接口返回非 JSON 响应（HTTP {response.status_code}）：{preview}"
+                    if preview
+                    else f"RunningHub 上传接口返回空响应（HTTP {response.status_code}）"
+                )
+                retryable = not preview or response.status_code in (408, 425, 429, 500, 502, 503, 504)
+                if attempt == 0 and retryable:
+                    await asyncio.sleep(1)
+                    continue
+                raise HTTPException(status_code=502, detail=detail)
+            if response.status_code >= 400:
+                detail = json.dumps(raw, ensure_ascii=False)[:800]
+                if attempt == 0 and response.status_code in (408, 425, 429, 500, 502, 503, 504):
+                    await asyncio.sleep(1)
+                    continue
+                raise HTTPException(status_code=response.status_code, detail=detail)
+            if isinstance(raw, dict) and raw.get("code") in (0, "0") and isinstance(raw.get("data"), dict) and raw["data"].get("fileName"):
+                return {"success": True, "data": {"fileName": raw["data"]["fileName"], "fileType": raw["data"].get("fileType") or content_type}}
+            raise HTTPException(status_code=400, detail=(raw.get("msg") if isinstance(raw, dict) else "") or f"RunningHub 上传失败：{raw}")
+    raise HTTPException(status_code=502, detail="RunningHub 上传接口在重试后仍未返回结果")
 
 @app.get("/api/jimeng/status")
 async def jimeng_status():
@@ -12351,16 +12420,17 @@ async def build_ominilink_omni_request(payload: CanvasVideoRequest, resolver=Non
         raise HTTPException(status_code=400, detail="Omni Flash 不支持音频参考，请移除音频后重试。")
     if images and videos:
         raise HTTPException(status_code=400, detail="Omni Flash 不能同时提交图片和视频参考。")
-    if len(images) > 1:
-        raise HTTPException(status_code=400, detail="Omni Flash 图片生视频只支持一张参考图。")
     if len(videos) > 1:
         raise HTTPException(status_code=400, detail="Omni Flash 视频编辑只支持一个参考视频。")
 
     content = [{"type": "text", "text": str(payload.prompt or "")}]
     task = "text_to_video"
     if images:
-        content.append(ominilink_media_content_item(images[0].url, "image/", resolver=resolver))
-        task = "image_to_video"
+        content.extend(
+            ominilink_media_content_item(image.url, "image/", resolver=resolver)
+            for image in images
+        )
+        task = "image_to_video" if len(images) == 1 else "reference_to_video"
     elif videos:
         duration = None if videos[0].startswith(("http://", "https://", "data:")) else probe_local_video_duration_seconds(videos[0])
         if duration is not None and duration > 3:
@@ -12483,6 +12553,17 @@ def humanize_video_task_failure(reason) -> str:
     目前主要处理 veo（Google）的内容安全过滤码。"""
     text = str(reason or "").strip()
     upper = text.upper()
+    if (
+        "INPUTIMAGESENSITIVECONTENTDETECTED" in upper
+        or "PRIVACYINFORMATION" in upper
+        or "MAY CONTAIN REAL PERSON" in upper
+    ):
+        return (
+            "参考素材被 Seedance 内容安全策略拦截：检测到画面可能包含真人身份或隐私信息。\n\n"
+            "Seedance 会把参考视频抽帧后按“input image”检查，因此即使上游错误写的是输入图片，"
+            "也可能是由真人参考视频触发。这说明素材已成功传到上游，不是接口未联通。\n\n"
+            "请移除或更换含真人的参考视频/图片，改用不含可识别真人的动画、CGI 或其他合规素材后重试。"
+        )
     if "INPUTVIDEOSENSITIVECONTENTDETECTED" in upper:
         marker_match = re.search(r"content\[\d+\]", text, re.I)
         marker = marker_match.group(0) if marker_match else "参考视频"
@@ -13641,7 +13722,11 @@ async def canvas_video(payload: CanvasVideoRequest):
             task_id = extract_task_id(raw) or raw.get("task_id") or raw.get("id")
             result = raw
             if task_id and not video_output_urls(raw):
-                result = await wait_for_video_task(client, provider, task_id, submit_url)
+                try:
+                    result = await wait_for_video_task(client, provider, task_id, submit_url)
+                except Exception as exc:
+                    setattr(exc, "upstream_task_id", str(task_id))
+                    raise
             raise_for_video_response_error(result)
             urls = video_output_urls(result)
             if not urls:
@@ -13703,19 +13788,79 @@ async def canvas_video(payload: CanvasVideoRequest):
             )
             raise HTTPException(status_code=exc.response.status_code, detail=hint) from exc
         if "inputimagesensitivecontentdetected" in text.lower() or "privacyinformation" in text.lower() or "may contain real person" in text.lower():
-            hint = (
-                f"上游「{provider_name}」拦截了输入参考图，原因是图片里可能包含真人身份/隐私信息。\n\n"
-                f"这不是代码协议错误，而是火山视频模型的内容安全策略。\n\n"
-                f"建议你这样处理：\n"
-                f"  1. 改用非真人参考图，例如插画、AI 头像、商品图、场景图；\n"
-                f"  2. 先把真人脸做模糊、遮挡、裁掉，或转成明显的二次元/插画风；\n"
-                f"  3. 如果只是想做文生视频，先去掉参考图只保留文字提示词测试。"
-            )
-            raise HTTPException(status_code=exc.response.status_code, detail=hint) from exc
+            raise HTTPException(
+                status_code=exc.response.status_code,
+                detail=humanize_video_task_failure(text),
+            ) from exc
         raise HTTPException(status_code=exc.response.status_code, detail=f"上游视频接口错误：{text}") from exc
     except httpx.HTTPError as exc:
         log_net_error(f"视频 网络/TLS错误 provider={provider.get('id')} model={payload.model}", exc)
         raise HTTPException(status_code=502, detail=f"请求上游视频接口失败：{exc}") from exc
+
+async def run_canvas_video_task(task_id: str, payload: CanvasVideoRequest):
+    """Run a long video request independently from the browser polling connection."""
+    with CANVAS_TASK_LOCK:
+        if task_id in CANVAS_TASKS:
+            CANVAS_TASKS[task_id]["status"] = "running"
+            CANVAS_TASKS[task_id]["updated_at"] = time.time()
+    try:
+        result = await canvas_video(payload)
+        upstream_task_id = ""
+        if isinstance(result, dict):
+            upstream_task_id = str(result.get("task_id") or "")
+        with CANVAS_TASK_LOCK:
+            task = CANVAS_TASKS.get(task_id)
+            if task is not None:
+                task.update({
+                    "status": "succeeded",
+                    "result": result,
+                    "error": "",
+                    "upstream_task_id": upstream_task_id,
+                    "updated_at": time.time(),
+                })
+    except Exception as exc:
+        detail = getattr(exc, "detail", None) or str(exc)
+        status_code = getattr(exc, "status_code", 500)
+        upstream_task_id = getattr(exc, "upstream_task_id", "") or extract_task_id_from_text(detail)
+        with CANVAS_TASK_LOCK:
+            task = CANVAS_TASKS.get(task_id)
+            if task is not None:
+                task.update({
+                    "status": "failed",
+                    "error": str(detail),
+                    "status_code": status_code,
+                    "upstream_task_id": str(upstream_task_id or ""),
+                    "updated_at": time.time(),
+                })
+
+
+@app.post("/api/canvas-video-tasks")
+async def create_canvas_video_task(payload: CanvasVideoRequest):
+    task_id = f"canvas_video_{uuid.uuid4().hex}"
+    with CANVAS_TASK_LOCK:
+        CANVAS_TASKS[task_id] = {
+            "id": task_id,
+            "type": "video",
+            "status": "queued",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "result": None,
+            "error": "",
+            "provider_id": payload.provider_id,
+            "model": payload.model,
+        }
+    asyncio.create_task(run_canvas_video_task(task_id, payload))
+    return {"task_id": task_id, "status": "queued"}
+
+
+@app.get("/api/canvas-video-tasks/{task_id}")
+async def get_canvas_video_task(task_id: str):
+    with CANVAS_TASK_LOCK:
+        task = dict(CANVAS_TASKS.get(task_id) or {})
+    if not task or task.get("type") != "video":
+        raise HTTPException(status_code=404, detail="视频任务不存在，可能服务已重启或任务已过期。")
+    return task
+
 
 # --- Canvas LLM ---
 

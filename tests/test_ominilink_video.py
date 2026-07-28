@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import tempfile
@@ -177,6 +178,45 @@ class OminiLinkVideoRequestTests(unittest.IsolatedAsyncioTestCase):
             {"type": "text", "text": "move"},
             {"type": "image", "data": "aGVsbG8=", "mime_type": "image/png"},
         ])
+
+    async def test_multiple_images_are_forwarded_without_a_local_count_limit(self):
+        references = [
+            main.AIReference(url=f"data:image/png;base64,{base64.b64encode(str(index).encode()).decode()}")
+            for index in range(12)
+        ]
+        payload = main.CanvasVideoRequest(
+            prompt="keep every reference", model="gemini-omni-flash-preview",
+            images=references,
+        )
+
+        body = await main.build_ominilink_omni_request(payload)
+
+        self.assertEqual(
+            body["generation_config"]["video_config"]["task"],
+            "reference_to_video",
+        )
+        image_items = [
+            item for item in body["input"][0]["content"]
+            if item.get("type") == "image"
+        ]
+        self.assertEqual(len(image_items), 12)
+        self.assertEqual(
+            [item["data"] for item in image_items],
+            [base64.b64encode(str(index).encode()).decode() for index in range(12)],
+        )
+
+    async def test_long_prompt_is_forwarded_without_a_local_character_limit(self):
+        prompt = "长" * 5001
+        payload = main.CanvasVideoRequest(
+            prompt=prompt, model="gemini-omni-flash-preview",
+        )
+
+        body = await main.build_ominilink_omni_request(payload)
+
+        self.assertEqual(body["input"][0]["content"][0], {
+            "type": "text",
+            "text": prompt,
+        })
 
     async def test_image_to_video_rejects_invalid_base64_locally(self):
         for reference_url in (
@@ -464,16 +504,6 @@ class OminiLinkVideoRequestTests(unittest.IsolatedAsyncioTestCase):
                     prompt="x", model="gemini-omni-flash-preview", duration=11,
                 ),
                 "3 到 10",
-            ),
-            (
-                main.CanvasVideoRequest(
-                    prompt="x", model="gemini-omni-flash-preview",
-                    images=[
-                        main.AIReference(url="data:image/png;base64,YQ=="),
-                        main.AIReference(url="data:image/png;base64,Yg=="),
-                    ],
-                ),
-                "只支持一张参考图",
             ),
             (
                 main.CanvasVideoRequest(

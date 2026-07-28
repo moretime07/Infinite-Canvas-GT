@@ -110,5 +110,51 @@ class CanvasOutputExportTests(unittest.TestCase):
         self.assertNotIn("Authorization", unrelated_headers)
 
 
+class SaveRemoteVideoTests(unittest.IsolatedAsyncioTestCase):
+    async def test_openrouter_video_download_uses_configured_authorization(self):
+        captured = {}
+
+        class FakeResponse:
+            headers = {"Content-Type": "video/mp4"}
+            content = b"\x00\x00\x00\x20ftypisomtest-video"
+
+            def raise_for_status(self):
+                return None
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                captured["headers"] = dict(kwargs.get("headers") or {})
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url):
+                captured["url"] = url
+                return FakeResponse()
+
+        url = "https://openrouter.ai/api/v1/videos/task-id/content?index=0"
+        saved_url = ""
+        with patch.object(
+            main,
+            "remote_media_request_headers",
+            return_value={"Authorization": "Bearer test-openrouter-key"},
+        ), patch.object(main.httpx, "AsyncClient", FakeClient):
+            saved_url = await main.save_remote_video_to_output(url, prefix="auth_test_")
+
+        try:
+            self.assertEqual(captured["url"], url)
+            self.assertEqual(captured["headers"].get("Authorization"), "Bearer test-openrouter-key")
+            self.assertTrue(saved_url.startswith("/assets/output/auth_test_"))
+            saved_path = main.output_file_from_url(saved_url)
+            self.assertTrue(saved_path and os.path.isfile(saved_path))
+        finally:
+            saved_path = main.output_file_from_url(saved_url)
+            if saved_path and os.path.isfile(saved_path):
+                os.remove(saved_path)
+
+
 if __name__ == "__main__":
     unittest.main()

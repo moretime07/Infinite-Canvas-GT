@@ -979,12 +979,28 @@ function normalizeRhWorkflowConfig(config, entry){
 }
 function normalizeRhAppConfig(entry){
     const appId = String(entry?.appId || entry?.id || '').trim();
+    const raw = entry?.raw || {};
+    const savedFields = (Array.isArray(entry?.fields) ? entry.fields : []).map(normalizeRhWorkflowField);
+    const rawFields = rhAppFieldSourceList(raw).map(normalizeFetchedRhAppField);
+    const savedByKey = new Map(savedFields.map(field => [rhWorkflowFieldKey(field), field]));
+    const rawKeys = new Set(rawFields.map(rhWorkflowFieldKey));
+    const fields = rawFields.length ? [
+        ...rawFields.map(rawField => {
+            const saved = savedByKey.get(rhWorkflowFieldKey(rawField));
+            if(!saved) return rawField;
+            const options = rawField.options?.length ? rawField.options : saved.options;
+            let fieldValue = saved.fieldValue;
+            if(options?.length && !options.includes(String(fieldValue))) fieldValue = options.includes(String(rawField.fieldValue)) ? rawField.fieldValue : options[0];
+            return normalizeRhWorkflowField({...rawField, ...saved, options, fieldValue});
+        }),
+        ...savedFields.filter(field => !rawKeys.has(rhWorkflowFieldKey(field))),
+    ] : savedFields;
     return {
         appId,
         title:String(entry?.title || `AI 应用 ${appId.slice(-6)}` || appId),
         description:String(entry?.note || ''),
-        fields:(Array.isArray(entry?.fields) ? entry.fields : []).map(normalizeRhWorkflowField),
-        raw:entry?.raw || {}
+        fields,
+        raw
     };
 }
 function applyRhImageSlotDefaults(config){
@@ -1036,7 +1052,8 @@ function normalizeFetchedRhAppField(field, index=0){
     if(value === undefined) value = field?.default;
     if(value === undefined || value === null) value = '';
     if(typeof value === 'object') value = JSON.stringify(value);
-    const options = extractRhEditorFieldOptions(field);
+    const declaredType = String(field?.fieldType || field?.type || field?.valueType || '').toUpperCase();
+    const options = ['IMAGE','VIDEO','AUDIO'].includes(declaredType) ? [] : extractRhEditorFieldOptions(field);
     return normalizeRhWorkflowField({
         id:field?.id || `${nodeId}::${name}`,
         nodeId,
@@ -1055,8 +1072,13 @@ function normalizeFetchedRhAppField(field, index=0){
 }
 function extractRhEditorFieldOptions(field){
     const candidates = [field?.options, field?.optionList, field?.values, field?.enum, field?.choices, field?.items, field?.list, field?.selectOptions, field?.fieldData];
-    for(const candidate of candidates){
+    for(let candidate of candidates){
+        if(typeof candidate === 'string'){
+            try { candidate = JSON.parse(candidate); } catch(_) { continue; }
+        }
         if(!Array.isArray(candidate) || !candidate.length) continue;
+        // RunningHub encodes LIST metadata as: [["option-a", "option-b"], {"default":"option-a"}].
+        if(Array.isArray(candidate[0])) candidate = candidate[0];
         return candidate.map(item => {
             if(item && typeof item === 'object') return item.value ?? item.label ?? item.name ?? item.title;
             return item;

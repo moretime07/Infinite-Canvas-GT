@@ -491,7 +491,13 @@ sandbox.CANVAS_REFERENCE_IMAGE_MAX = 8;
             sandbox.requestBodies.push(payload);
             return {task_id:'task-1'};
         };
+        sandbox.createCanvasVideoTask = async payload => {
+            sandbox.networkCalls += 1;
+            sandbox.requestBodies.push(payload);
+            return {task_id:'task-1', status:'queued'};
+        };
         sandbox.waitCanvasImageTaskResult = async () => ({images:['/output/image.png']});
+        sandbox.waitCanvasVideoTaskResult = async () => ({videos:['/output/video.mp4']});
         sandbox.showErrorModal = message => sandbox.runErrors.push(String(message));
         sandbox.alert = message => sandbox.runErrors.push(String(message));
         let thrown = '';
@@ -611,7 +617,7 @@ sandbox.CANVAS_REFERENCE_IMAGE_MAX = 8;
         openSmartCanvasPage:()=>{}, localViewportForCanvas:(_id, value)=>value, resetTransientRunState:()=>{},
         sanitizeConnections:()=>{}, pruneMissingComfyWorkflows:()=>{}, refreshMissingCanvasAssets:async()=>{},
         setCanvasMode:()=>{}, renderCanvasList:()=>{}, render:()=>lifecycleSandbox.events.push('render'),
-        resumeCanvasImageTasks:()=>{}, startCanvasRemotePolling:()=>{}, setStatus:value=>lifecycleSandbox.events.push(value),
+        resumeCanvasImageTasks:()=>{}, resumeCanvasVideoTasks:()=>{}, resumeRunningHubTasks:()=>{}, startCanvasRemotePolling:()=>{}, setStatus:value=>lifecycleSandbox.events.push(value),
         syncFollowingDefaultCanvasNodes:()=>{ lifecycleSandbox.syncCalls += 1; lifecycleSandbox.events.push('sync'); return lifecycleSandbox.syncChanged; },
         scheduleSave:()=>{ lifecycleSandbox.saveCalls += 1; lifecycleSandbox.events.push(`save:${lifecycleSandbox.applyingRemoteCanvas}`); },
         currentCanvasTitle:null, currentCanvasTime:null, formatCanvasTime:()=>'', setTimeout:()=>1, clearTimeout:()=>{},

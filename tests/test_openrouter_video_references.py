@@ -160,6 +160,29 @@ class OpenRouterVideoReferenceTests(unittest.TestCase):
         self.assertIn("content[2]", detail)
         self.assertNotIn("没有返回视频", detail)
 
+    def test_real_person_privacy_error_mentions_video_frame_scanning(self):
+        raw = {
+            "error": {
+                "message": (
+                    'HTTP 400: {"error":{"code":"InputImageSensitiveContentDetected.PrivacyInformation",'
+                    '"message":"The request failed because the input image may contain real person.",'
+                    '"type":"BadRequest"}}'
+                ),
+                "code": 400,
+            }
+        }
+
+        with self.assertRaises(HTTPException) as ctx:
+            main.raise_for_video_response_error(raw)
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        detail = str(ctx.exception.detail)
+        self.assertIn("真人", detail)
+        self.assertIn("参考视频", detail)
+        self.assertIn("抽帧", detail)
+        self.assertIn("不是接口未联通", detail)
+        self.assertNotIn("视频生成任务失败：HTTP 400", detail)
+
     def test_success_payload_is_not_mistaken_for_an_error(self):
         main.raise_for_video_response_error({"id": "job-1", "status": "pending"})
 

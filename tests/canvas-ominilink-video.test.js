@@ -92,6 +92,7 @@ vm.runInContext([
     productionFunction('omniFlashSafePublicHttpsUri'),
     productionFunction('omniFlashCanonicalMediaRef'),
     productionFunction('omniFlashVideoValidationError'),
+    productionFunction('createCanvasVideoTask'),
     productionFunction('runVideoNode'),
     'this.controls = {isOminiLinkProvider, omniFlashSafePublicHttpsUri, omniFlashCanonicalMediaRef, omniFlashVideoValidationError, videoProviderOptions, videoModelOptions, runVideoNode};'
 ].join('\n'), sandbox);
@@ -134,6 +135,15 @@ assert.equal(canonicalRef.originalLocalUrl, 'data:video/mp4;base64,YQ==');
 
 assert.match(controls.videoProviderOptions('orange'), /value="orange"/);
 assert.match(controls.videoModelOptions('gemini-omni-flash-preview', 'orange'), /value="gemini-omni-flash-preview"/);
+assert.equal(
+    controls.omniFlashVideoValidationError(
+        {model:'gemini-omni-flash-preview', duration:6},
+        Array.from({length:12}, (_, index) => ({kind:'image', url:`/assets/input/${index}.png`})),
+        orangeProvider
+    ),
+    '',
+    'the canvas must not impose its own reference-image count limit'
+);
 
 async function runCase({providerId='orange', duration=6, refs=[], manualVideo='', cascade=false}){
     const node = {
@@ -154,7 +164,7 @@ async function runCase({providerId='orange', duration=6, refs=[], manualVideo=''
 (async () => {
     const valid = await runCase({duration:'6'});
     assert.equal(valid.fetchCalls.length, 1, 'valid OminiLink input must reach the real task fetch boundary once');
-    assert.equal(valid.fetchCalls[0].url, '/api/canvas-video');
+    assert.equal(valid.fetchCalls[0].url, '/api/canvas-video-tasks');
     assert.equal(valid.fetchCalls[0].body.provider_id, 'orange');
     assert.equal(valid.fetchCalls[0].body.model, 'gemini-omni-flash-preview');
     assert.equal(valid.fetchCalls[0].body.duration, 6, 'the serialized duration must be normalized once');
@@ -194,7 +204,6 @@ async function runCase({providerId='orange', duration=6, refs=[], manualVideo=''
         ['audio reference', {refs:[{kind:'audio', url:'/assets/input/audio.mp3'}]}, /\u4e0d\u652f\u6301\u97f3\u9891/],
         ['mixed image and video', {refs:[{kind:'image', url:'/assets/input/image.png'}, {kind:'video', url:'/assets/input/video.mp4'}]}, /\u4e0d\u80fd\u540c\u65f6/],
         ['image plus manual video', {refs:[{kind:'image', url:'/assets/input/image.png'}], manualVideo:'https://cdn.example.test/input.mp4'}, /\u4e0d\u80fd\u540c\u65f6/],
-        ['two images', {refs:[{kind:'image', url:'/assets/input/one.png'}, {kind:'image', url:'/assets/input/two.png'}]}, /\u53ea\u652f\u6301\u4e00\u5f20\u53c2\u8003\u56fe/],
         ['two videos', {refs:[{kind:'video', url:'/assets/input/one.mp4'}, {kind:'video', url:'/assets/input/two.mp4'}]}, /\u53ea\u652f\u6301\u4e00\u4e2a\u53c2\u8003\u89c6\u9891/]
     ];
     for(const [name, input, expected] of invalidCases){
@@ -208,7 +217,7 @@ async function runCase({providerId='orange', duration=6, refs=[], manualVideo=''
     assert.match(cascade.thrown, /\u89c6\u9891\u65f6\u957f.*3.*10/);
 
     const runVideoNode = productionFunction('runVideoNode');
-    assert.match(runVideoNode, /cascadeFetch\('\/api\/canvas-video',[\s\S]*body:JSON\.stringify\(requestPayload\)/, 'the validated canonical payload must be handed directly to the committed video endpoint');
-    assert.ok(runVideoNode.indexOf('omniFlashVideoValidationError(') < runVideoNode.indexOf("cascadeFetch('/api/canvas-video'"));
+    assert.match(runVideoNode, /createCanvasVideoTask\(requestPayload/, 'the validated canonical payload must be handed directly to the committed video task endpoint');
+    assert.ok(runVideoNode.indexOf('omniFlashVideoValidationError(') < runVideoNode.indexOf('createCanvasVideoTask(requestPayload'));
     console.log('canvas OminiLink Omni Flash tests passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });
