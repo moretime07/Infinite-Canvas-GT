@@ -2,9 +2,11 @@ import hashlib
 import importlib
 import marshal
 import os
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -14,6 +16,23 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from motion_extractor import models
+
+
+class ContentionProbeRLock:
+    """Report real lock contention without relying on scheduler timing."""
+
+    def __init__(self, observations):
+        self._lock = threading.RLock()
+        self._observations = observations
+
+    def __enter__(self):
+        if not self._lock.acquire(blocking=False):
+            self._observations.put(("waiting", threading.current_thread().name))
+            self._lock.acquire()
+        return self
+
+    def __exit__(self, _error_type, _error, _traceback):
+        self._lock.release()
 
 
 class MotionModelCacheTests(unittest.TestCase):
@@ -402,6 +421,108 @@ class MotionModelCacheTests(unittest.TestCase):
             with self.assertRaises(models.MotionSourceError):
                 with models.verified_source_imports(self.cache_root, assets):
                     (checkout / "injected.py").write_text("VALUE = 'injected'\n", encoding="utf-8")
+
+    def run_overlapping_import_contexts(self, first_raises):
+        source, checkout, _module_name, _module_path, git_run = self.make_source_fixture(
+            "thread-error" if first_raises else "thread-success"
+        )
+        assets = {source.name: checkout}
+        prior_path = [str(Path(self.temp_dir.name) / "path-sentinel"), *sys.path]
+        prior_dont_write_bytecode = False
+        prior_pycache_prefix = str(Path(self.temp_dir.name) / "prior-bytecode")
+        sys.path[:] = prior_path
+        sys.dont_write_bytecode = prior_dont_write_bytecode
+        sys.pycache_prefix = prior_pycache_prefix
+
+        observations = queue.Queue()
+        worker_errors = queue.Queue()
+        first_inside = threading.Event()
+        second_inside = threading.Event()
+        release_first = threading.Event()
+        overlap_barrier = threading.Barrier(2)
+        probe_lock = ContentionProbeRLock(observations)
+
+        def first_worker():
+            try:
+                with models.verified_source_imports(self.cache_root, assets):
+                    first_inside.set()
+                    overlap_barrier.wait(timeout=5)
+                    if not release_first.wait(timeout=5):
+                        raise AssertionError("test did not release the first import context")
+                    if first_raises:
+                        raise RuntimeError("processor failed")
+            except RuntimeError as error:
+                if not first_raises or str(error) != "processor failed":
+                    worker_errors.put(error)
+            except BaseException as error:
+                worker_errors.put(error)
+
+        def second_worker():
+            try:
+                if not first_inside.wait(timeout=5):
+                    raise AssertionError("first import context did not enter")
+                overlap_barrier.wait(timeout=5)
+                with models.verified_source_imports(self.cache_root, assets):
+                    second_inside.set()
+                    observations.put(("entered", threading.current_thread().name))
+                    self.assertEqual(sys.path[0], str(checkout))
+                    self.assertTrue(sys.dont_write_bytecode)
+                    self.assertIsNone(sys.pycache_prefix)
+            except BaseException as error:
+                worker_errors.put(error)
+
+        with patch.object(models, "GIT_SOURCES", (source,)), patch.object(
+            models, "_VERIFIED_SOURCE_IMPORT_LOCK", probe_lock, create=True
+        ), patch.object(models.subprocess, "run", side_effect=git_run):
+            first = threading.Thread(target=first_worker, name="first-import")
+            second = threading.Thread(target=second_worker, name="second-import")
+            first.start()
+            second.start()
+            try:
+                self.assertEqual(observations.get(timeout=5), ("waiting", "second-import"))
+                self.assertFalse(second_inside.is_set())
+            finally:
+                release_first.set()
+                first.join(timeout=5)
+                second.join(timeout=5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertTrue(second_inside.is_set())
+        self.assertEqual(observations.get_nowait(), ("entered", "second-import"))
+        self.assertTrue(worker_errors.empty(), list(worker_errors.queue))
+        self.assertEqual(sys.path, prior_path)
+        self.assertEqual(sys.dont_write_bytecode, prior_dont_write_bytecode)
+        self.assertEqual(sys.pycache_prefix, prior_pycache_prefix)
+
+    def test_verified_source_imports_serialize_overlapping_success_contexts(self):
+        self.run_overlapping_import_contexts(first_raises=False)
+
+    def test_verified_source_imports_serialize_when_a_processor_raises(self):
+        self.run_overlapping_import_contexts(first_raises=True)
+
+    def test_verified_source_imports_support_nested_same_thread_reentry(self):
+        source, checkout, _module_name, _module_path, git_run = self.make_source_fixture("nested")
+        assets = {source.name: checkout}
+        prior_path = sys.path.copy()
+        prior_dont_write_bytecode = sys.dont_write_bytecode
+        prior_pycache_prefix = sys.pycache_prefix
+
+        with patch.object(models, "GIT_SOURCES", (source,)), patch.object(
+            models.subprocess, "run", side_effect=git_run
+        ):
+            with models.verified_source_imports(self.cache_root, assets):
+                with models.verified_source_imports(self.cache_root, assets):
+                    self.assertEqual(sys.path[0], str(checkout))
+                    self.assertTrue(sys.dont_write_bytecode)
+                    self.assertIsNone(sys.pycache_prefix)
+                self.assertEqual(sys.path[0], str(checkout))
+                self.assertTrue(sys.dont_write_bytecode)
+                self.assertIsNone(sys.pycache_prefix)
+
+        self.assertEqual(sys.path, prior_path)
+        self.assertEqual(sys.dont_write_bytecode, prior_dont_write_bytecode)
+        self.assertEqual(sys.pycache_prefix, prior_pycache_prefix)
 
     def test_rejects_forged_valid_header_bytecode_inside_checkout(self):
         source, checkout, _module_name, module_path, git_run = self.make_source_fixture("inside-forgery")

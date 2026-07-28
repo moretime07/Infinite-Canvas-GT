@@ -8,6 +8,7 @@ import importlib.util
 import os
 import subprocess
 import sys
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -114,6 +115,7 @@ _PACKAGE_MODULES = {
     "tqdm": "tqdm",
 }
 _HASH_CHUNK_SIZE = 1024 * 1024
+_VERIFIED_SOURCE_IMPORT_LOCK = threading.RLock()
 
 
 def _model_directory(cache_root: Path) -> Path:
@@ -312,24 +314,25 @@ def verified_source_imports(
     assets: Mapping[str, Path],
 ) -> Iterator[None]:
     """Temporarily expose pinned sources without reading or writing bytecode caches."""
-    verified_checkouts = _verified_source_checkouts(cache_root, assets)
-    prior_path = sys.path.copy()
-    prior_dont_write_bytecode = sys.dont_write_bytecode
-    prior_pycache_prefix = sys.pycache_prefix
-    checkout_paths = [str(checkout.resolve()) for _source, checkout in verified_checkouts]
-    try:
-        sys.path[:] = checkout_paths + [path for path in prior_path if path not in checkout_paths]
-        sys.dont_write_bytecode = True
-        sys.pycache_prefix = None
-        importlib.invalidate_caches()
-        yield
-    finally:
-        sys.path[:] = prior_path
-        sys.dont_write_bytecode = prior_dont_write_bytecode
-        sys.pycache_prefix = prior_pycache_prefix
-        importlib.invalidate_caches()
-        for source, checkout in verified_checkouts:
-            verify_source_checkout(checkout, source, _source_directory(cache_root))
+    with _VERIFIED_SOURCE_IMPORT_LOCK:
+        verified_checkouts = _verified_source_checkouts(cache_root, assets)
+        prior_path = sys.path.copy()
+        prior_dont_write_bytecode = sys.dont_write_bytecode
+        prior_pycache_prefix = sys.pycache_prefix
+        checkout_paths = [str(checkout.resolve()) for _source, checkout in verified_checkouts]
+        try:
+            sys.path[:] = checkout_paths + [path for path in prior_path if path not in checkout_paths]
+            sys.dont_write_bytecode = True
+            sys.pycache_prefix = None
+            importlib.invalidate_caches()
+            yield
+        finally:
+            sys.path[:] = prior_path
+            sys.dont_write_bytecode = prior_dont_write_bytecode
+            sys.pycache_prefix = prior_pycache_prefix
+            importlib.invalidate_caches()
+            for source, checkout in verified_checkouts:
+                verify_source_checkout(checkout, source, _source_directory(cache_root))
 
 
 def inspect_motion_runtime(cache_root: Path) -> MotionRuntimeStatus:
