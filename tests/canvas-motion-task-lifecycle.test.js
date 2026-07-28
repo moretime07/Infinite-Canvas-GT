@@ -5,6 +5,10 @@ const vm = require('node:vm');
 
 ;(async () => {
 const source = fs.readFileSync(path.resolve(__dirname, '..', 'static', 'js', 'canvas.js'), 'utf8');
+const TASK_ONE = 'canvas_motion_11111111111111111111111111111111';
+const TASK_OLD = 'canvas_motion_22222222222222222222222222222222';
+const TASK_SAVED = 'canvas_motion_33333333333333333333333333333333';
+const TASK_NEW = 'canvas_motion_44444444444444444444444444444444';
 
 function productionFunction(name){
     const match = new RegExp(`(?:async )?function ${name}\\(`).exec(source);
@@ -39,8 +43,14 @@ function lifecycleContext({nodes, fetch, saves}={}){
     };
     vm.createContext(context);
     const names = [
+        'motionTaskIdIsSafe',
         'motionTaskIsTerminal',
         'motionTaskIsPolling',
+        'motionTaskStateIsKnown',
+        'motionTaskSafeState',
+        'motionTaskSafeStage',
+        'motionTaskSafeBranchState',
+        'motionTaskCanTransition',
         'motionTaskSafeUrl',
         'motionTaskSafeMessage',
         'motionTaskNode',
@@ -76,7 +86,7 @@ function motionNode(overrides={}){
     const requests = [];
     const context = lifecycleContext({nodes:[node], saves, fetch:async (url, options) => {
         requests.push({url, options});
-        return response(true, {task_id:'task-1', state:'queued', stage:'queued', progress:0, queue_position:2, depth_state:'pending', pose_state:'pending', warnings:[]});
+        return response(true, {task_id:TASK_ONE, state:'queued', stage:'queued', progress:0, queue_position:2, depth_state:'pending', pose_state:'pending', warnings:[]});
     }});
     await context.createCanvasMotionTask(node, '/assets/input/clip.mp4');
     const body = JSON.parse(requests[0].options.body);
@@ -103,9 +113,9 @@ function motionNode(overrides={}){
 // Break caught: a lower-progress queued response or an omitted queue position would make the visible task status move backwards or lose its queue placement.
 {
     const saves = {count:0};
-    const node = motionNode({motionTaskId:'task-1', motionRunToken:1, motionState:'queued', motionProgress:42, motionQueuePosition:3});
+    const node = motionNode({motionTaskId:TASK_ONE, motionRunToken:1, motionState:'queued', motionProgress:42, motionQueuePosition:3});
     const context = lifecycleContext({nodes:[node], saves, fetch:async () => response(true, {})});
-    context.applyCanvasMotionTask(node, {task_id:'task-1', state:'queued', stage:'queued', progress:12, queue_position:2, depth_state:'pending', pose_state:'pending', warnings:[]});
+    context.applyCanvasMotionTask(node, {task_id:TASK_ONE, state:'queued', stage:'queued', progress:12, queue_position:2, depth_state:'pending', pose_state:'pending', warnings:[]});
     assert.equal(node.motionProgress, 42);
     assert.equal(node.motionQueuePosition, 2);
     assert.equal(node.motionState, 'queued');
@@ -115,10 +125,10 @@ function motionNode(overrides={}){
 // Break caught: partial results must keep the successful branch usable while retaining the failed branch's error instead of treating both as one outcome.
 {
     const saves = {count:0};
-    const node = motionNode({motionTaskId:'task-1', motionRunToken:1});
+    const node = motionNode({motionTaskId:TASK_ONE, motionRunToken:1});
     const context = lifecycleContext({nodes:[node], saves, fetch:async () => response(true, {})});
     context.applyCanvasMotionTask(node, {
-        task_id:'task-1', state:'partial', stage:'publishing', progress:100,
+        task_id:TASK_ONE, state:'partial', stage:'publishing', progress:100,
         depth_state:'completed', depth_url:'/assets/output/motion/depth.mp4', depth_error:null,
         pose_state:'failed', pose_url:null, pose_error:'No person found', warnings:['Pose is black'],
     });
@@ -133,10 +143,10 @@ function motionNode(overrides={}){
 // Break caught: completed task branches are independently mapped; depth must never overwrite a separate pose output.
 {
     const saves = {count:0};
-    const node = motionNode({motionTaskId:'task-1', motionRunToken:1});
+    const node = motionNode({motionTaskId:TASK_ONE, motionRunToken:1});
     const context = lifecycleContext({nodes:[node], saves, fetch:async () => response(true, {})});
     context.applyCanvasMotionTask(node, {
-        task_id:'task-1', state:'completed', stage:'completed', progress:100,
+        task_id:TASK_ONE, state:'completed', stage:'completed', progress:100,
         depth_state:'completed', depth_url:'/assets/output/motion/depth.mp4',
         pose_state:'completed', pose_url:'/assets/output/motion/pose.mp4', warnings:[],
     });
@@ -148,19 +158,19 @@ function motionNode(overrides={}){
 // Break caught: cancelling must invalidate an in-flight poll and call the task-specific cancel route.
 {
     const saves = {count:0};
-    const node = motionNode({motionTaskId:'task-old', motionRunToken:1, motionState:'running'});
+    const node = motionNode({motionTaskId:TASK_OLD, motionRunToken:1, motionState:'running'});
     let resolvePoll;
     const requests = [];
     const context = lifecycleContext({nodes:[node], saves, fetch:(url, options={}) => {
         requests.push({url, options});
-        if(url.endsWith('/cancel')) return Promise.resolve(response(true, {task_id:'task-old', state:'cancelled', stage:'cancelled', progress:40, depth_state:'cancelled', pose_state:'cancelled', warnings:[]}));
-        return new Promise(resolve => { resolvePoll = () => resolve(response(true, {task_id:'task-old', state:'running', stage:'decoding', progress:90, depth_state:'running', pose_state:'pending', warnings:[]})); });
+        if(url.endsWith('/cancel')) return Promise.resolve(response(true, {task_id:TASK_OLD, state:'cancelled', stage:'cancelled', progress:40, depth_state:'cancelled', pose_state:'cancelled', warnings:[]}));
+        return new Promise(resolve => { resolvePoll = () => resolve(response(true, {task_id:TASK_OLD, state:'running', stage:'decoding', progress:90, depth_state:'running', pose_state:'pending', warnings:[]})); });
     }});
-    const polling = context.pollCanvasMotionTask('motion-1', 'task-old');
+    const polling = context.pollCanvasMotionTask('motion-1', TASK_OLD);
     await context.cancelCanvasMotionTask('motion-1');
     resolvePoll();
     await polling;
-    assert.equal(requests[1].url, '/api/canvas-motion-tasks/task-old/cancel');
+    assert.equal(requests[1].url, `/api/canvas-motion-tasks/${TASK_OLD}/cancel`);
     assert.equal(node.motionState, 'cancelled');
     assert.notEqual(node.motionProgress, 90);
 }
@@ -168,16 +178,16 @@ function motionNode(overrides={}){
 // Break caught: reopening a canvas must recover an existing task by GET polling, never submit a duplicate paid/local job.
 {
     const saves = {count:0};
-    const node = motionNode({motionTaskId:'saved-task', motionRunToken:0, motionState:'running'});
+    const node = motionNode({motionTaskId:TASK_SAVED, motionRunToken:0, motionState:'running'});
     const requests = [];
     const context = lifecycleContext({nodes:[node], saves, fetch:async (url, options={}) => {
         requests.push({url, options});
-        return response(true, {task_id:'saved-task', state:'completed', stage:'completed', progress:100, depth_state:'completed', depth_url:'/assets/output/motion/depth.mp4', pose_state:'disabled', warnings:[]});
+        return response(true, {task_id:TASK_SAVED, state:'completed', stage:'completed', progress:100, depth_state:'completed', depth_url:'/assets/output/motion/depth.mp4', pose_state:'disabled', warnings:[]});
     }});
     context.resumePendingCanvasMotionTasks();
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(requests.length, 1);
-    assert.equal(requests[0].url, '/api/canvas-motion-tasks/saved-task');
+    assert.equal(requests[0].url, `/api/canvas-motion-tasks/${TASK_SAVED}`);
     assert.equal(requests[0].options.method, undefined);
     assert.equal(node.motionState, 'completed');
 }
@@ -185,19 +195,19 @@ function motionNode(overrides={}){
 // Break caught: a late response for a pre-retry task must not overwrite the newly created task's terminal state.
 {
     const saves = {count:0};
-    const node = motionNode({motionTaskId:'old-task', motionRunToken:1, motionState:'running'});
+    const node = motionNode({motionTaskId:TASK_OLD, motionRunToken:1, motionState:'running'});
     let resolveOld;
     const context = lifecycleContext({nodes:[node], saves, fetch:(url) => {
-        if(url.endsWith('/old-task')) return new Promise(resolve => { resolveOld = () => resolve(response(true, {task_id:'old-task', state:'failed', stage:'failed', progress:100, depth_state:'failed', depth_error:'old failure', pose_state:'failed', warnings:[]})); });
-        return Promise.resolve(response(true, {task_id:'new-task', state:'completed', stage:'completed', progress:100, depth_state:'completed', depth_url:'/assets/output/motion/new-depth.mp4', pose_state:'disabled', warnings:[]}));
+        if(url.endsWith(`/${TASK_OLD}`)) return new Promise(resolve => { resolveOld = () => resolve(response(true, {task_id:TASK_OLD, state:'failed', stage:'failed', progress:100, depth_state:'failed', depth_error:'old failure', pose_state:'failed', warnings:[]})); });
+        return Promise.resolve(response(true, {task_id:TASK_NEW, state:'completed', stage:'completed', progress:100, depth_state:'completed', depth_url:'/assets/output/motion/new-depth.mp4', pose_state:'disabled', warnings:[]}));
     }});
-    const oldPoll = context.pollCanvasMotionTask('motion-1', 'old-task');
-    node.motionTaskId = 'new-task';
+    const oldPoll = context.pollCanvasMotionTask('motion-1', TASK_OLD);
+    node.motionTaskId = TASK_NEW;
     node.motionRunToken = 2;
-    await context.pollCanvasMotionTask('motion-1', 'new-task');
+    await context.pollCanvasMotionTask('motion-1', TASK_NEW);
     resolveOld();
     await oldPoll;
-    assert.equal(node.motionTaskId, 'new-task');
+    assert.equal(node.motionTaskId, TASK_NEW);
     assert.equal(node.motionState, 'completed');
     assert.equal(node.depthUrl, '/assets/output/motion/new-depth.mp4');
 }
@@ -205,19 +215,104 @@ function motionNode(overrides={}){
 // Break caught: terminal responses must stop the polling loop and repeated identical responses must not keep saving the canvas.
 {
     const saves = {count:0};
-    const node = motionNode({motionTaskId:'task-1', motionRunToken:1, motionState:'running'});
+    const node = motionNode({motionTaskId:TASK_ONE, motionRunToken:1, motionState:'running'});
     let calls = 0;
-    const completed = {task_id:'task-1', state:'completed', stage:'completed', progress:100, depth_state:'completed', depth_url:'/assets/output/motion/depth.mp4', pose_state:'disabled', warnings:[]};
+    const completed = {task_id:TASK_ONE, state:'completed', stage:'completed', progress:100, depth_state:'completed', depth_url:'/assets/output/motion/depth.mp4', pose_state:'disabled', warnings:[]};
     const context = lifecycleContext({nodes:[node], saves, fetch:async () => { calls += 1; return response(true, completed); }});
-    await context.pollCanvasMotionTask('motion-1', 'task-1');
+    await context.pollCanvasMotionTask('motion-1', TASK_ONE);
     assert.equal(calls, 1);
     const afterTerminalSave = saves.count;
     context.applyCanvasMotionTask(node, completed);
     assert.equal(saves.count, afterTerminalSave);
     const persisted = JSON.stringify(node);
-    assert.match(persisted, /"motionTaskId":"task-1"/);
+    assert.match(persisted, new RegExp(`"motionTaskId":"${TASK_ONE}"`));
     assert.match(persisted, /"depthUrl":"\/assets\/output\/motion\/depth.mp4"/);
     assert.equal(/source_path|C:\\|data:/.test(persisted), false);
+}
+
+// Break caught: a malicious create response cannot turn an arbitrary server string into a persisted task ID or raw diagnostic.
+{
+    const saves = {count:0};
+    const node = motionNode({motionRunToken:1});
+    const badTaskId = 'C:\\private\\canvas_motion_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const context = lifecycleContext({nodes:[node], saves, fetch:async () => response(true, {
+        task_id:badTaskId, state:'running', stage:'C:\\private\\stage', progress:10,
+        depth_state:'running', pose_state:'pending', warnings:['sk-live-unsafe'],
+    })});
+    await assert.rejects(() => context.createCanvasMotionTask(node, '/assets/input/clip.mp4'));
+    assert.equal(node.motionTaskId, '');
+    assert.equal(node.motionState, 'failed');
+    assert.equal(node.motionError, 'Motion task failed');
+    assert.equal(JSON.stringify(node).includes('private'), false);
+    assert.equal(JSON.stringify(node).includes('sk-live'), false);
+}
+
+// Break caught: mismatched IDs and unknown or oversized task metadata must never overwrite a saved run or persist raw backend text.
+{
+    const saves = {count:0};
+    const node = motionNode({motionTaskId:TASK_ONE, motionRunToken:1, motionState:'running', motionStage:'decoding'});
+    const context = lifecycleContext({nodes:[node], saves, fetch:async () => response(true, {})});
+    assert.equal(context.applyCanvasMotionTask(node, {
+        task_id:TASK_NEW, state:'completed', stage:'completed', progress:100,
+        depth_state:'completed', depth_url:'/assets/output/motion/wrong.mp4', pose_state:'disabled', warnings:[],
+    }), false);
+    assert.equal(node.motionTaskId, TASK_ONE);
+    assert.equal(node.motionState, 'running');
+    assert.equal(context.applyCanvasMotionTask(node, {
+        task_id:TASK_ONE, state:'running', stage:'C:\\private\\stage', progress:20,
+        depth_state:'running', pose_state:'pending', warnings:[],
+    }), true);
+    assert.equal(node.motionStage, 'decoding');
+    const rawWarning = 'x'.repeat(1000);
+    context.applyCanvasMotionTask(node, {
+        task_id:TASK_ONE, state:'not-a-state', stage:'C:\\private\\stage', progress:99,
+        depth_state:'not-a-branch', depth_error:'C:\\private\\depth.mp4',
+        pose_state:'not-a-branch', pose_error:rawWarning,
+        warnings:['sk-live-secret', rawWarning], error:'token=unsafe',
+    });
+    assert.equal(node.motionState, 'failed');
+    assert.equal(node.motionStage, 'failed');
+    assert.equal(node.depthState, 'failed');
+    assert.equal(node.poseState, 'failed');
+    assert.equal(node.depthError, 'Motion task failed');
+    assert.equal(node.poseError, 'Motion task failed');
+    assert.deepEqual(JSON.parse(JSON.stringify(node.motionWarnings)), ['Motion task failed', 'Motion task failed']);
+    assert.equal(node.motionError, 'Motion task failed');
+    const persisted = JSON.stringify(node);
+    assert.equal(/private|secret|token=|x{300}/.test(persisted), false);
+}
+
+// Break caught: delayed nonterminal snapshots cannot move a task backwards or resurrect it after a terminal result, and a terminal node never polls again.
+{
+    const saves = {count:0};
+    const node = motionNode({motionTaskId:TASK_ONE, motionRunToken:1, motionState:'queued', motionStage:'queued'});
+    let calls = 0;
+    const context = lifecycleContext({nodes:[node], saves, fetch:async () => { calls += 1; return response(true, {}); }});
+    assert.equal(context.applyCanvasMotionTask(node, {task_id:TASK_ONE, state:'running', stage:'decoding', progress:10, depth_state:'running', pose_state:'pending', warnings:[]}), false);
+    assert.equal(node.motionState, 'queued');
+    assert.equal(context.applyCanvasMotionTask(node, {task_id:TASK_ONE, state:'downloading', stage:'preparing', progress:1, depth_state:'pending', pose_state:'pending', warnings:[]}), true);
+    assert.equal(context.applyCanvasMotionTask(node, {task_id:TASK_ONE, state:'queued', stage:'queued', progress:1, depth_state:'pending', pose_state:'pending', warnings:[]}), false);
+    assert.equal(context.applyCanvasMotionTask(node, {task_id:TASK_ONE, state:'running', stage:'decoding', progress:10, depth_state:'running', pose_state:'pending', warnings:[]}), true);
+    assert.equal(context.applyCanvasMotionTask(node, {task_id:TASK_ONE, state:'downloading', stage:'preparing', progress:10, depth_state:'pending', pose_state:'pending', warnings:[]}), false);
+    assert.equal(context.applyCanvasMotionTask(node, {task_id:TASK_ONE, state:'completed', stage:'completed', progress:100, depth_state:'completed', depth_url:'/assets/output/motion/depth.mp4', pose_state:'disabled', warnings:[]}), true);
+    assert.equal(context.applyCanvasMotionTask(node, {task_id:TASK_ONE, state:'running', stage:'decoding', progress:100, depth_state:'running', pose_state:'pending', warnings:[]}), false);
+    assert.equal(node.motionState, 'completed');
+    assert.equal(await context.pollCanvasMotionTask('motion-1', TASK_ONE), 'completed');
+    assert.equal(calls, 0);
+}
+
+// Break caught: an asset-looking traversal URL is not a public output URL and must be discarded before persistence.
+{
+    const saves = {count:0};
+    const node = motionNode({motionTaskId:TASK_ONE, motionRunToken:1, motionState:'running'});
+    const context = lifecycleContext({nodes:[node], saves, fetch:async () => response(true, {})});
+    context.applyCanvasMotionTask(node, {
+        task_id:TASK_ONE, state:'partial', stage:'partial', progress:100,
+        depth_state:'completed', depth_url:'/assets/../../private/depth.mp4',
+        pose_state:'failed', pose_error:'safe branch failure', warnings:[],
+    });
+    assert.equal(node.depthUrl, '');
+    assert.equal(JSON.stringify(node).includes('private'), false);
 }
 
 console.log('canvas-motion-task-lifecycle: passed');

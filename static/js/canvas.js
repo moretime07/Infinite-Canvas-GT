@@ -2711,16 +2711,31 @@ function resolveMotionInputVideo(node, context={}){
     if(refs.length > 1) return {video:null, error:tr('canvas.motionOnlyOneVideo')};
     return {video:null, error:tr(refs.hasImageInput ? 'canvas.motionImageInputRejected' : 'canvas.motionNeedVideo')};
 }
+function motionTaskIdIsSafe(taskId){ return typeof taskId === 'string' && /^canvas_motion_[a-f0-9]{32}$/.test(taskId); }
 function motionTaskIsTerminal(state){ return ['partial', 'completed', 'failed', 'cancelled'].includes(state); }
 function motionTaskIsPolling(state){ return ['queued', 'downloading', 'running'].includes(state); }
+function motionTaskStateIsKnown(state){ return motionTaskIsPolling(state) || motionTaskIsTerminal(state); }
+function motionTaskSafeState(state){ return motionTaskStateIsKnown(state) ? state : 'failed'; }
+function motionTaskSafeStage(stage, state){
+    const known = ['queued', 'preparing', 'decoding', 'depth', 'pose', 'publishing', 'partial', 'completed', 'failed', 'cancelled'];
+    const fallback = {queued:'queued', downloading:'preparing', running:'decoding', partial:'partial', completed:'completed', failed:'failed', cancelled:'cancelled'};
+    return typeof stage === 'string' && known.includes(stage) ? stage : (fallback[state] || 'failed');
+}
+function motionTaskSafeBranchState(state){ return ['pending', 'running', 'disabled', 'completed', 'failed', 'cancelled'].includes(state) ? state : 'failed'; }
+function motionTaskCanTransition(current, next){
+    if(motionTaskIsTerminal(current)) return current === next;
+    if(motionTaskIsTerminal(next)) return true;
+    if(current === next) return true;
+    return (current === 'queued' && next === 'downloading') || (current === 'downloading' && next === 'running');
+}
 function motionTaskSafeUrl(value){
     const url = typeof value === 'string' ? value : '';
-    return /^\/(?:assets|output)\//.test(url) ? url : '';
+    return url.length <= 512 && /^\/(?:assets|output)\//.test(url) && !url.includes('..') && !url.includes('\\') ? url : '';
 }
 function motionTaskSafeMessage(value){
-    const text = String(value || '').trim();
-    if(!text || /(?:[A-Za-z]:[\\/]|\\\\|\bsk-[A-Za-z0-9_-]+\b|data:|api[_ -]?key|token\s*[=:])/i.test(text)) return tr('canvas.motionFailed');
-    return text.slice(0, 500);
+    const text = typeof value === 'string' ? value.trim() : '';
+    if(!text || text.length > 240 || /(?:[A-Za-z]:[\\/]|\\\\|(?:^|[\s(])\/(?:[\w.-]+\/)*[\w.-]+|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}\b|data:|api[_ -]?key|authorization|bearer|token\s*[=:]|secret|password|credential)/i.test(text)) return tr('canvas.motionFailed');
+    return text;
 }
 function motionTaskNode(nodeId){ return nodes.find(candidate => candidate.id === nodeId && candidate.type === 'motionExtract') || null; }
 function motionTaskPersist(node, before){
@@ -2745,17 +2760,19 @@ function applyCanvasMotionTask(node, payload={}){
         poseState:node.poseState || '', poseUrl:node.poseUrl || '', poseError:node.poseError || '',
         motionWarnings:node.motionWarnings || [], motionError:node.motionError || '',
     });
-    const taskId = typeof payload.task_id === 'string' ? payload.task_id : node.motionTaskId || '';
+    const taskId = payload.task_id;
     const isSameTask = !node.motionTaskId || node.motionTaskId === taskId;
-    if(!taskId || !isSameTask) return false;
-    const state = typeof payload.state === 'string' ? payload.state : node.motionState || 'queued';
+    if(!motionTaskIdIsSafe(taskId) || !isSameTask) return false;
+    const state = motionTaskSafeState(payload.state);
     const isNewTask = node.motionTaskId !== taskId;
+    if(!isNewTask && !motionTaskCanTransition(node.motionState, state)) return false;
     node.motionTaskId = taskId;
     node.motionState = state;
-    node.motionStage = typeof payload.stage === 'string' ? payload.stage : state;
+    node.motionStage = motionTaskSafeStage(payload.stage, state);
     const reportedProgress = Math.max(0, Math.min(100, Number(payload.progress) || 0));
     node.motionProgress = isNewTask ? reportedProgress : Math.max(Number(node.motionProgress) || 0, reportedProgress);
-    node.motionQueuePosition = motionTaskIsPolling(state) ? Math.max(0, Number(payload.queue_position) || 0) : 0;
+    const queuePosition = Number(payload.queue_position);
+    node.motionQueuePosition = motionTaskIsPolling(state) && Number.isSafeInteger(queuePosition) && queuePosition >= 0 && queuePosition <= 9999 ? queuePosition : 0;
     ['depth', 'pose'].forEach(branch => {
         const stateKey = `${branch}_state`;
         const urlKey = `${branch}_url`;
@@ -2763,11 +2780,11 @@ function applyCanvasMotionTask(node, payload={}){
         const nodeState = `${branch}State`;
         const nodeUrl = `${branch}Url`;
         const nodeError = `${branch}Error`;
-        if(typeof payload[stateKey] === 'string') node[nodeState] = payload[stateKey];
+        if(Object.hasOwn(payload, stateKey)) node[nodeState] = motionTaskSafeBranchState(payload[stateKey]);
         if(Object.hasOwn(payload, urlKey) || node[nodeState] !== 'completed') node[nodeUrl] = node[nodeState] === 'completed' ? motionTaskSafeUrl(payload[urlKey]) : '';
         if(Object.hasOwn(payload, errorKey)) node[nodeError] = payload[errorKey] ? motionTaskSafeMessage(payload[errorKey]) : '';
     });
-    if(Array.isArray(payload.warnings)) node.motionWarnings = payload.warnings.filter(Boolean).map(motionTaskSafeMessage).filter(Boolean);
+    if(Array.isArray(payload.warnings)) node.motionWarnings = payload.warnings.slice(0, 10).filter(Boolean).map(motionTaskSafeMessage).filter(Boolean);
     node.motionError = state === 'failed' ? motionTaskSafeMessage(payload.error || payload.message) : '';
     return motionTaskPersist(node, before);
 }
@@ -2790,14 +2807,22 @@ async function createCanvasMotionTask(node, sourceUrl, runToken=node?.motionRunT
         if(JSON.stringify({motionState:node.motionState || '', motionError:node.motionError || ''}) !== before){ render(); scheduleSave(); }
         throw new Error(node.motionError);
     }
-    if(!data?.task_id) throw new Error(tr('canvas.motionFailed'));
-    applyCanvasMotionTask(node, data);
+    if(!motionTaskIdIsSafe(data?.task_id) || !applyCanvasMotionTask(node, data)){
+        const before = JSON.stringify({motionState:node.motionState || '', motionError:node.motionError || ''});
+        node.motionState = 'failed';
+        node.motionStage = 'failed';
+        node.motionError = tr('canvas.motionFailed');
+        if(JSON.stringify({motionState:node.motionState || '', motionError:node.motionError || ''}) !== before){ render(); scheduleSave(); }
+        throw new Error(node.motionError);
+    }
     return data;
 }
 async function pollCanvasMotionTask(nodeId, taskId, runToken=null){
     const node = motionTaskNode(nodeId);
     const token = runToken ?? node?.motionRunToken;
-    if(!node || !taskId || node.motionTaskId !== taskId) return 'stale';
+    if(!node || !motionTaskIdIsSafe(taskId) || node.motionTaskId !== taskId) return 'stale';
+    if(motionTaskIsTerminal(node.motionState)) return node.motionState;
+    if(!motionTaskIsPolling(node.motionState)) return 'stale';
     let attempt = 0;
     while(node.motionRunToken === token && node.motionTaskId === taskId){
         try {
@@ -2805,9 +2830,10 @@ async function pollCanvasMotionTask(nodeId, taskId, runToken=null){
             const data = await res.json().catch(() => ({}));
             if(node.motionRunToken !== token || node.motionTaskId !== taskId) return 'stale';
             if(!res.ok) throw new Error(motionTaskSafeMessage(data?.detail || data?.error || data?.message));
-            applyCanvasMotionTask(node, data);
-            if(motionTaskIsTerminal(data?.state)) return data.state;
-            if(!motionTaskIsPolling(data?.state)) return data?.state || 'unknown';
+            const applied = applyCanvasMotionTask(node, data);
+            if(motionTaskIsTerminal(node.motionState)) return node.motionState;
+            if(!applied && node.motionState !== data?.state) return 'stale';
+            if(!motionTaskIsPolling(node.motionState)) return 'stale';
         } catch(error) {
             if(node.motionRunToken !== token || node.motionTaskId !== taskId) return 'stale';
             const before = JSON.stringify({motionState:node.motionState || '', motionError:node.motionError || ''});
@@ -2824,7 +2850,7 @@ async function pollCanvasMotionTask(nodeId, taskId, runToken=null){
 async function cancelCanvasMotionTask(nodeId){
     const node = motionTaskNode(nodeId);
     const taskId = node?.motionTaskId;
-    if(!node || !taskId || motionTaskIsTerminal(node.motionState)) return false;
+    if(!node || !motionTaskIdIsSafe(taskId) || motionTaskIsTerminal(node.motionState)) return false;
     node.motionRunToken = Number(node.motionRunToken || 0) + 1;
     const token = node.motionRunToken;
     try {
@@ -2832,8 +2858,7 @@ async function cancelCanvasMotionTask(nodeId){
         const data = await res.json().catch(() => ({}));
         if(node.motionRunToken !== token || node.motionTaskId !== taskId) return false;
         if(!res.ok) throw new Error(motionTaskSafeMessage(data?.detail || data?.error || data?.message));
-        applyCanvasMotionTask(node, data);
-        return true;
+        return applyCanvasMotionTask(node, data);
     } catch(error) {
         if(node.motionRunToken !== token || node.motionTaskId !== taskId) return false;
         const before = JSON.stringify({motionState:node.motionState || '', motionError:node.motionError || ''});
@@ -2885,7 +2910,7 @@ async function runMotionExtractNode(nodeId, context={}){
     }
 }
 function resumePendingCanvasMotionTasks(){
-    nodes.filter(node => node?.type === 'motionExtract' && node.motionTaskId && !motionTaskIsTerminal(node.motionState)).forEach(node => {
+    nodes.filter(node => node?.type === 'motionExtract' && motionTaskIdIsSafe(node.motionTaskId) && motionTaskIsPolling(node.motionState)).forEach(node => {
         node.motionRunToken = Number(node.motionRunToken || 0) + 1;
         pollCanvasMotionTask(node.id, node.motionTaskId, node.motionRunToken);
     });
