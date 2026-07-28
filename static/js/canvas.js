@@ -2673,7 +2673,11 @@ function motionLoopItemState(node, context={}){
     const key = `${loop.nodeId}:${index}:${sourceUrl}`;
     if(!node.motionLoopItems || typeof node.motionLoopItems !== 'object') node.motionLoopItems = {};
     if(!node.motionLoopItems[key]){
-        node.motionLoopItems[key] = {key, loopNodeId:loop.nodeId, index, sourceUrl, taskId:'', status:'idle', error:'', depthUrl:'', poseUrl:''};
+        node.motionLoopItems[key] = {
+            key, loopNodeId:loop.nodeId, index, sourceUrl, taskId:'', status:'idle', error:'',
+            depthState:node.depthEnabled === false ? 'disabled' : 'pending', depthUrl:'', depthError:'',
+            poseState:node.poseEnabled === true ? 'pending' : 'disabled', poseUrl:'', poseError:'',
+        };
     }
     return node.motionLoopItems[key];
 }
@@ -2688,8 +2692,12 @@ function snapshotMotionLoopItem(node, item){
     item.taskId = node.motionTaskId || '';
     item.status = node.motionState || 'idle';
     item.error = node.motionError || '';
+    item.depthState = node.depthState || 'pending';
     item.depthUrl = node.depthState === 'completed' ? node.depthUrl || '' : '';
+    item.depthError = node.depthError || '';
+    item.poseState = node.poseState || 'disabled';
     item.poseUrl = node.poseState === 'completed' ? node.poseUrl || '' : '';
+    item.poseError = node.poseError || '';
     return persistMotionLoopItem(node, item);
 }
 function motionCascadeSelectedBranches(node, targetId=''){
@@ -3010,7 +3018,16 @@ function resumePendingCanvasMotionTasks(){
     });
 }
 function startMotionExtract(nodeId){ return runMotionExtractNode(nodeId); }
-function retryMotionExtract(nodeId){ return runMotionExtractNode(nodeId); }
+function retryMotionExtract(nodeId, itemKey=''){
+    const node = motionTaskNode(nodeId);
+    if(!node) return false;
+    const items = node.motionLoopItems && typeof node.motionLoopItems === 'object' ? node.motionLoopItems : {};
+    const item = items[itemKey] || Object.values(items).find(candidate => candidate?.status === 'failed');
+    if(!item || item.status !== 'failed' || !item.loopNodeId || !Number.isInteger(Number(item.index)) || !item.sourceUrl){
+        return runMotionExtractNode(nodeId);
+    }
+    return runMotionExtractNode(nodeId, {loopContext:{nodeId:item.loopNodeId, index:Number(item.index), currentVideoRef:{url:item.sourceUrl}}});
+}
 function cancelMotionExtract(nodeId){ return cancelCanvasMotionTask(nodeId); }
 function addRhNode(point){
     const p = point || defaultPoint(180, 0);
@@ -9034,9 +9051,10 @@ function renderMotionExtractBody(node){
         ? `<div class="motion-source-card">${canvasVideoPreviewHtml(sourceDisplay.url, 480, 'data-video-fallback-attrs="controls"')}${canvasVideoFallbackHtml(sourceDisplay.url, 'class="motion-source-metadata-probe" aria-hidden="true" tabindex="-1"')}<div class="motion-source-meta"><strong>${escapeHtml(sourceDisplay.name || tr('canvas.motionVideoSource'))}</strong><span data-motion-source-meta>${escapeHtml(motionSourceMeta(sourceDisplay))}</span></div></div>`
         : `<div class="motion-source-empty">${escapeHtml(tr('canvas.motionSourceHint'))}</div>`;
     const progress = Math.max(0, Math.min(100, Number(node.motionProgress) || 0));
+    const hasFailedLoopItem = Object.values(node.motionLoopItems || {}).some(item => item?.status === 'failed');
     const action = ['queued', 'downloading', 'running'].includes(node.motionState)
         ? `<button class="motion-action secondary" type="button" data-motion-cancel>${escapeHtml(tr('canvas.motionCancel'))}</button>`
-        : node.motionState === 'failed'
+        : node.motionState === 'failed' || hasFailedLoopItem
             ? `<button class="motion-action" type="button" data-motion-retry>${escapeHtml(tr('canvas.motionRetry'))}</button>`
             : `<button class="motion-action" type="button" data-motion-start>${escapeHtml(tr('canvas.motionStart'))}</button>`;
     wrap.innerHTML = `
