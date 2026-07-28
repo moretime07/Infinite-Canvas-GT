@@ -9,6 +9,8 @@ API/.env
 
 # Runtime/user data
 data/
+data/motion_models/
+data/motion_tasks/
 history.json
 _self_restart.log
 *.log
@@ -16,6 +18,7 @@ _self_restart.log
 # Generated and uploaded media
 assets/input/
 assets/output/
+assets/output/motion/
 output/
 
 # Bundled/local Python runtime and caches
