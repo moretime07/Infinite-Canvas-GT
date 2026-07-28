@@ -2659,8 +2659,27 @@ function motionOutputVideoRefs(node, portName=''){
     const url = branch === 'depth' ? node?.depthUrl : node?.poseUrl;
     if(!enabled || state === 'disabled') return unavailable(branch === 'depth' ? 'canvas.motionDepthUnavailable' : 'canvas.motionPoseUnavailable');
     if(state !== 'completed' || !url) return unavailable(branch === 'depth' ? 'canvas.motionDepthUnavailable' : 'canvas.motionPoseUnavailable');
-    refs.push({url, name:`${branch}.mp4`, kind:'video'});
+    refs.push({url, name:`${branch}.mp4`, kind:'video', ...motionVideoRefMetadata(branch === 'depth' ? node?.depthMeta : node?.poseMeta)});
     return refs;
+}
+function motionLoopCurrentVideoRef(refs, context=null){
+    if(!context || !refs.length) return null;
+    const explicit = context.currentVideoRef || context.currentMediaRef || context.videoRef || null;
+    if(explicit){
+        const url = typeof explicit === 'string' ? explicit : explicit.url;
+        const matched = url ? refs.find(ref => ref?.url === url) : null;
+        if(matched) return matched;
+    }
+    const currentIndex = Number(context.currentVideoIndex ?? context.videoIndex);
+    if(Number.isInteger(currentIndex)){
+        const matched = refs.find(ref => Number(ref?.loopIndex ?? ref?.videoIndex ?? ref?.index) === currentIndex);
+        if(matched) return matched;
+        const offset = Number(context.currentVideoOffset ?? context.currentVideoBatchIndex);
+        if(Number.isInteger(offset) && offset >= 0 && offset < refs.length) return refs[offset];
+        if(currentIndex >= 0 && currentIndex < refs.length) return refs[currentIndex];
+    }
+    // loopInputVideoRefs starts its batch at the active iteration, so its first result is current only while a loop context exists.
+    return refs[0] || null;
 }
 function motionInputVideoRefs(node, context={}){
     const allNodes = context.nodes || nodes;
@@ -2674,7 +2693,11 @@ function motionInputVideoRefs(node, context={}){
         const sourceRefs = source.type === 'loop'
             ? loopInputVideoRefs(source, activeLoopContext)
             : videoRefsFromNode(source, normalizedFromPort(connection));
-        if(sourceRefs.length) refs.push(...sourceRefs.filter(ref => ref?.url && ref.kind === 'video'));
+        const videoRefs = sourceRefs.filter(ref => ref?.url && ref.kind === 'video');
+        if(source.type === 'loop' && activeLoopContext) {
+            const currentRef = motionLoopCurrentVideoRef(videoRefs, activeLoopContext);
+            if(currentRef) refs.push(currentRef);
+        } else if(videoRefs.length) refs.push(...videoRefs);
         if(!sourceRefs.length && imageRefsFromNode(source).some(ref => ref?.url)) hasImageInput = true;
     });
     refs.hasImageInput = hasImageInput;
@@ -6585,15 +6608,31 @@ function loopInputImageRefs(node, ctx=loopContext){
     const start = Math.max(0, currentIndex - 1);
     return allRefs.slice(start, start + batchSize);
 }
+function motionVideoRefMetadata(source){
+    const positiveNumber = value => {
+        const number = Number(value);
+        return Number.isFinite(number) && number > 0 ? number : undefined;
+    };
+    const duration = positiveNumber(source?.videoDuration ?? source?.duration);
+    const width = positiveNumber(source?.videoWidth ?? source?.natural_w ?? source?.naturalWidth ?? source?.width);
+    const height = positiveNumber(source?.videoHeight ?? source?.natural_h ?? source?.naturalHeight ?? source?.height);
+    const fps = positiveNumber(source?.videoFps ?? source?.fps ?? source?.frameRate);
+    return {
+        ...(duration === undefined ? {} : {duration}),
+        ...(width === undefined ? {} : {width}),
+        ...(height === undefined ? {} : {height}),
+        ...(fps === undefined ? {} : {fps}),
+    };
+}
 function videoRefsFromNode(node, fromPort=''){
     if(!node) return [];
     if(node.type === 'motionExtract') return motionOutputVideoRefs(node, fromPort);
-    if(node.type === 'image' && node.url && mediaKindForNode(node) === 'video') return [{url:node.url, name:node.name || 'video', role:node.role || '', kind:'video'}];
+    if(node.type === 'image' && node.url && mediaKindForNode(node) === 'video') return [{url:node.url, name:node.name || 'video', role:node.role || '', kind:'video', ...motionVideoRefMetadata(node)}];
     if(node.type === 'group'){
         return (node.items || [])
             .map(id => nodes.find(x => x.id === id))
             .filter(x => x?.type === 'image' && x?.url && mediaKindForNode(x) === 'video')
-            .map(vid => ({url:vid.url, name:vid.name || 'video', role:vid.role || '', kind:'video'}));
+            .map(vid => ({url:vid.url, name:vid.name || 'video', role:vid.role || '', kind:'video', ...motionVideoRefMetadata(vid)}));
     }
     if(node.type === 'output'){
         return (node.images || [])
@@ -6602,11 +6641,17 @@ function videoRefsFromNode(node, fromPort=''){
             .map(({item, i}) => {
                 const url = outputUrlValue(item);
                 if(!url) return null;
-                return {url, name:outputImageName(url) || `output-${i + 1}.mp4`, kind:'video', nodeId:node.id, outputIndex:i};
+                return {url, name:outputImageName(url) || `output-${i + 1}.mp4`, kind:'video', nodeId:node.id, outputIndex:i, ...motionVideoRefMetadata(item)};
             })
             .filter(Boolean);
     }
-    if(CANVAS_MEDIA_OUTPUT_TYPES.includes(node.type)) return generatedImageRefs(node).filter(ref => ref.kind === 'video');
+    if(CANVAS_MEDIA_OUTPUT_TYPES.includes(node.type)){
+        return (node.generatedOutputs || []).map((item, i) => {
+            const url = outputUrlValue(item);
+            if(!url || mediaKindForOutputItem(item) !== 'video') return null;
+            return {url, name:outputImageName(url) || `${node.type || 'generated'}-${i + 1}.mp4`, kind:'video', ...motionVideoRefMetadata(item)};
+        }).filter(Boolean);
+    }
     return [];
 }
 function loopInputVideoRefs(node, ctx=loopContext){
@@ -8599,6 +8644,31 @@ function motionSourceMeta(ref){
         `${tr('canvas.motionFps')}: ${ref.fps || '—'}`
     ].join(' · ');
 }
+function updateMotionSourceMetadata(node, source, media){
+    if(!node || node.type !== 'motionExtract' || !source?.url || !media) return false;
+    const current = resolveMotionInputVideo(node).video;
+    if(!current || current.url !== source.url) return false;
+    const positiveNumber = value => {
+        const number = Number(value);
+        return Number.isFinite(number) && number > 0 ? number : undefined;
+    };
+    const existing = node.motionSourceMeta?.url === source.url ? node.motionSourceMeta : {};
+    const next = {
+        ...existing,
+        url:source.url,
+        ...motionVideoRefMetadata(source),
+    };
+    const duration = positiveNumber(media.duration);
+    const width = positiveNumber(media.videoWidth);
+    const height = positiveNumber(media.videoHeight);
+    if(duration !== undefined) next.duration = duration;
+    if(width !== undefined) next.width = width;
+    if(height !== undefined) next.height = height;
+    if(JSON.stringify(existing) === JSON.stringify(next)) return false;
+    node.motionSourceMeta = next;
+    scheduleSave();
+    return true;
+}
 function renderMotionResultCard(branch, enabled, state, url){
     const label = branch === 'depth' ? tr('canvas.motionDepth') : tr('canvas.motionPose');
     if(!enabled) return `<div class="motion-result-card disabled"><div class="motion-result-head"><span>${escapeHtml(label)}</span><span>${escapeHtml(tr('canvas.motionDisabled'))}</span></div></div>`;
@@ -8610,8 +8680,9 @@ function renderMotionExtractBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'motion-extract-body';
     const source = resolveMotionInputVideo(node).video;
-    const sourceHtml = source
-        ? `<div class="motion-source-card">${canvasVideoPreviewHtml(source.url, 480, 'data-video-fallback-attrs="controls"')}<div class="motion-source-meta"><strong>${escapeHtml(source.name || tr('canvas.motionVideoSource'))}</strong><span>${escapeHtml(motionSourceMeta(source))}</span></div></div>`
+    const sourceDisplay = source && node.motionSourceMeta?.url === source.url ? {...source, ...node.motionSourceMeta} : source;
+    const sourceHtml = sourceDisplay
+        ? `<div class="motion-source-card">${canvasVideoPreviewHtml(sourceDisplay.url, 480, 'data-video-fallback-attrs="controls"')}${canvasVideoFallbackHtml(sourceDisplay.url, 'class="motion-source-metadata-probe" aria-hidden="true" tabindex="-1"')}<div class="motion-source-meta"><strong>${escapeHtml(sourceDisplay.name || tr('canvas.motionVideoSource'))}</strong><span data-motion-source-meta>${escapeHtml(motionSourceMeta(sourceDisplay))}</span></div></div>`
         : `<div class="motion-source-empty">${escapeHtml(tr('canvas.motionSourceHint'))}</div>`;
     const progress = Math.max(0, Math.min(100, Number(node.motionProgress) || 0));
     const action = ['queued', 'running'].includes(node.motionState)
@@ -8642,6 +8713,16 @@ function renderMotionExtractBody(node){
     wrap.querySelector('[data-motion-start]')?.addEventListener('click', () => startMotionExtract(node.id));
     wrap.querySelector('[data-motion-retry]')?.addEventListener('click', () => retryMotionExtract(node.id));
     wrap.querySelector('[data-motion-cancel]')?.addEventListener('click', () => cancelMotionExtract(node.id));
+    const sourceVideo = wrap.querySelector('.motion-source-metadata-probe');
+    const sourceMeta = wrap.querySelector('[data-motion-source-meta]');
+    if(sourceVideo && source && sourceMeta){
+        sourceVideo.addEventListener('loadedmetadata', () => {
+            if(!updateMotionSourceMetadata(node, source, sourceVideo)) return;
+            const current = resolveMotionInputVideo(node).video;
+            if(current?.url !== source.url) return;
+            sourceMeta.textContent = motionSourceMeta({...source, ...node.motionSourceMeta});
+        });
+    }
     return wrap;
 }
 function renderVideoBody(node){

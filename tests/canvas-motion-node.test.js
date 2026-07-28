@@ -94,7 +94,9 @@ function resolverContext(nodes, connections, loopRefs=()=>[]){
     };
     vm.createContext(context);
     vm.runInContext([
+        productionFunction('motionVideoRefMetadata'),
         productionFunction('motionOutputVideoRefs'),
+        productionFunction('motionLoopCurrentVideoRef'),
         productionFunction('motionInputVideoRefs'),
         productionFunction('resolveMotionInputVideo'),
         'this.motionOutputVideoRefs = motionOutputVideoRefs;',
@@ -132,6 +134,24 @@ function resolverContext(nodes, connections, loopRefs=()=>[]){
     assert.deepEqual(JSON.parse(JSON.stringify(seen)), [['loop', 7]]);
 }
 
+// Break caught: loop batches may include preloaded neighbours, but the motion node must consume the explicitly current video only.
+{
+    const loop = {id:'loop', type:'loop'};
+    const motion = {id:'motion', type:'motionExtract'};
+    const batch = [
+        {url:'/loop-1.mp4', name:'one.mp4', kind:'video'},
+        {url:'/loop-2.mp4', name:'two.mp4', kind:'video'},
+    ];
+    const context = resolverContext([loop, motion], [{from:'loop', to:'motion'}], () => batch);
+    const selected = context.resolveMotionInputVideo(motion, {loopContext:{index:2, currentVideoRef:batch[1]}});
+    assert.equal(selected.video.url, '/loop-2.mp4');
+    const selectedByIndex = context.resolveMotionInputVideo(motion, {loopContext:{index:2, currentVideoIndex:1}});
+    assert.equal(selectedByIndex.video.url, '/loop-2.mp4');
+    const outsideLoop = context.resolveMotionInputVideo(motion, {});
+    assert.equal(outsideLoop.video, null);
+    assert.match(outsideLoop.error, /只能处理一个视频/);
+}
+
 // Break caught: image-only sources must be rejected explicitly rather than converted or ignored.
 {
     const image = {id:'image', type:'image', imageRefs:[{url:'/still.png', kind:'image'}]};
@@ -140,6 +160,55 @@ function resolverContext(nodes, connections, loopRefs=()=>[]){
     const resolved = context.resolveMotionInputVideo(motion, {});
     assert.equal(resolved.video, null);
     assert.match(resolved.error, /不支持图片输入/);
+}
+
+// Break caught: source metadata must survive video ref resolution for the preview and task payload.
+{
+    const context = {
+        mediaKindForNode:() => 'video',
+        motionOutputVideoRefs:() => [],
+        nodes:[],
+        CANVAS_MEDIA_OUTPUT_TYPES:[],
+        outputUrlValue:item => item.url,
+        mediaKindForOutputItem:item => item.kind,
+        outputImageName:url => url.split('/').pop(),
+    };
+    vm.createContext(context);
+    vm.runInContext([
+        productionFunction('motionVideoRefMetadata'),
+        productionFunction('videoRefsFromNode'),
+        'this.videoRefsFromNode = videoRefsFromNode;',
+    ].join('\n'), context);
+    const refs = context.videoRefsFromNode({
+        type:'image', url:'/clip.mp4', name:'clip.mp4', duration:4.25,
+        natural_w:1920, natural_h:1080, fps:29.97,
+    });
+    assert.deepEqual(JSON.parse(JSON.stringify(refs)), [{
+        url:'/clip.mp4', name:'clip.mp4', role:'', kind:'video',
+        duration:4.25, width:1920, height:1080, fps:29.97,
+    }]);
+}
+
+// Break caught: a delayed source preview must not write metadata after the node has resolved a different source.
+{
+    let saves = 0;
+    const node = {id:'motion', type:'motionExtract'};
+    const context = {
+        resolveMotionInputVideo:() => ({video:{url:'/active.mp4', kind:'video'}}),
+        scheduleSave:() => { saves += 1; },
+    };
+    vm.createContext(context);
+    vm.runInContext([
+        productionFunction('motionVideoRefMetadata'),
+        productionFunction('updateMotionSourceMetadata'),
+        'this.updateMotionSourceMetadata = updateMotionSourceMetadata;',
+    ].join('\n'), context);
+    assert.equal(context.updateMotionSourceMetadata(node, {url:'/active.mp4', fps:24}, {duration:3.5, videoWidth:1280, videoHeight:720}), true);
+    assert.deepEqual(JSON.parse(JSON.stringify(node.motionSourceMeta)), {url:'/active.mp4', duration:3.5, width:1280, height:720, fps:24});
+    assert.equal(saves, 1);
+    assert.equal(context.updateMotionSourceMetadata(node, {url:'/old.mp4'}, {duration:9, videoWidth:640, videoHeight:480}), false);
+    assert.equal(node.motionSourceMeta.url, '/active.mp4');
+    assert.equal(saves, 1);
 }
 
 // Break caught: downstream consumers must receive only the completed branch selected by the named port.

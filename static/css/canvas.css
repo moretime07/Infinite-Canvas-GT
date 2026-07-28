@@ -661,6 +661,7 @@ input[type=range].canvas-range::-webkit-slider-runnable-track { height:3px; bord
 .node.sized.motionExtract-node .motion-extract-body { height:100%; }
 .motion-source-card,.motion-source-empty,.motion-result-card { border:1px solid var(--line-2); border-radius:12px; overflow:hidden; background:var(--soft); }
 .motion-source-card video { display:block; width:100%; max-height:160px; background:#0f172a; object-fit:contain; }
+.motion-source-metadata-probe { display:none !important; }
 .motion-source-meta,.motion-result-head,.motion-progress-meta { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:7px 9px; font-size:10px; color:var(--muted); }
 .motion-source-meta strong,.motion-result-head span:first-child { color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .motion-source-empty,.motion-result-empty { display:flex; min-height:62px; align-items:center; justify-content:center; padding:10px; color:var(--muted); font-size:11px; text-align:center; }
