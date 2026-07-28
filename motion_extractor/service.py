@@ -108,7 +108,9 @@ def _run_mux(command: list[str], cancelled: Callable[[], bool]) -> bool:
         raise
 
 
-def _probe_stream_duration(path: Path, selector: str) -> float:
+def _probe_stream_duration(path: Path, selector: str) -> float | None:
+    if selector.startswith("v:"):
+        return probe_video(path).duration_seconds
     executable = shutil.which("ffprobe")
     if executable is None:
         raise MotionRuntimeUnavailable("The local FFmpeg runtime is unavailable.")
@@ -118,7 +120,7 @@ def _probe_stream_duration(path: Path, selector: str) -> float:
                 executable,
                 "-v", "error",
                 "-select_streams", selector,
-                "-show_entries", "stream=duration:format=duration",
+                "-show_entries", "stream=duration,duration_ts,time_base",
                 "-of", "json",
                 str(path),
             ],
@@ -129,19 +131,27 @@ def _probe_stream_duration(path: Path, selector: str) -> float:
         )
         payload = json.loads(result.stdout)
         streams = payload.get("streams", ())
-        candidates = [
-            stream.get("duration")
-            for stream in streams
-            if isinstance(stream, dict) and stream.get("duration") not in (None, "N/A", "")
-        ]
-        if not candidates:
-            format_data = payload.get("format", {})
-            if isinstance(format_data, dict):
-                candidates.append(format_data.get("duration"))
-        duration = float(candidates[0])
-        if not math.isfinite(duration) or duration <= 0:
-            raise ValueError
-        return duration
+        stream = next(
+            (candidate for candidate in streams if isinstance(candidate, dict)),
+            None,
+        )
+        if stream is None:
+            return None
+        duration_value = stream.get("duration")
+        if duration_value not in (None, "N/A", ""):
+            duration = float(duration_value)
+            return duration if math.isfinite(duration) and duration > 0 else None
+        duration_ts_value = stream.get("duration_ts")
+        time_base_value = stream.get("time_base")
+        if duration_ts_value in (None, "N/A", "") or time_base_value in (None, "N/A", ""):
+            return None
+        duration_ts = int(duration_ts_value)
+        numerator_text, denominator_text = str(time_base_value).split("/", 1)
+        numerator, denominator = int(numerator_text), int(denominator_text)
+        if duration_ts <= 0 or numerator <= 0 or denominator <= 0:
+            return None
+        duration = duration_ts * numerator / denominator
+        return duration if math.isfinite(duration) and duration > 0 else None
     except MotionRuntimeUnavailable:
         raise
     except (
@@ -178,6 +188,8 @@ def mux_source_audio(
         if executable is None:
             raise MotionRuntimeUnavailable("The local FFmpeg runtime is unavailable.")
         video_duration = _probe_stream_duration(encoded, "v:0")
+        if video_duration is None:
+            raise MotionMediaError(_PUBLIC_MEDIA_ERROR)
         audio_duration = _probe_stream_duration(source, "a:0")
         duration_argument = f"{video_duration:.6f}"
         common = [
@@ -198,7 +210,7 @@ def mux_source_audio(
             "copy",
         ]
         copied = False
-        if audio_duration + 0.05 >= video_duration:
+        if audio_duration is not None and audio_duration + 0.05 >= video_duration:
             copy_command = [
                 *common, "-c:a", "copy", "-t", duration_argument,
                 "-movflags", "+faststart", str(target),
@@ -306,7 +318,7 @@ class MotionTaskService:
         task_id = f"canvas_motion_{uuid4().hex}"
         async with self._lock:
             self._prune_terminal_records_locked()
-            if sum(record["state"] not in _TERMINAL_STATES for record in self._records.values()) >= self._max_pending_tasks:
+            if len(self._private) >= self._max_pending_tasks:
                 raise MotionQueueFull("The local motion queue is full.")
             queue_position = 1 + sum(
                 record["state"] == "queued" for record in self._records.values()

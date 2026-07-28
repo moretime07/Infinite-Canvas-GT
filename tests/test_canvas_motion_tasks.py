@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import main
 from motion_extractor import errors as motion_errors
+from motion_extractor import service as motion_service
 from motion_extractor.depth import BranchResult
 from motion_extractor.errors import MotionCancelled, MotionMediaError, MotionOutOfMemory, MotionRuntimeError
 from motion_extractor.media import VideoMetadata
@@ -282,6 +283,70 @@ class CanvasMotionTaskTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await self.wait_for_state(service, first["task_id"], {"completed"})
         await self.wait_for_state(service, second["task_id"], {"completed"})
+
+    async def test_cancelled_queued_ownership_cannot_bypass_capacity(self):
+        decoder_started = threading.Event()
+        release_decoder = threading.Event()
+
+        def blocking_decoder(_path, _work_dir, _cancelled):
+            decoder_started.set()
+            release_decoder.wait(timeout=2)
+            return FakeFrameStore()
+
+        service = self.make_service(decoder=blocking_decoder, max_pending_tasks=2)
+        active = await service.submit(
+            "/assets/input/active.mp4", self.source, True, False, False
+        )
+        self.assertTrue(await asyncio.to_thread(decoder_started.wait, 1))
+
+        accepted = 0
+        rejected = 0
+        max_private = len(service._private)
+        max_queued = service._queue.qsize()
+        try:
+            for index in range(12):
+                try:
+                    created = await service.submit(
+                        f"/assets/input/churn-{index}.mp4",
+                        self.source,
+                        True,
+                        False,
+                        False,
+                    )
+                except motion_errors.MotionQueueFull:
+                    rejected += 1
+                else:
+                    accepted += 1
+                    cancelled = await service.cancel(created["task_id"])
+                    self.assertEqual(cancelled["state"], "cancelled")
+                max_private = max(max_private, len(service._private))
+                max_queued = max(max_queued, service._queue.qsize())
+
+            with self.assertRaises(motion_errors.MotionQueueFull):
+                await service.submit(
+                    "/assets/input/still-owned.mp4",
+                    self.source,
+                    True,
+                    False,
+                    False,
+                )
+        finally:
+            release_decoder.set()
+
+        self.assertEqual((accepted, rejected), (1, 11))
+        self.assertLessEqual(max_private, 2)
+        self.assertLessEqual(max_queued, 1)
+        await self.wait_for_state(service, active["task_id"], {"completed"})
+        for _attempt in range(100):
+            if not service._private:
+                break
+            await asyncio.sleep(0.01)
+        self.assertFalse(service._private)
+
+        after_cleanup = await service.submit(
+            "/assets/input/after-cleanup.mp4", self.source, True, False, False
+        )
+        await self.wait_for_state(service, after_cleanup["task_id"], {"completed"})
 
     async def test_terminal_cleanup_drops_private_state_and_bounds_public_history(self):
         now = [100.0]
@@ -1012,6 +1077,68 @@ class CanvasMotionTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(float(audio["duration"]), 1.9)
         self.assertGreaterEqual(float(facts["format"]["duration"]), 1.9)
         self.assertTrue(transcoded)
+
+    async def test_audio_duration_probe_never_inherits_container_duration(self):
+        payload = {
+            "streams": [{"codec_type": "audio", "duration": "N/A"}],
+            "format": {"duration": "12.0"},
+        }
+        completed = subprocess.CompletedProcess(
+            ["ffprobe"],
+            0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+        with patch("motion_extractor.service.shutil.which", return_value="ffprobe"), \
+                patch("motion_extractor.service.subprocess.run", return_value=completed):
+            duration = motion_service._probe_stream_duration(self.source, "a:0")
+
+        self.assertIsNone(duration)
+
+    async def test_mux_strategy_transcodes_unknown_audio_but_copies_known_sufficient_audio(self):
+        encoded = self.root / "encoded-for-strategy.mp4"
+        encoded.write_bytes(b"video")
+
+        cases = (
+            ("unknown", None, True, "aac", True),
+            ("known", 2.1, False, "copy", False),
+        )
+        for label, audio_duration, expected_transcoded, expected_codec, expected_padding in cases:
+            with self.subTest(label=label):
+                destination = self.root / f"muxed-{label}.mp4"
+                commands = []
+
+                def successful_mux(command, _cancelled):
+                    commands.append(command)
+                    Path(command[-1]).write_bytes(b"muxed")
+                    return True
+
+                with patch(
+                    "motion_extractor.service._probe_stream_duration",
+                    side_effect=[2.0, audio_duration],
+                ), patch(
+                    "motion_extractor.service.shutil.which",
+                    return_value="ffmpeg",
+                ), patch(
+                    "motion_extractor.service._run_mux",
+                    side_effect=successful_mux,
+                ):
+                    try:
+                        transcoded = mux_source_audio(
+                            encoded,
+                            self.source,
+                            destination,
+                        )
+                    except MotionMediaError:
+                        self.fail("unknown audio duration did not select the safe transcode path")
+
+                self.assertEqual(transcoded, expected_transcoded)
+                self.assertEqual(len(commands), 1)
+                codec_index = commands[0].index("-c:a") + 1
+                self.assertEqual(commands[0][codec_index], expected_codec)
+                self.assertEqual("-af" in commands[0], expected_padding)
+                duration_index = commands[0].index("-t") + 1
+                self.assertEqual(commands[0][duration_index], "2.000000")
 
     async def test_depth_oom_retries_exactly_once_at_input_size_392(self):
         input_sizes = []

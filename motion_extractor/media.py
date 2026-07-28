@@ -41,6 +41,9 @@ _PUBLIC_MEDIA_ERROR = "媒体文件无效或无法读取"
 _PUBLIC_VFR_ERROR = (
     "Variable-frame-rate video is unsupported; convert it to constant frame rate before retrying."
 )
+_PUBLIC_DURATION_ERROR = (
+    "Video duration is unavailable; remux or convert the video to constant frame rate before retrying."
+)
 _PUBLIC_RUNTIME_UNAVAILABLE = "The local FFmpeg runtime is unavailable."
 _PROCESS_TIMEOUT_SECONDS = 180
 _PROCESS_POLL_SECONDS = 0.01
@@ -178,6 +181,49 @@ def _optional_frame_count(value: object) -> int:
         return 0
 
 
+def _optional_positive_float(value: object) -> float | None:
+    if value in (None, "N/A", ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _duration_from_time_base(stream: dict[str, Any]) -> float | None:
+    try:
+        duration_ts = int(stream.get("duration_ts"))
+        time_base_num, time_base_den = _parse_rational(stream.get("time_base"))
+    except (MotionMediaError, TypeError, ValueError):
+        return None
+    if duration_ts <= 0:
+        return None
+    return _optional_positive_float(duration_ts * time_base_num / time_base_den)
+
+
+def _video_duration_from_evidence(
+    stream: dict[str, Any],
+    timestamps: list[float],
+    fps_num: int,
+    fps_den: int,
+    frame_count: int,
+) -> float:
+    duration = _optional_positive_float(stream.get("duration"))
+    if duration is None:
+        duration = _duration_from_time_base(stream)
+    frame_duration = fps_den / fps_num
+    if duration is None and frame_count and len(timestamps) == frame_count:
+        duration = _optional_positive_float(frame_count * frame_duration)
+    if duration is None and timestamps:
+        duration = _optional_positive_float(
+            timestamps[-1] - timestamps[0] + frame_duration
+        )
+    if duration is None:
+        raise MotionValidationError(_PUBLIC_DURATION_ERROR)
+    return duration
+
+
 def _ffprobe(path: Path) -> dict[str, Any]:
     try:
         result = subprocess.run(
@@ -185,7 +231,7 @@ def _ffprobe(path: Path) -> dict[str, Any]:
                 _required_executable("ffprobe"),
                 "-v", "error",
                 "-show_entries",
-                "format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate,nb_frames:stream_tags=rotate:stream_side_data=rotation",
+                "stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate,nb_frames,duration,duration_ts,time_base:stream_tags=rotate:stream_side_data=rotation",
                 "-of", "json",
                 str(path),
             ],
@@ -277,19 +323,9 @@ def probe_video(path: Path) -> VideoMetadata:
         fps_value = video_stream.get("r_frame_rate")
     fps_num, fps_den = _parse_rational(fps_value)
     fps = fps_num / fps_den
-    duration_value = video_stream.get("duration")
-    if duration_value in (None, "N/A", ""):
-        duration_value = payload.get("format", {}).get("duration")
-    try:
-        duration = float(duration_value)
-    except (AttributeError, TypeError, ValueError):
-        raise _media_error() from None
-    if not math.isfinite(duration) or duration <= 0 or duration > _MAX_DURATION_SECONDS:
-        raise _media_error()
     rotation = _rotation(video_stream)
     width, height = (encoded_height, encoded_width) if rotation in {90, 270} else (encoded_width, encoded_height)
     frame_count = _optional_frame_count(video_stream.get("nb_frames"))
-    expected_frames = max(frame_count, math.ceil(duration * fps))
     if (
         encoded_width % 2
         or encoded_height % 2
@@ -297,11 +333,27 @@ def probe_video(path: Path) -> VideoMetadata:
         or height > _MAX_DIMENSION
         or width * height > _MAX_PIXELS
         or fps > _MAX_FPS
-        or expected_frames > _MAX_FRAMES
+        or frame_count > _MAX_FRAMES
+        or width * height * 3 * frame_count > _MAX_RAW_BYTES
+    ):
+        raise _media_error()
+    timestamps = _video_timestamps(source)
+    _reject_variable_frame_rate(timestamps, fps_num, fps_den)
+    duration = _video_duration_from_evidence(
+        video_stream,
+        timestamps,
+        fps_num,
+        fps_den,
+        frame_count,
+    )
+    if not math.isfinite(duration) or duration <= 0 or duration > _MAX_DURATION_SECONDS:
+        raise _media_error()
+    expected_frames = max(frame_count, math.ceil(duration * fps))
+    if (
+        expected_frames > _MAX_FRAMES
         or width * height * 3 * expected_frames > _MAX_RAW_BYTES
     ):
         raise _media_error()
-    _reject_variable_frame_rate(_video_timestamps(source), fps_num, fps_den)
     return VideoMetadata(
         width=width,
         height=height,

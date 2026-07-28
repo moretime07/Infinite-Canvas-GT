@@ -256,6 +256,71 @@ class MotionMediaTests(unittest.TestCase):
         self.assertEqual((metadata.width, metadata.height), (1080, 1920))
         self.assertEqual(metadata.frame_count, 1800)
 
+    def test_missing_stream_duration_uses_only_selected_video_evidence(self) -> None:
+        timestamps = [index / 12 for index in range(24)]
+        cases = (
+            (
+                "duration-ts",
+                {
+                    "duration_ts": "24576",
+                    "time_base": "1/12288",
+                    "nb_frames": "24",
+                },
+            ),
+            ("frame-count", {"nb_frames": "24"}),
+            ("timestamps", {"nb_frames": "N/A"}),
+        )
+        for label, duration_fields in cases:
+            with self.subTest(label=label):
+                payload = {
+                    "format": {"duration": "35.0"},
+                    "streams": [
+                        {
+                            "codec_type": "video",
+                            "codec_name": "h264",
+                            "width": 80,
+                            "height": 48,
+                            "avg_frame_rate": "12/1",
+                            "r_frame_rate": "12/1",
+                            **duration_fields,
+                        },
+                        {
+                            "codec_type": "audio",
+                            "codec_name": "aac",
+                            "duration": "35.0",
+                        },
+                    ],
+                }
+                with patch("motion_extractor.media._ffprobe", return_value=payload), \
+                        patch("motion_extractor.media._video_timestamps", return_value=timestamps):
+                    try:
+                        metadata = media.probe_video(self.source)
+                    except media.MotionMediaError:
+                        self.fail("container duration replaced selected video evidence")
+
+                self.assertEqual(metadata.duration_seconds, 2.0)
+
+    def test_missing_all_video_duration_evidence_is_actionable_and_path_free(self) -> None:
+        payload = {
+            "format": {"duration": "2.0"},
+            "streams": [{
+                "codec_type": "video",
+                "codec_name": "h264",
+                "width": 80,
+                "height": 48,
+                "avg_frame_rate": "12/1",
+                "r_frame_rate": "12/1",
+                "nb_frames": "N/A",
+            }],
+        }
+        with patch("motion_extractor.media._ffprobe", return_value=payload), \
+                patch("motion_extractor.media._video_timestamps", return_value=[]):
+            with self.assertRaises(media.MotionValidationError) as raised:
+                media.probe_video(self.source)
+
+        self.assertIn("duration", str(raised.exception).lower())
+        self.assertNotIn(str(self.source), str(raised.exception))
+
     def test_probe_rejects_odd_dimensions_excessive_pixels_and_excessive_fps(self) -> None:
         cases = (
             ({"width": 81, "height": 48, "avg_frame_rate": "12/1"}, "odd width"),
