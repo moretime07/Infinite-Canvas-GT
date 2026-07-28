@@ -28,8 +28,6 @@ _LINE_VALUE = np.uint8(224)
 _JOINT_VALUE = np.uint8(255)
 _YOLOX_INPUT_SIZE = (640, 640)
 _YOLOX_NMS_THRESHOLD = 0.45
-_POSE_MEAN = np.array([123.675, 116.28, 103.53], dtype=np.float32)
-_POSE_STD = np.array([58.395, 57.12, 57.375], dtype=np.float32)
 _POSE_PADDING = 1.25
 _SIMCC_SPLIT_RATIO = 2.0
 
@@ -348,7 +346,11 @@ class PoseProcessor:
             raise MotionRuntimeError(_RUNTIME_MESSAGE)
         decoded = self._decode_yolox_head(array[:, :85])
         scores = decoded[:, 4] * decoded[:, 5]  # COCO class zero is person.
-        source_boxes = decoded[:, :4].copy()
+        candidates = scores >= self._confidence_threshold
+        if not np.any(candidates):
+            return []
+        source_boxes = decoded[candidates, :4].copy()
+        scores = scores[candidates]
         source_boxes[:, [0, 2]] /= ratio
         source_boxes[:, [1, 3]] /= ratio
         keep = self._nms(source_boxes, scores, _YOLOX_NMS_THRESHOLD)
@@ -433,10 +435,10 @@ class PoseProcessor:
             raise MotionRuntimeError(_RUNTIME_MESSAGE)
         height, width = source.shape[:2]
         ratio = min(target_height / height, target_width / width)
-        resized = self._resize_image(source[..., ::-1], int(width * ratio), int(height * ratio))
+        resized = self._resize_image(source, int(width * ratio), int(height * ratio))
         padded = np.full((target_height, target_width, 3), 114, dtype=np.float32)
         padded[:resized.shape[0], :resized.shape[1]] = resized
-        return np.ascontiguousarray(np.moveaxis(padded, -1, 0)[None]), ratio
+        return np.ascontiguousarray(np.moveaxis(padded / 255.0, -1, 0)[None]), ratio
 
     @staticmethod
     def _resize_image(image: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -482,8 +484,7 @@ class PoseProcessor:
             [0.0, input_height / height, input_height / 2 - center_y * input_height / height],
         ], dtype=np.float32)
         warped, inverse_affine = self._warp_affine(source[..., ::-1], affine, input_width, input_height)
-        normalized = (warped - _POSE_MEAN) / _POSE_STD
-        return np.ascontiguousarray(np.moveaxis(normalized, -1, 0)[None]), inverse_affine
+        return np.ascontiguousarray(np.moveaxis(warped, -1, 0)[None]), inverse_affine
 
     @staticmethod
     def _warp_affine(image: np.ndarray, affine: np.ndarray, width: int, height: int) -> tuple[np.ndarray, np.ndarray]:

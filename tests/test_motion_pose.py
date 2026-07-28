@@ -150,7 +150,16 @@ class MotionPoseTests(unittest.TestCase):
         self.assertTrue(any(np.allclose(box, (97.5, 50, 127.5, 100), atol=0.51) for box in boxes))
         detector_input = next(iter(session.inputs[0].values()))
         self.assertEqual(detector_input.shape, (1, 3, 640, 640))
-        self.assertEqual(float(detector_input[0, 0, 500, 500]), 114.0)
+        self.assertAlmostEqual(float(detector_input[0, 0, 500, 500]), 114.0 / 255.0)
+
+    def test_yolox_tensor_preserves_rgb_and_scales_source_and_padding(self) -> None:
+        """The DWPose detector consumes RGB pixels and a fully [0, 1]-scaled letterbox."""
+        source = np.zeros((100, 200, 3), dtype=np.uint8)
+        source[0, 0] = [11, 22, 33]
+        tensor, _ratio = PoseProcessor()._yolox_tensor(RawOrtSession([], shape=(1, 3, 640, 640)), source)
+
+        self.assertTrue(np.allclose(tensor[0, :, 0, 0], [11 / 255, 22 / 255, 33 / 255]))
+        self.assertTrue(np.allclose(tensor[0, :, 500, 500], [114 / 255] * 3))
 
     def test_pose_affine_simcc_inverse_mapping_keeps_wholebody_landmarks_in_source_coordinates(self) -> None:
         """Using a rectangular crop directly distorts DWPose's body, feet, face, and hands."""
@@ -173,6 +182,34 @@ class MotionPoseTests(unittest.TestCase):
             self.assertEqual(float(keypoints[point_index, 2]), 1.0)
         pose_input = next(iter(session.inputs[0].values()))
         self.assertEqual(pose_input.shape, (1, 3, 384, 288))
+
+    def test_pose_tensor_feeds_unormalized_affine_warped_bgr_pixels(self) -> None:
+        """The pose ONNX model expects BGR float pixels, not ImageNet-normalized RGB values."""
+        source = np.zeros((100, 200, 3), dtype=np.uint8)
+        source[:, :] = [11, 22, 33]  # RGB
+        tensor, _inverse = PoseProcessor()._pose_tensor(
+            RawOrtSession([], shape=(1, 3, 384, 288)), source, (20.0, 10.0, 140.0, 70.0)
+        )
+
+        self.assertTrue(np.allclose(tensor[0, :, 192, 144], [33.0, 22.0, 11.0]))
+
+    def test_yolox_filters_low_person_scores_before_quadratic_nms(self) -> None:
+        """Low-score anchors must not turn NMS into an 8,400-row quadratic loop."""
+        raw = np.zeros((1, 8400, 85), dtype=np.float32)
+        for index in (0, 1):
+            raw[0, index, :4] = [0, 0, 0, 0]
+            raw[0, index, 4] = raw[0, index, 5] = 0.9
+        processor = PoseProcessor(confidence_threshold=0.3)
+        seen = []
+
+        def nms(boxes, scores, threshold):
+            seen.append((len(boxes), len(scores), threshold))
+            return np.arange(len(boxes))
+
+        processor._nms = nms
+        processor._detect(RawOrtSession([raw]), np.zeros((100, 200, 3), dtype=np.uint8))
+
+        self.assertEqual(seen, [(2, 2, 0.45)])
 
     def test_provider_contract_rejects_unrelated_errors_and_rebuilds_silent_cuda_fallback(self) -> None:
         """A broken model is not a CUDA failure, while ORT's silent CPU fallback is explicit."""
