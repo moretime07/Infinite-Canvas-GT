@@ -2725,12 +2725,19 @@ function motionTaskSafeBranchState(state){ return ['pending', 'running', 'disabl
 function motionTaskCanTransition(current, next){
     if(motionTaskIsTerminal(current)) return current === next;
     if(motionTaskIsTerminal(next)) return true;
-    if(current === next) return true;
-    return (current === 'queued' && next === 'downloading') || (current === 'downloading' && next === 'running');
+    const ranks = {queued:0, downloading:1, running:2};
+    return Number.isInteger(ranks[current]) && Number.isInteger(ranks[next]) && ranks[next] >= ranks[current];
 }
 function motionTaskSafeUrl(value){
     const url = typeof value === 'string' ? value : '';
-    return url.length <= 512 && /^\/(?:assets|output)\//.test(url) && !url.includes('..') && !url.includes('\\') ? url : '';
+    if(!url || url.length > 512 || !url.startsWith('/') || url.startsWith('//') || /[\x00-\x1f\x7f\\?#%]/.test(url) || url.includes('..')) return '';
+    try {
+        const parsed = new URL(url, 'http://canvas.local');
+        if(parsed.origin !== 'http://canvas.local' || parsed.search || parsed.hash || !/^\/(?:assets|output)\//.test(parsed.pathname)) return '';
+        return parsed.pathname;
+    } catch(_error) {
+        return '';
+    }
 }
 function motionTaskSafeMessage(value){
     const text = typeof value === 'string' ? value.trim() : '';
@@ -2830,9 +2837,10 @@ async function pollCanvasMotionTask(nodeId, taskId, runToken=null){
             const data = await res.json().catch(() => ({}));
             if(node.motionRunToken !== token || node.motionTaskId !== taskId) return 'stale';
             if(!res.ok) throw new Error(motionTaskSafeMessage(data?.detail || data?.error || data?.message));
+            if(!motionTaskIdIsSafe(data?.task_id) || data.task_id !== taskId) return 'stale';
             const applied = applyCanvasMotionTask(node, data);
             if(motionTaskIsTerminal(node.motionState)) return node.motionState;
-            if(!applied && node.motionState !== data?.state) return 'stale';
+            if(!applied && !(motionTaskIsPolling(node.motionState) && motionTaskIsPolling(data?.state))) return 'stale';
             if(!motionTaskIsPolling(node.motionState)) return 'stale';
         } catch(error) {
             if(node.motionRunToken !== token || node.motionTaskId !== taskId) return 'stale';
