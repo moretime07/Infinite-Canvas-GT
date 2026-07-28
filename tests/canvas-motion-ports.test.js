@@ -78,6 +78,7 @@ function connectionValidationContext(){
 // Break caught: generic connection validation must not discard a saved named motion-output link.
 const validation = connectionValidationContext();
 assert.equal(validation.canConnect('motion', 'video'), true);
+assert.equal(validation.canConnect('video', 'motion'), true);
 validation.sanitizeConnections();
 assert.deepEqual(JSON.parse(JSON.stringify(validation.connections)), [
     {id:'depth-link', from:'motion', to:'video', fromPort:'depth'},

@@ -2605,6 +2605,106 @@ function addVideoNode(point){
         running:false
     });
 }
+function addMotionExtractNode(point){
+    const p = point || defaultPoint(180, 0);
+    return addNode({
+        id:uid('motion'),
+        type:'motionExtract',
+        x:p.x,
+        y:p.y,
+        w:480,
+        h:680,
+        depthEnabled:true,
+        poseEnabled:false,
+        preserveAudio:false,
+        motionTaskId:'',
+        motionState:'idle',
+        motionStage:'',
+        motionProgress:0,
+        depthState:'pending',
+        depthUrl:'',
+        poseState:'disabled',
+        poseUrl:'',
+        motionWarnings:[],
+        motionError:''
+    });
+}
+function setMotionExtractProcessorEnabled(node, processor, enabled){
+    if(!node || node.type !== 'motionExtract' || !['depth', 'pose'].includes(processor)) return false;
+    const property = processor === 'depth' ? 'depthEnabled' : 'poseEnabled';
+    if(!enabled && node.depthEnabled === (processor === 'depth') && node.poseEnabled === (processor === 'pose')){
+        alert(tr('canvas.motionProcessorRequired'));
+        return false;
+    }
+    node[property] = Boolean(enabled);
+    const stateProperty = processor === 'depth' ? 'depthState' : 'poseState';
+    const urlProperty = processor === 'depth' ? 'depthUrl' : 'poseUrl';
+    node[urlProperty] = '';
+    node[stateProperty] = enabled ? 'pending' : 'disabled';
+    node.motionError = '';
+    render();
+    scheduleSave();
+    return true;
+}
+function motionOutputVideoRefs(node, portName=''){
+    const branch = portName === 'pose' ? 'pose' : portName === 'depth' ? 'depth' : '';
+    const refs = [];
+    const unavailable = key => {
+        refs.error = tr(key);
+        return refs;
+    };
+    if(!branch) return unavailable('canvas.motionResultPortRequired');
+    const enabled = branch === 'depth' ? node?.depthEnabled !== false : node?.poseEnabled === true;
+    const state = branch === 'depth' ? node?.depthState : node?.poseState;
+    const url = branch === 'depth' ? node?.depthUrl : node?.poseUrl;
+    if(!enabled || state === 'disabled') return unavailable(branch === 'depth' ? 'canvas.motionDepthUnavailable' : 'canvas.motionPoseUnavailable');
+    if(state !== 'completed' || !url) return unavailable(branch === 'depth' ? 'canvas.motionDepthUnavailable' : 'canvas.motionPoseUnavailable');
+    refs.push({url, name:`${branch}.mp4`, kind:'video'});
+    return refs;
+}
+function motionInputVideoRefs(node, context={}){
+    const allNodes = context.nodes || nodes;
+    const allConnections = context.connections || connections;
+    const activeLoopContext = context.loopContext || node?._activeLoopCtx || loopContext || null;
+    const refs = [];
+    let hasImageInput = false;
+    allConnections.filter(c => c.to === node?.id).forEach(connection => {
+        const source = allNodes.find(candidate => candidate.id === connection.from);
+        if(!source) return;
+        const sourceRefs = source.type === 'loop'
+            ? loopInputVideoRefs(source, activeLoopContext)
+            : videoRefsFromNode(source, normalizedFromPort(connection));
+        if(sourceRefs.length) refs.push(...sourceRefs.filter(ref => ref?.url && ref.kind === 'video'));
+        if(!sourceRefs.length && imageRefsFromNode(source).some(ref => ref?.url)) hasImageInput = true;
+    });
+    refs.hasImageInput = hasImageInput;
+    return refs;
+}
+function resolveMotionInputVideo(node, context={}){
+    const refs = motionInputVideoRefs(node, context);
+    if(refs.length === 1) return {video:refs[0], error:''};
+    if(refs.length > 1) return {video:null, error:tr('canvas.motionOnlyOneVideo')};
+    return {video:null, error:tr(refs.hasImageInput ? 'canvas.motionImageInputRejected' : 'canvas.motionNeedVideo')};
+}
+function startMotionExtract(nodeId){
+    const node = nodes.find(candidate => candidate.id === nodeId && candidate.type === 'motionExtract');
+    if(!node) return false;
+    const resolution = resolveMotionInputVideo(node);
+    node.motionError = resolution.error;
+    if(!resolution.error) node.motionError = tr('canvas.motionBackendPending');
+    render();
+    scheduleSave();
+    return false;
+}
+function retryMotionExtract(nodeId){ return startMotionExtract(nodeId); }
+function cancelMotionExtract(nodeId){
+    const node = nodes.find(candidate => candidate.id === nodeId && candidate.type === 'motionExtract');
+    if(!node) return false;
+    node.motionError = tr('canvas.motionBackendPending');
+    render();
+    scheduleSave();
+    return false;
+}
 function addRhNode(point){
     const p = point || defaultPoint(180, 0);
     return addNode({
@@ -3189,6 +3289,7 @@ function linkCreateOptions(state){
                 {type:'rh', label:tr('canvas.rhGenerate'), icon:'workflow'},
                 {type:'ltxDirector', label:tr('canvas.ltxDirector'), icon:'film'},
                 {type:'video', label:tr('canvas.videoGenerateNode'), icon:'clapperboard'},
+                {type:'motionExtract', label:tr('canvas.motionExtract'), icon:'scan-line'},
                 ...(node.type === 'output' ? [] : [{type:'llm', label:'LLM', icon:'message-square-text'}])
             ];
         }
@@ -3707,6 +3808,7 @@ function createNodeByType(type, point){
     if(type === 'generator') return addGeneratorNode(point);
     if(type === 'msgen') return addMsGenNode(point);
     if(type === 'video') return addVideoNode(point);
+    if(type === 'motionExtract') return addMotionExtractNode(point);
     if(type === 'rh') return addRhNode(point);
     if(type === 'comfy') return addComfyNode(point);
     if(type === 'ltxDirector') return addLTXDirectorNode(point);
@@ -3722,6 +3824,7 @@ function menuAdd(type){
     if(type === 'generator') addGeneratorNode(menuPoint);
     if(type === 'msgen') addMsGenNode(menuPoint);
     if(type === 'video') addVideoNode(menuPoint);
+    if(type === 'motionExtract') addMotionExtractNode(menuPoint);
     if(type === 'rh') addRhNode(menuPoint);
     if(type === 'comfy') addComfyNode(menuPoint);
     if(type === 'ltxDirector') addLTXDirectorNode(menuPoint);
@@ -6010,7 +6113,7 @@ function renderNode(node){
         if(node.type === 'output') openOutputNodeMenu(node.id, e.clientX, e.clientY);
         else openGeneratorNodeMenu(node.id, e.clientX, e.clientY);
     };
-    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
+    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : node.type === 'motionExtract' ? tr('canvas.motionExtract') : tr('canvas.apiGenerate');
     const displayTitle = node.type === 'image' && node.url ? nodeTitleForMedia(node) : title;
     // 失败徽章只在一键运行模式中显示，单节点失败已通过 alert 提示
     const showStatus = ['generator','msgen','comfy','ltxDirector','llm','video','rh'].includes(node.type) && node.runStatus
@@ -6167,6 +6270,7 @@ function renderNode(node){
     if(node.type === 'generator') body.appendChild(renderGeneratorBody(node));
     if(node.type === 'msgen') body.appendChild(renderMsGenBody(node));
     if(node.type === 'video') body.appendChild(renderVideoBody(node));
+    if(node.type === 'motionExtract') body.appendChild(renderMotionExtractBody(node));
     if(node.type === 'rh') body.appendChild(renderRhBody(node));
     if(node.type === 'comfy') body.appendChild(renderComfyBody(node));
     if(node.type === 'ltxDirector') body.appendChild(renderLTXDirectorBody(node));
@@ -6192,7 +6296,7 @@ function renderNode(node){
         startNodeDrag(e, node);
     };
     const namedOutputPorts = nodeOutputPorts(node);
-    const canInput = ['generator','comfy','ltxDirector','output','llm','msgen','video','rh'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
+    const canInput = ['generator','comfy','ltxDirector','output','llm','msgen','video','rh','motionExtract'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
     const canOutput = namedOutputPorts.length || ['image','prompt','loop','group','promptGroup','generator','comfy','ltxDirector','llm','msgen','video','rh','output'].includes(node.type);
     if(canInput) el.insertAdjacentHTML('beforeend', `<div class="port in" title="${tr('canvas.connectHere')}"></div>`);
     if(namedOutputPorts.length){
@@ -6374,6 +6478,7 @@ function defaultNodeSize(type){
     if(type === 'generator') return {w:380, h:0};
     if(type === 'msgen') return {w:380, h:0};
     if(type === 'video') return {w:400, h:0};
+    if(type === 'motionExtract') return {w:480, h:680};
     if(type === 'rh') return {w:430, h:0};
     if(type === 'comfy') return {w:420, h:460};
     if(type === 'ltxDirector') return {w:1000, h:800};
@@ -6480,8 +6585,9 @@ function loopInputImageRefs(node, ctx=loopContext){
     const start = Math.max(0, currentIndex - 1);
     return allRefs.slice(start, start + batchSize);
 }
-function videoRefsFromNode(node){
+function videoRefsFromNode(node, fromPort=''){
     if(!node) return [];
+    if(node.type === 'motionExtract') return motionOutputVideoRefs(node, fromPort);
     if(node.type === 'image' && node.url && mediaKindForNode(node) === 'video') return [{url:node.url, name:node.name || 'video', role:node.role || '', kind:'video'}];
     if(node.type === 'group'){
         return (node.items || [])
@@ -6507,7 +6613,7 @@ function loopInputVideoRefs(node, ctx=loopContext){
     if(!node?.videoInput) return [];
     const allRefs = connections
         .filter(c => c.to === node.id)
-        .flatMap(c => videoRefsFromNode(nodes.find(n => n.id === c.from)))
+        .flatMap(c => videoRefsFromNode(nodes.find(n => n.id === c.from), normalizedFromPort(c)))
         .filter(ref => ref?.url);
     if(!allRefs.length) return [];
     const startBase = Math.max(1, Number(node.loopStart) || 1);
@@ -8485,6 +8591,59 @@ function videoReferenceSummaryHtml(node, sources){
         : '';
     return `<div class="video-reference-summary"><div>${summary}</div>${warning}</div>`;
 }
+function motionSourceMeta(ref){
+    if(!ref) return '';
+    return [
+        `${tr('canvas.motionDuration')}: ${ref.duration ? `${ref.duration}s` : '—'}`,
+        `${tr('canvas.motionDimensions')}: ${ref.width && ref.height ? `${ref.width}×${ref.height}` : '—'}`,
+        `${tr('canvas.motionFps')}: ${ref.fps || '—'}`
+    ].join(' · ');
+}
+function renderMotionResultCard(branch, enabled, state, url){
+    const label = branch === 'depth' ? tr('canvas.motionDepth') : tr('canvas.motionPose');
+    if(!enabled) return `<div class="motion-result-card disabled"><div class="motion-result-head"><span>${escapeHtml(label)}</span><span>${escapeHtml(tr('canvas.motionDisabled'))}</span></div></div>`;
+    if(state === 'completed' && url) return `<div class="motion-result-card"><div class="motion-result-head"><span>${escapeHtml(label)}</span><span>${escapeHtml(tr('canvas.motionCompleted'))}</span></div>${canvasVideoPreviewHtml(url, 480, 'data-video-fallback-attrs="controls"')}</div>`;
+    const stateKey = state === 'failed' ? 'canvas.motionFailed' : 'canvas.motionPending';
+    return `<div class="motion-result-card"><div class="motion-result-head"><span>${escapeHtml(label)}</span><span>${escapeHtml(tr(stateKey))}</span></div><div class="motion-result-empty">${escapeHtml(tr(stateKey))}</div></div>`;
+}
+function renderMotionExtractBody(node){
+    const wrap = document.createElement('div');
+    wrap.className = 'motion-extract-body';
+    const source = resolveMotionInputVideo(node).video;
+    const sourceHtml = source
+        ? `<div class="motion-source-card">${canvasVideoPreviewHtml(source.url, 480, 'data-video-fallback-attrs="controls"')}<div class="motion-source-meta"><strong>${escapeHtml(source.name || tr('canvas.motionVideoSource'))}</strong><span>${escapeHtml(motionSourceMeta(source))}</span></div></div>`
+        : `<div class="motion-source-empty">${escapeHtml(tr('canvas.motionSourceHint'))}</div>`;
+    const progress = Math.max(0, Math.min(100, Number(node.motionProgress) || 0));
+    const action = ['queued', 'running'].includes(node.motionState)
+        ? `<button class="motion-action secondary" type="button" data-motion-cancel>${escapeHtml(tr('canvas.motionCancel'))}</button>`
+        : node.motionState === 'failed'
+            ? `<button class="motion-action" type="button" data-motion-retry>${escapeHtml(tr('canvas.motionRetry'))}</button>`
+            : `<button class="motion-action" type="button" data-motion-start>${escapeHtml(tr('canvas.motionStart'))}</button>`;
+    wrap.innerHTML = `
+        ${sourceHtml}
+        <div class="motion-switches">
+            <label><input type="checkbox" data-motion-processor="depth" ${node.depthEnabled !== false ? 'checked' : ''}><span>${escapeHtml(tr('canvas.motionDepth'))}</span></label>
+            <label><input type="checkbox" data-motion-processor="pose" ${node.poseEnabled === true ? 'checked' : ''}><span>${escapeHtml(tr('canvas.motionPose'))}</span></label>
+            <label><input type="checkbox" data-motion-audio ${node.preserveAudio ? 'checked' : ''}><span>${escapeHtml(tr('canvas.motionPreserveAudio'))}</span></label>
+        </div>
+        <div class="motion-progress" aria-label="${escapeAttr(tr('canvas.motionProgress'))}"><div class="motion-progress-meta"><span>${escapeHtml(node.motionStage || tr('canvas.motionWaiting'))}${node.motionQueuePosition ? ` · ${escapeHtml(trf('canvas.motionQueuePosition', {n:node.motionQueuePosition}))}` : ''}</span><span>${progress}%</span></div><div class="motion-progress-track"><span style="width:${progress}%"></span></div></div>
+        <div class="motion-results">${renderMotionResultCard('depth', node.depthEnabled !== false, node.depthState, node.depthUrl)}${renderMotionResultCard('pose', node.poseEnabled === true, node.poseState, node.poseUrl)}</div>
+        ${node.motionWarnings?.length ? `<div class="motion-warnings">${node.motionWarnings.map(warning => `<div>${escapeHtml(warning)}</div>`).join('')}</div>` : ''}
+        ${node.motionError ? `<div class="motion-error">${escapeHtml(node.motionError)}</div>` : ''}
+        <div class="motion-actions">${action}</div>
+    `;
+    wrap.querySelectorAll('[data-motion-processor]').forEach(input => {
+        input.onchange = () => setMotionExtractProcessorEnabled(node, input.dataset.motionProcessor, input.checked);
+    });
+    wrap.querySelector('[data-motion-audio]')?.addEventListener('change', event => {
+        node.preserveAudio = event.target.checked;
+        scheduleSave();
+    });
+    wrap.querySelector('[data-motion-start]')?.addEventListener('click', () => startMotionExtract(node.id));
+    wrap.querySelector('[data-motion-retry]')?.addEventListener('click', () => retryMotionExtract(node.id));
+    wrap.querySelector('[data-motion-cancel]')?.addEventListener('click', () => cancelMotionExtract(node.id));
+    return wrap;
+}
 function renderVideoBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'generator-body';
@@ -10094,8 +10253,9 @@ function generatedImageRefs(node){
             return clean;
         });
 }
-function mediaRefsFromNode(node){
+function mediaRefsFromNode(node, fromPort=''){
     if(!node) return [];
+    if(node.type === 'motionExtract') return motionOutputVideoRefs(node, fromPort);
     if(node.type === 'image' && node.url){
         const kind = mediaKindForNode(node);
         return [{url:node.url, name:node.name || kind, role:node.role || '', kind}];
@@ -10118,7 +10278,18 @@ function mediaRefsFromNode(node){
     return [];
 }
 function generatorSources(gen){
-    return connections.filter(c => c.to === gen.id).map(c => nodes.find(n => n.id === c.from)).filter(Boolean).map(n => {
+    return connections.filter(c => c.to === gen.id).map(c => ({node:nodes.find(n => n.id === c.from), fromPort:typeof c.fromPort === 'string' ? c.fromPort : ''})).filter(entry => entry.node).map(({node:n, fromPort}) => {
+        if(n.type === 'motionExtract'){
+            const refs = motionOutputVideoRefs(n, fromPort);
+            return refs.map((ref, i) => ({
+                id:`${n.id}:${fromPort}:${i}:${ref.url}`,
+                type:'motionVideo',
+                label:fromPort.toUpperCase(),
+                preview:ref.url,
+                refs:[ref],
+                prompt:''
+            }));
+        }
         if(n.type === 'output' && (n.images||[]).length){
             // 从 output 节点取最新一张图当作 reference 给下游
             const reversed = [...n.images].map((item, index) => ({item, index})).reverse();
@@ -14129,12 +14300,14 @@ function canConnect(fromId, toId){
     const to = nodes.find(n => n.id === toId);
     if(!from || !to) return false;
     if(CANVAS_GENERATOR_TYPES.includes(from.type)){
+        if(to.type === 'motionExtract') return CANVAS_MEDIA_OUTPUT_TYPES.includes(from.type);
         if(to.type === 'output') return true;
         if(CANVAS_MEDIA_OUTPUT_TYPES.includes(from.type) && CANVAS_GENERATOR_TYPES.includes(to.type)){
             return !wouldCreateGeneratorCycle(fromId, toId);
         }
         return false;
     }
+    if(to.type === 'motionExtract') return ['image','group','output','loop'].includes(from.type) || CANVAS_MEDIA_OUTPUT_TYPES.includes(from.type);
     if(from.type === 'motionExtract') return CANVAS_GENERATOR_TYPES.includes(to.type);
     if(to.type === 'loop'){
         const allowImage = Boolean(to.imageInput) && ['image','group','output'].includes(from.type);
