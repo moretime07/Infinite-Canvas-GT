@@ -2741,7 +2741,8 @@ function motionTaskSafeUrl(value){
 }
 function motionTaskSafeMessage(value){
     const text = typeof value === 'string' ? value.trim() : '';
-    if(!text || text.length > 240 || /(?:[A-Za-z]:[\\/]|\\\\|(?:^|[\s(])\/(?:[\w.-]+\/)*[\w.-]+|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}\b|data:|api[_ -]?key|authorization|bearer|token\s*[=:]|secret|password|credential)/i.test(text)) return tr('canvas.motionFailed');
+    const unsafe = /[\x00-\x1f\x7f]|(?:[A-Za-z]:[\\/])|\\\\[^\s]+|\bfile\s*:\s*(?:(?:[\\/]{2})|(?:%(?:2f|5c)){2})|(?:^|[=:\s("'\[,;])\/(?:[^/\s]+\/)*[^/\s]+|%(?:2f|5c|2e|00|0[0-9a-f]|1f|7f)|\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}\b|data:|api[_ -]?key|authorization|bearer|token\s*[=:]|secret|password|credential/i;
+    if(!text || text.length > 240 || unsafe.test(text)) return tr('canvas.motionFailed');
     return text;
 }
 function motionTaskNode(nodeId){ return nodes.find(candidate => candidate.id === nodeId && candidate.type === 'motionExtract') || null; }

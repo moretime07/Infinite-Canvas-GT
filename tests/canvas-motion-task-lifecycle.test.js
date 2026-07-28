@@ -356,6 +356,25 @@ function motionNode(overrides={}){
     ].forEach(value => assert.equal(context.motionTaskSafeUrl(value), ''));
 }
 
+// Break caught: backend errors cannot persist raw absolute paths or file URIs when they appear after common field separators or in encoded form.
+{
+    const saves = {count:0};
+    const context = lifecycleContext({nodes:[], saves, fetch:async () => response(true, {})});
+    [
+        'source_path=/private/video.mp4',
+        'failed:/private/video.mp4',
+        'file:///private/video.mp4',
+        'file:%2F%2Fprivate%2Fvideo.mp4',
+        'encoded=%2Fprivate%2Fvideo.mp4',
+        '\\\\server\\share\\video.mp4',
+        'C:\\private\\video.mp4',
+        'failed\u0000with control text',
+        'Authorization: Bearer secret-value',
+    ].forEach(value => assert.equal(context.motionTaskSafeMessage(value), 'Motion task failed'));
+    assert.equal(context.motionTaskSafeMessage('The source video is invalid or unsupported.'), 'The source video is invalid or unsupported.');
+    assert.equal(context.motionTaskSafeMessage('视频无效或不支持'), '视频无效或不支持');
+}
+
 console.log('canvas-motion-task-lifecycle: passed');
 })().catch(error => {
     console.error(error);
