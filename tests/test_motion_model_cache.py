@@ -19,7 +19,10 @@ from motion_extractor import models
 class MotionModelCacheTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
+        self.original_sys_path = sys.path.copy()
+        self.original_dont_write_bytecode = sys.dont_write_bytecode
         self.original_pycache_prefix = sys.pycache_prefix
+        self.loaded_module_names = set()
         self.cache_root = Path(self.temp_dir.name) / "cache"
         self.payload = b"verified-model-data"
         self.artifact = models.ModelArtifact(
@@ -29,6 +32,10 @@ class MotionModelCacheTests(unittest.TestCase):
         )
 
     def tearDown(self):
+        for module_name in self.loaded_module_names:
+            sys.modules.pop(module_name, None)
+        sys.path[:] = self.original_sys_path
+        sys.dont_write_bytecode = self.original_dont_write_bytecode
         sys.pycache_prefix = self.original_pycache_prefix
         self.temp_dir.cleanup()
 
@@ -49,6 +56,43 @@ class MotionModelCacheTests(unittest.TestCase):
             return str(source)
 
         return download
+
+    def make_source_fixture(self, name):
+        source = models.GitSource(name, "https://example.invalid/source.git", "a" * 40)
+        checkout = self.cache_root / "motion_models" / "sources" / source.name
+        checkout.mkdir(parents=True)
+        module_name = f"motion_runtime_{name.replace('-', '_')}"
+        self.loaded_module_names.add(module_name)
+        module_path = checkout / f"{module_name}.py"
+        module_path.write_text("VALUE = 'verified-source'\n", encoding="utf-8")
+        tracked_paths = {module_path.relative_to(checkout).as_posix()}
+
+        def git_run(command, **_kwargs):
+            if command[-2:] == ["rev-parse", "HEAD"]:
+                return CompletedProcess(command, 0, source.commit + "\n", "")
+            if "status" in command:
+                untracked_paths = sorted(
+                    path.relative_to(checkout).as_posix()
+                    for path in checkout.rglob("*")
+                    if path.is_file() and path.relative_to(checkout).as_posix() not in tracked_paths
+                )
+                status = "".join(f"?? {path}\0" for path in untracked_paths)
+                return CompletedProcess(command, 0, status, "")
+            self.fail(f"unexpected git command: {command}")
+
+        return source, checkout, module_name, module_path, git_run
+
+    @staticmethod
+    def write_timestamp_bytecode(source_path, bytecode_path, code):
+        source_stat = source_path.stat()
+        header = (
+            importlib.util.MAGIC_NUMBER
+            + (0).to_bytes(4, "little")
+            + int(source_stat.st_mtime).to_bytes(4, "little")
+            + source_stat.st_size.to_bytes(4, "little")
+        )
+        bytecode_path.parent.mkdir(parents=True, exist_ok=True)
+        bytecode_path.write_bytes(header + marshal.dumps(compile(code, str(source_path), "exec")))
 
     def test_reuses_valid_preexisting_model_without_downloading(self):
         destination = self.cache_root / "motion_models" / self.artifact.filename
@@ -230,81 +274,148 @@ class MotionModelCacheTests(unittest.TestCase):
         with self.assertRaises(models.MotionSourceError):
             models.ensure_source_checkout(self.cache_root, source)
 
-    def test_reuses_verified_checkout_after_normal_import_creates_bytecode(self):
-        source = models.GitSource("bytecode-source", "https://example.invalid/source.git", "a" * 40)
-        checkout = self.cache_root / "motion_models" / "sources" / source.name
-        checkout.mkdir(parents=True)
-        module_name = "motion_runtime_bytecode_fixture"
-        module_path = checkout / f"{module_name}.py"
-        module_path.write_text("VALUE = 1\n", encoding="utf-8")
-        original_pycache_prefix = sys.pycache_prefix
+    def test_ensure_motion_assets_returns_source_paths_without_mutating_import_state(self):
+        source, checkout, _module_name, _module_path, git_run = self.make_source_fixture("asset-path")
+        prior_path = sys.path.copy()
+        prior_dont_write_bytecode = sys.dont_write_bytecode
+        prior_pycache_prefix = str(Path(self.temp_dir.name) / "prior-bytecode")
+        sys.pycache_prefix = prior_pycache_prefix
 
-        def git_run(command, **_kwargs):
-            if command[-2:] == ["rev-parse", "HEAD"]:
-                return CompletedProcess(command, 0, source.commit + "\n", "")
-            if "status" in command:
-                in_tree_bytecode = checkout / "__pycache__"
-                status = "?? __pycache__/unexpected.pyc\0" if in_tree_bytecode.exists() else ""
-                return CompletedProcess(command, 0, status, "")
-            self.fail(f"unexpected git command: {command}")
+        with patch.object(models, "GIT_SOURCES", (source,)), patch.object(
+            models, "MODEL_ARTIFACTS", ()
+        ), patch.object(models.subprocess, "run", side_effect=git_run):
+            assets = models.ensure_motion_assets(
+                self.cache_root, lambda _message, _progress: None, lambda: False
+            )
 
-        try:
-            with patch.object(models, "GIT_SOURCES", (source,)), patch.object(
-                models, "MODEL_ARTIFACTS", ()
-            ), patch.object(models.subprocess, "run", side_effect=git_run):
-                first_assets = models.ensure_motion_assets(self.cache_root, lambda _message, _progress: None, lambda: False)
-                bytecode_path = Path(importlib.util.cache_from_source(str(module_path)))
-                importlib.invalidate_caches()
+        self.assertEqual(assets[source.name], checkout)
+        self.assertEqual(sys.path, prior_path)
+        self.assertEqual(sys.dont_write_bytecode, prior_dont_write_bytecode)
+        self.assertEqual(sys.pycache_prefix, prior_pycache_prefix)
+
+    def test_verified_source_imports_allow_clean_repeat_use(self):
+        source, _checkout, module_name, _module_path, git_run = self.make_source_fixture("repeat")
+
+        with patch.object(models, "GIT_SOURCES", (source,)), patch.object(
+            models, "MODEL_ARTIFACTS", ()
+        ), patch.object(models.subprocess, "run", side_effect=git_run):
+            assets = models.ensure_motion_assets(
+                self.cache_root, lambda _message, _progress: None, lambda: False
+            )
+            imported_values = []
+            for _attempt in range(2):
                 sys.modules.pop(module_name, None)
-                imported = importlib.import_module(module_name)
-                second_assets = models.ensure_motion_assets(self.cache_root, lambda _message, _progress: None, lambda: False)
+                with models.verified_source_imports(self.cache_root, assets):
+                    imported_values.append(importlib.import_module(module_name).VALUE)
 
-            self.assertEqual(imported.VALUE, 1)
-            self.assertTrue(bytecode_path.is_file())
-            self.assertTrue(bytecode_path.resolve().is_relative_to(self.cache_root.resolve()))
-            self.assertFalse(bytecode_path.resolve().is_relative_to(checkout.resolve()))
-            self.assertFalse((checkout / "__pycache__").exists())
-            self.assertEqual(second_assets[source.name], first_assets[source.name])
-        finally:
-            sys.pycache_prefix = original_pycache_prefix
-            sys.modules.pop(module_name, None)
-            while str(checkout) in sys.path:
-                sys.path.remove(str(checkout))
+        self.assertEqual(imported_values, ["verified-source", "verified-source"])
+
+    def test_verified_source_imports_create_no_in_tree_or_external_bytecode(self):
+        source, checkout, module_name, _module_path, git_run = self.make_source_fixture("no-bytecode")
+        external_bytecode = Path(self.temp_dir.name) / "external-bytecode"
+        sys.pycache_prefix = str(external_bytecode)
+
+        with patch.object(models, "GIT_SOURCES", (source,)), patch.object(
+            models, "MODEL_ARTIFACTS", ()
+        ), patch.object(models.subprocess, "run", side_effect=git_run):
+            assets = models.ensure_motion_assets(
+                self.cache_root, lambda _message, _progress: None, lambda: False
+            )
+            with models.verified_source_imports(self.cache_root, assets):
+                importlib.import_module(module_name)
+
+        self.assertEqual(list(checkout.rglob("*.pyc")), [])
+        self.assertEqual(list(external_bytecode.rglob("*.pyc")), [])
+
+    def test_verified_source_imports_never_execute_forged_external_bytecode(self):
+        source, _checkout, module_name, module_path, git_run = self.make_source_fixture("external-forgery")
+        external_bytecode = Path(self.temp_dir.name) / "external-bytecode"
+        sys.pycache_prefix = str(external_bytecode)
+        forged_bytecode = Path(importlib.util.cache_from_source(str(module_path)))
+        self.write_timestamp_bytecode(module_path, forged_bytecode, "VALUE = 'forged-bytecode'\n")
+
+        with patch.object(models, "GIT_SOURCES", (source,)), patch.object(
+            models, "MODEL_ARTIFACTS", ()
+        ), patch.object(models.subprocess, "run", side_effect=git_run):
+            assets = models.ensure_motion_assets(
+                self.cache_root, lambda _message, _progress: None, lambda: False
+            )
+            with models.verified_source_imports(self.cache_root, assets):
+                imported = importlib.import_module(module_name)
+
+        self.assertEqual(imported.VALUE, "verified-source")
+
+    def test_verified_source_imports_restore_interpreter_state_after_success(self):
+        source, checkout, _module_name, _module_path, git_run = self.make_source_fixture("restore-success")
+        prior_path = sys.path.copy()
+        prior_dont_write_bytecode = False
+        prior_pycache_prefix = str(Path(self.temp_dir.name) / "prior-bytecode")
+        sys.dont_write_bytecode = prior_dont_write_bytecode
+        sys.pycache_prefix = prior_pycache_prefix
+
+        with patch.object(models, "GIT_SOURCES", (source,)), patch.object(
+            models, "MODEL_ARTIFACTS", ()
+        ), patch.object(models.subprocess, "run", side_effect=git_run):
+            assets = models.ensure_motion_assets(
+                self.cache_root, lambda _message, _progress: None, lambda: False
+            )
+            with models.verified_source_imports(self.cache_root, assets):
+                self.assertEqual(sys.path[0], str(checkout))
+                self.assertTrue(sys.dont_write_bytecode)
+                self.assertIsNone(sys.pycache_prefix)
+
+        self.assertEqual(sys.path, prior_path)
+        self.assertEqual(sys.dont_write_bytecode, prior_dont_write_bytecode)
+        self.assertEqual(sys.pycache_prefix, prior_pycache_prefix)
+
+    def test_verified_source_imports_restore_interpreter_state_after_exception(self):
+        source, _checkout, _module_name, _module_path, git_run = self.make_source_fixture("restore-error")
+        prior_path = sys.path.copy()
+        prior_dont_write_bytecode = False
+        prior_pycache_prefix = str(Path(self.temp_dir.name) / "prior-bytecode")
+        sys.dont_write_bytecode = prior_dont_write_bytecode
+        sys.pycache_prefix = prior_pycache_prefix
+
+        with patch.object(models, "GIT_SOURCES", (source,)), patch.object(
+            models, "MODEL_ARTIFACTS", ()
+        ), patch.object(models.subprocess, "run", side_effect=git_run):
+            assets = models.ensure_motion_assets(
+                self.cache_root, lambda _message, _progress: None, lambda: False
+            )
+            with self.assertRaisesRegex(RuntimeError, "processor failed"):
+                with models.verified_source_imports(self.cache_root, assets):
+                    raise RuntimeError("processor failed")
+
+        self.assertEqual(sys.path, prior_path)
+        self.assertEqual(sys.dont_write_bytecode, prior_dont_write_bytecode)
+        self.assertEqual(sys.pycache_prefix, prior_pycache_prefix)
+
+    def test_verified_source_imports_revalidate_checkout_after_use(self):
+        source, checkout, _module_name, _module_path, git_run = self.make_source_fixture("revalidate")
+
+        with patch.object(models, "GIT_SOURCES", (source,)), patch.object(
+            models, "MODEL_ARTIFACTS", ()
+        ), patch.object(models.subprocess, "run", side_effect=git_run):
+            assets = models.ensure_motion_assets(
+                self.cache_root, lambda _message, _progress: None, lambda: False
+            )
+            with self.assertRaises(models.MotionSourceError):
+                with models.verified_source_imports(self.cache_root, assets):
+                    (checkout / "injected.py").write_text("VALUE = 'injected'\n", encoding="utf-8")
 
     def test_rejects_forged_valid_header_bytecode_inside_checkout(self):
-        source = models.GitSource("forged-bytecode-source", "https://example.invalid/source.git", "a" * 40)
-        checkout = self.cache_root / "motion_models" / "sources" / source.name
-        checkout.mkdir(parents=True)
-        source_path = checkout / "trusted.py"
-        source_path.write_text("VALUE = 1\n", encoding="utf-8")
-        original_pycache_prefix = sys.pycache_prefix
+        source, checkout, _module_name, module_path, git_run = self.make_source_fixture("inside-forgery")
         sys.pycache_prefix = None
-        try:
-            bytecode_path = Path(importlib.util.cache_from_source(str(source_path)))
-        finally:
-            sys.pycache_prefix = original_pycache_prefix
-        bytecode_path.parent.mkdir()
-        source_stat = source_path.stat()
-        header = (
-            importlib.util.MAGIC_NUMBER
-            + (0).to_bytes(4, "little")
-            + int(source_stat.st_mtime).to_bytes(4, "little")
-            + source_stat.st_size.to_bytes(4, "little")
-        )
-        bytecode_path.write_bytes(header + marshal.dumps(compile("VALUE = 'forged'\n", str(source_path), "exec")))
+        bytecode_path = Path(importlib.util.cache_from_source(str(module_path)))
+        self.write_timestamp_bytecode(module_path, bytecode_path, "VALUE = 'forged-bytecode'\n")
+        assets = {source.name: checkout}
 
-        def git_run(command, **_kwargs):
-            if command[-2:] == ["rev-parse", "HEAD"]:
-                return CompletedProcess(command, 0, source.commit + "\n", "")
-            if "status" in command:
-                return CompletedProcess(command, 0, f"?? {bytecode_path.relative_to(checkout).as_posix()}\0", "")
-            if "ls-files" in command:
-                return CompletedProcess(command, 0, "trusted.py\n", "")
-            self.fail(f"unexpected git command: {command}")
-
-        with patch.object(models.subprocess, "run", side_effect=git_run):
+        with patch.object(models, "GIT_SOURCES", (source,)), patch.object(
+            models.subprocess, "run", side_effect=git_run
+        ):
             with self.assertRaises(models.MotionSourceError):
-                models.verify_source_checkout(checkout, source, checkout.parent)
+                with models.verified_source_imports(self.cache_root, assets):
+                    self.fail("a checkout containing bytecode must not enter the import scope")
 
     def test_runtime_status_serialization_has_names_without_absolute_paths(self):
         status = models.MotionRuntimeStatus(

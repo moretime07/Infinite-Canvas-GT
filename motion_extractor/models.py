@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import importlib.util
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator, Mapping
 
 try:
     from huggingface_hub import hf_hub_download
@@ -122,10 +124,6 @@ def _source_directory(cache_root: Path) -> Path:
     return _cache_path(cache_root, "motion_models", "sources")
 
 
-def _source_bytecode_directory(cache_root: Path) -> Path:
-    return _cache_path(cache_root, "motion_models", "source_bytecode")
-
-
 def _cache_path(cache_root: Path, *parts: str) -> Path:
     root = Path(cache_root).resolve()
     candidate = root.joinpath(*parts)
@@ -222,13 +220,19 @@ def ensure_model_artifact(
 
 def verify_source_checkout(checkout: Path, source: GitSource, source_root: Path) -> None:
     """Reject a checkout unless it is clean, contained, and at its pinned commit."""
+    checkout_entries = tuple(checkout.rglob("*")) if checkout.is_dir() else ()
     if (
         not checkout.is_dir()
         or checkout.is_symlink()
         or not _is_within(checkout, source_root)
-        or any(path.is_symlink() and not _is_within(path, checkout) for path in checkout.rglob("*"))
+        or any(path.is_symlink() and not _is_within(path, checkout) for path in checkout_entries)
     ):
         raise MotionSourceError(f"Source {source.name} escapes its verified cache directory")
+    if any(
+        path.is_file() and path.suffix.lower() in {".pyc", ".pyo"}
+        for path in checkout_entries
+    ):
+        raise MotionSourceError(f"Source {source.name} contains persistent bytecode")
     try:
         head = subprocess.run(
             ["git", "-C", str(checkout), "rev-parse", "HEAD"],
@@ -283,6 +287,51 @@ def ensure_source_checkout(cache_root: Path, source: GitSource) -> Path:
     return checkout
 
 
+def _verified_source_checkouts(
+    cache_root: Path,
+    assets: Mapping[str, Path],
+) -> tuple[tuple[GitSource, Path], ...]:
+    source_root = _source_directory(cache_root)
+    verified = []
+    for source in GIT_SOURCES:
+        expected_checkout = _cache_path(cache_root, "motion_models", "sources", source.name)
+        try:
+            checkout = Path(assets[source.name])
+        except (KeyError, TypeError) as error:
+            raise MotionSourceError(f"Verified source path is missing for {source.name}") from error
+        if checkout.resolve(strict=False) != expected_checkout.resolve(strict=False):
+            raise MotionSourceError(f"Source {source.name} escapes its verified cache directory")
+        verify_source_checkout(checkout, source, source_root)
+        verified.append((source, checkout))
+    return tuple(verified)
+
+
+@contextmanager
+def verified_source_imports(
+    cache_root: Path,
+    assets: Mapping[str, Path],
+) -> Iterator[None]:
+    """Temporarily expose pinned sources without reading or writing bytecode caches."""
+    verified_checkouts = _verified_source_checkouts(cache_root, assets)
+    prior_path = sys.path.copy()
+    prior_dont_write_bytecode = sys.dont_write_bytecode
+    prior_pycache_prefix = sys.pycache_prefix
+    checkout_paths = [str(checkout.resolve()) for _source, checkout in verified_checkouts]
+    try:
+        sys.path[:] = checkout_paths + [path for path in prior_path if path not in checkout_paths]
+        sys.dont_write_bytecode = True
+        sys.pycache_prefix = None
+        importlib.invalidate_caches()
+        yield
+    finally:
+        sys.path[:] = prior_path
+        sys.dont_write_bytecode = prior_dont_write_bytecode
+        sys.pycache_prefix = prior_pycache_prefix
+        importlib.invalidate_caches()
+        for source, checkout in verified_checkouts:
+            verify_source_checkout(checkout, source, _source_directory(cache_root))
+
+
 def inspect_motion_runtime(cache_root: Path) -> MotionRuntimeStatus:
     """Inspect the optional local runtime without installing or downloading anything."""
     missing_packages = tuple(
@@ -324,12 +373,6 @@ def ensure_motion_assets(
         _is_cancelled(cancelled)
         checkout = ensure_source_checkout(cache_root, source)
         verify_source_checkout(checkout, source, _source_directory(cache_root))
-        source_bytecode_directory = _source_bytecode_directory(cache_root)
-        source_bytecode_directory.mkdir(parents=True, exist_ok=True)
-        sys.pycache_prefix = str(source_bytecode_directory)
-        checkout_string = str(checkout)
-        if checkout_string not in sys.path:
-            sys.path.insert(0, checkout_string)
         assets[source.name] = checkout
     for artifact in MODEL_ARTIFACTS:
         _is_cancelled(cancelled)
