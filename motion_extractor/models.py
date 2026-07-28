@@ -12,7 +12,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Mapping
+from typing import Callable, Iterable, Iterator, Mapping, TypeVar
 
 try:
     from huggingface_hub import hf_hub_download
@@ -116,6 +116,7 @@ _PACKAGE_MODULES = {
 }
 _HASH_CHUNK_SIZE = 1024 * 1024
 _VERIFIED_SOURCE_IMPORT_LOCK = threading.RLock()
+_Selection = TypeVar("_Selection")
 
 
 def _model_directory(cache_root: Path) -> Path:
@@ -292,10 +293,11 @@ def ensure_source_checkout(cache_root: Path, source: GitSource) -> Path:
 def _verified_source_checkouts(
     cache_root: Path,
     assets: Mapping[str, Path],
+    sources: Iterable[GitSource] | None = None,
 ) -> tuple[tuple[GitSource, Path], ...]:
     source_root = _source_directory(cache_root)
     verified = []
-    for source in GIT_SOURCES:
+    for source in GIT_SOURCES if sources is None else sources:
         expected_checkout = _cache_path(cache_root, "motion_models", "sources", source.name)
         try:
             checkout = Path(assets[source.name])
@@ -312,10 +314,12 @@ def _verified_source_checkouts(
 def verified_source_imports(
     cache_root: Path,
     assets: Mapping[str, Path],
+    source_names: Iterable[str] | None = None,
 ) -> Iterator[None]:
     """Temporarily expose pinned sources without reading or writing bytecode caches."""
     with _VERIFIED_SOURCE_IMPORT_LOCK:
-        verified_checkouts = _verified_source_checkouts(cache_root, assets)
+        selected_sources = _select_named(GIT_SOURCES, source_names, lambda source: source.name)
+        verified_checkouts = _verified_source_checkouts(cache_root, assets, selected_sources)
         prior_path = sys.path.copy()
         prior_dont_write_bytecode = sys.dont_write_bytecode
         prior_pycache_prefix = sys.pycache_prefix
@@ -365,19 +369,52 @@ def inspect_motion_runtime(cache_root: Path) -> MotionRuntimeStatus:
     )
 
 
+def _select_named(
+    candidates: Iterable[_Selection],
+    requested_names: Iterable[str] | None,
+    name: Callable[[_Selection], str],
+) -> tuple[_Selection, ...]:
+    available = tuple(candidates)
+    if requested_names is None:
+        return available
+    by_name = {name(candidate): candidate for candidate in available}
+    requested = tuple(requested_names)
+    if len(set(requested)) != len(requested) or any(item not in by_name for item in requested):
+        raise MotionAssetError("Requested motion runtime asset is unavailable")
+    return tuple(by_name[item] for item in requested)
+
+
 def ensure_motion_assets(
     cache_root: Path,
     progress: Callable[[str, float], None],
     cancelled: Callable[[], bool],
+    *,
+    source_names: Iterable[str] | None = None,
+    artifact_names: Iterable[str] | None = None,
 ) -> dict[str, Path]:
     """Prepare only verified models and immutable source revisions below ``cache_root``."""
     assets: dict[str, Path] = {}
-    for source in GIT_SOURCES:
+    for source in _select_named(GIT_SOURCES, source_names, lambda item: item.name):
         _is_cancelled(cancelled)
         checkout = ensure_source_checkout(cache_root, source)
         verify_source_checkout(checkout, source, _source_directory(cache_root))
         assets[source.name] = checkout
-    for artifact in MODEL_ARTIFACTS:
+    for artifact in _select_named(MODEL_ARTIFACTS, artifact_names, lambda item: item.filename):
         _is_cancelled(cancelled)
         assets[artifact.filename] = ensure_model_artifact(cache_root, artifact, progress, cancelled)
     return assets
+
+
+def ensure_depth_assets(
+    cache_root: Path,
+    progress: Callable[[str, float], None],
+    cancelled: Callable[[], bool],
+) -> dict[str, Path]:
+    """Prepare exactly the verified VDA source and Small checkpoint for depth inference."""
+    return ensure_motion_assets(
+        cache_root,
+        progress,
+        cancelled,
+        source_names=(VIDEO_DEPTH_ANYTHING_SOURCE.name,),
+        artifact_names=("video_depth_anything_vits.pth",),
+    )

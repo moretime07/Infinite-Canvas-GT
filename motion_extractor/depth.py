@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,7 +14,7 @@ from .errors import MotionCancelled, MotionMediaError, MotionOutOfMemory, Motion
 from .media import EncodeResult, SharedFrameStore, encode_rgb_frames
 from .models import (
     MotionCancelled as AssetPreparationCancelled,
-    ensure_motion_assets,
+    ensure_depth_assets,
     verified_source_imports,
 )
 
@@ -29,6 +29,11 @@ _OOM_MESSAGE = "\u672c\u5730\u663e\u5b58\u4e0d\u8db3\uff0c\u65e0\u6cd5\u5b8c\u62
 _RUNTIME_MESSAGE = "\u672c\u5730\u6df1\u5ea6\u5904\u7406\u5931\u8d25\u3002"
 _CANCELLED_MESSAGE = "\u4efb\u52a1\u5df2\u53d6\u6d88\u3002"
 _ROBUST_HISTOGRAM_BINS = 2048
+_INFER_LENGTH = 32
+_OVERLAP = 10
+_INTERPOLATION_LENGTH = 8
+_WINDOW_STEP = _INFER_LENGTH - _OVERLAP
+_ALIGNMENT_KEYFRAMES = (0, 12)
 
 
 @dataclass(frozen=True)
@@ -46,6 +51,52 @@ class _MonotonicProgress:
     def report(self, value: float) -> None:
         self._value = max(self._value, min(1.0, float(value)))
         self._callback(self._value)
+
+
+class _VDAWindowAdapter:
+    """Pinned VDA inference reduced to one bounded, source-sized depth window."""
+
+    def __init__(self, model: Any, torch_module: Any, cv2_module: Any, compose: Any, transforms: tuple[Any, Any, Any]) -> None:
+        self._model = model
+        self._torch = torch_module
+        self._cv2 = cv2_module
+        self._compose = compose
+        self._resize, self._normalize, self._prepare = transforms
+
+    def infer_depth_window(
+        self,
+        frames: np.ndarray,
+        start: int,
+        *,
+        input_size: int,
+        device: str,
+        fp32: bool,
+    ) -> np.ndarray:
+        height, width = frames.shape[1:3]
+        ratio = max(height, width) / min(height, width)
+        effective_size = int(input_size * 1.777 / ratio) if ratio > 1.78 else input_size
+        effective_size = round(effective_size / 14) * 14
+        transform = self._compose([
+            self._resize(
+                width=effective_size, height=effective_size, resize_target=False,
+                keep_aspect_ratio=True, ensure_multiple_of=14, resize_method="lower_bound",
+                image_interpolation_method=self._cv2.INTER_CUBIC,
+            ),
+            self._normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            self._prepare(),
+        ])
+        tensors = []
+        for offset in range(_INFER_LENGTH):
+            frame = np.asarray(frames[min(start + offset, len(frames) - 1)], dtype=np.float32) / 255.0
+            tensors.append(self._torch.from_numpy(transform({"image": frame})["image"]).unsqueeze(0).unsqueeze(0))
+        inputs = self._torch.cat(tensors, dim=1).to(device)
+        with self._torch.no_grad():
+            with self._torch.autocast(device_type=device, enabled=not fp32):
+                depth = self._model.forward(inputs).to(inputs.dtype)
+                depth = self._torch.nn.functional.interpolate(
+                    depth.flatten(0, 1).unsqueeze(1), size=(height, width), mode="bilinear", align_corners=True
+                )
+        return depth[:, 0].detach().cpu().numpy()
 
 
 class DepthProcessor:
@@ -81,26 +132,22 @@ class DepthProcessor:
             self._check_cancelled(cancelled)
             if input_size <= 0:
                 raise MotionRuntimeError(_RUNTIME_MESSAGE)
-            device = "cuda" if self._cuda_is_available() else "cpu"
+            if not self._cuda_is_available():
+                raise MotionRuntimeError(_RUNTIME_MESSAGE)
+            device = "cuda"
             model = self._load_model(device, cancelled, reporter)
             self._check_cancelled(cancelled)
-            inference = model.infer_video_depth(
-                frame_store.frames,
-                frame_store.metadata.fps_num / frame_store.metadata.fps_den,
-                input_size=input_size,
-                device=device,
-                fp32=False,
-            )
-            depth_frames = self._depth_frames(inference)
             self._work_dir.mkdir(parents=True, exist_ok=True)
             with TemporaryDirectory(prefix="motion-depth-", dir=self._work_dir) as temporary:
                 temporary_path = Path(temporary)
-                depth_shape = self._write_depth_memmap(
-                    depth_frames,
-                    frame_store.metadata.frame_count,
+                depth_shape = self._write_windowed_depth_memmap(
+                    model,
+                    frame_store,
                     temporary_path / "relative.depth",
                     cancelled,
                     reporter,
+                    input_size,
+                    device,
                 )
                 self._check_cancelled(cancelled)
                 self._encode_normalized_depth(
@@ -147,64 +194,110 @@ class DepthProcessor:
         if self._model_factory is not None:
             return self._model_factory({}, device)
 
-        assets = ensure_motion_assets(
+        assets = ensure_depth_assets(
             self._cache_root,
             lambda _message, value: reporter.report(0.05 * value),
             cancelled,
         )
-        with verified_source_imports(self._cache_root, assets):
+        with verified_source_imports(self._cache_root, assets, source_names=("video-depth-anything",)):
             import torch
+            import cv2
+            from torchvision.transforms import Compose
+            from video_depth_anything.util.transform import NormalizeImage, PrepareForNet, Resize
             from video_depth_anything.video_depth import VideoDepthAnything
 
             model = VideoDepthAnything(**_SMALL_CONFIGURATION)
             model.load_state_dict(torch.load(assets[_DEPTH_WEIGHT_NAME], map_location="cpu"), strict=True)
-            return model.to(device).eval()
+            return _VDAWindowAdapter(
+                model.to(device).eval(), torch, cv2, Compose, (Resize, NormalizeImage, PrepareForNet)
+            )
 
-    @staticmethod
-    def _depth_frames(inference: object) -> Iterator[object]:
-        payload = inference[0] if isinstance(inference, tuple) else inference
-        if isinstance(payload, np.ndarray):
-            return iter(payload)
-        if isinstance(payload, Iterable):
-            return iter(payload)
-        raise MotionRuntimeError(_RUNTIME_MESSAGE)
-
-    def _write_depth_memmap(
+    def _write_windowed_depth_memmap(
         self,
-        depths: Iterator[object],
-        frame_count: int,
+        model: Any,
+        frame_store: SharedFrameStore,
         path: Path,
         cancelled: Callable[[], bool],
         reporter: _MonotonicProgress,
+        input_size: int,
+        device: str,
     ) -> tuple[int, int]:
-        self._check_cancelled(cancelled)
+        frame_count = frame_store.metadata.frame_count
+        mapped: np.memmap | None = None
+        written = 0
+        pending: np.ndarray | None = None
+        reference: np.ndarray | None = None
+        depth_shape: tuple[int, int] | None = None
         try:
-            first = self._depth_frame(next(depths))
-        except StopIteration:
-            raise MotionRuntimeError(_RUNTIME_MESSAGE) from None
-        height, width = first.shape
-        mapped = np.memmap(path, mode="w+", dtype=np.float16, shape=(frame_count, height, width))
-        try:
-            mapped[0] = first
-            reporter.report(0.05 + 0.60 / frame_count)
-            for index in range(1, frame_count):
+            for start in range(0, frame_count, _WINDOW_STEP):
                 self._check_cancelled(cancelled)
-                try:
-                    mapped[index] = self._depth_frame(next(depths))
-                except StopIteration:
-                    raise MotionRuntimeError(_RUNTIME_MESSAGE) from None
-                reporter.report(0.05 + 0.60 * (index + 1) / frame_count)
-            self._check_cancelled(cancelled)
-            try:
-                next(depths)
-            except StopIteration:
-                return height, width
-            raise MotionRuntimeError(_RUNTIME_MESSAGE)
+                window = self._depth_window(
+                    model.infer_depth_window(
+                        frame_store.frames, start, input_size=input_size, device=device, fp32=False
+                    )
+                )
+                if mapped is None:
+                    depth_shape = window.shape[1:]
+                    mapped = np.memmap(path, mode="w+", dtype=np.float16, shape=(frame_count, *depth_shape))
+
+                def persist(frames: np.ndarray) -> None:
+                    nonlocal written
+                    assert mapped is not None
+                    available = min(len(frames), frame_count - written)
+                    if available:
+                        mapped[written:written + available] = frames[:available]
+                        written += available
+                        reporter.report(0.05 + 0.60 * written / frame_count)
+
+                if pending is None:
+                    reference = window[list(_ALIGNMENT_KEYFRAMES)].copy()
+                    persist(window[: _INFER_LENGTH - _INTERPOLATION_LENGTH])
+                    pending = window[_INFER_LENGTH - _INTERPOLATION_LENGTH :].copy()
+                else:
+                    assert reference is not None
+                    scale, shift = self._alignment_scale_shift(window[: len(_ALIGNMENT_KEYFRAMES)], reference)
+                    post = np.maximum(window[len(_ALIGNMENT_KEYFRAMES) : _OVERLAP] * scale + shift, 0)
+                    persist(self._interpolate_overlap(pending, post))
+                    aligned = np.maximum(window[_OVERLAP:] * scale + shift, 0)
+                    persist(aligned[: _INFER_LENGTH - _OVERLAP - _INTERPOLATION_LENGTH])
+                    pending = aligned[-_INTERPOLATION_LENGTH:].copy()
+                    reference = np.stack((reference[0], np.maximum(window[_ALIGNMENT_KEYFRAMES[1]] * scale + shift, 0)))
+                mapped.flush()
+            if mapped is None or depth_shape is None or written != frame_count:
+                raise MotionRuntimeError(_RUNTIME_MESSAGE)
+            return depth_shape
         finally:
-            mapped.flush()
-            mapping = getattr(mapped, "_mmap", None)
-            if mapping is not None:
-                mapping.close()
+            if mapped is not None:
+                mapped.flush()
+                mapping = getattr(mapped, "_mmap", None)
+                if mapping is not None:
+                    mapping.close()
+
+    @staticmethod
+    def _depth_window(value: object) -> np.ndarray:
+        array = np.asarray(value, dtype=np.float32)
+        if array.ndim != 3 or array.shape[0] != _INFER_LENGTH or not np.isfinite(array).all():
+            raise MotionRuntimeError(_RUNTIME_MESSAGE)
+        return array
+
+    @staticmethod
+    def _alignment_scale_shift(prediction: np.ndarray, target: np.ndarray) -> tuple[float, float]:
+        prediction = prediction.astype(np.float32, copy=False).reshape(-1)
+        target = target.astype(np.float32, copy=False).reshape(-1)
+        a00 = float(np.dot(prediction, prediction))
+        a01 = float(np.sum(prediction))
+        a11 = float(prediction.size)
+        b0 = float(np.dot(prediction, target))
+        b1 = float(np.sum(target))
+        determinant = a00 * a11 - a01 * a01
+        if determinant == 0:
+            return 1.0, 0.0
+        return (a11 * b0 - a01 * b1) / determinant, (-a01 * b0 + a00 * b1) / determinant
+
+    @staticmethod
+    def _interpolate_overlap(previous: np.ndarray, current: np.ndarray) -> np.ndarray:
+        weights = np.linspace(0.0, 1.0, _INTERPOLATION_LENGTH, dtype=np.float32).reshape(-1, 1, 1)
+        return previous * (1.0 - weights) + current * weights
 
     @staticmethod
     def _depth_frame(value: object) -> np.ndarray:
@@ -234,6 +327,7 @@ class DepthProcessor:
 
             def rendered_frames() -> Iterator[np.ndarray]:
                 for index in range(count):
+                    self._check_cancelled(cancelled)
                     yield self._render_depth(depths[index], lower, upper, frame_store)
                     reporter.report(0.68 + 0.30 * (index + 1) / count)
 

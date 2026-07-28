@@ -20,7 +20,7 @@ from uuid import uuid4
 
 import numpy as np
 
-from .errors import MotionMediaError
+from .errors import MotionCancelled, MotionMediaError
 
 
 _MAX_DURATION_SECONDS = 30.0
@@ -308,6 +308,14 @@ def _spooled_frames(spool_path: Path, metadata: VideoMetadata) -> Iterator[np.nd
             yield np.frombuffer(data, dtype=np.uint8).reshape(metadata.height, metadata.width, 3)
 
 
+def _close_process_pipe(pipe: object | None) -> None:
+    try:
+        if pipe is not None:
+            pipe.close()
+    except OSError:
+        pass
+
+
 def _encode_attempt(
     frames: Iterable[np.ndarray],
     metadata: VideoMetadata,
@@ -341,12 +349,21 @@ def _encode_attempt(
         if process.stderr is not None:
             process.stderr.close()
         return count == metadata.frame_count and process.wait(timeout=_PROCESS_TIMEOUT_SECONDS) == 0 and not stderr
+    except MotionCancelled:
+        if "process" in locals() and process.poll() is None:
+            process.kill()
+            process.wait()
+        if "process" in locals():
+            _close_process_pipe(process.stdin)
+            _close_process_pipe(process.stderr)
+        raise
     except (OSError, subprocess.SubprocessError, ValueError, MotionMediaError):
         if "process" in locals() and process.poll() is None:
             process.kill()
             process.wait()
-        if "process" in locals() and process.stderr is not None:
-            process.stderr.close()
+        if "process" in locals():
+            _close_process_pipe(process.stdin)
+            _close_process_pipe(process.stderr)
         return False
 
 
@@ -405,6 +422,10 @@ def encode_rgb_frames(
         spool_path = None
         os.replace(temporary_destination, target)
         return EncodeResult(destination=target, audio_transcoded=audio_transcoded)
+    except MotionCancelled:
+        _cleanup_artifact(temporary_destination, preserve_failure=True)
+        _cleanup_artifact(spool_path, preserve_failure=True)
+        raise
     except (OSError, MotionMediaError):
         _cleanup_artifact(temporary_destination, preserve_failure=True)
         _cleanup_artifact(spool_path, preserve_failure=True)

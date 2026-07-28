@@ -312,6 +312,55 @@ class MotionModelCacheTests(unittest.TestCase):
         self.assertEqual(sys.dont_write_bytecode, prior_dont_write_bytecode)
         self.assertEqual(sys.pycache_prefix, prior_pycache_prefix)
 
+    def test_asset_selection_prepares_only_requested_depth_source_and_weight(self):
+        """Selecting depth assets must not touch the DWPose checkout or download path."""
+        depth_source = models.GitSource("depth-source", "https://example.invalid/depth.git", "a" * 40)
+        pose_source = models.GitSource("pose-source", "https://example.invalid/pose.git", "b" * 40)
+        depth_artifact = models.ModelArtifact("test/depth", "depth.pth", "0" * 64)
+        pose_artifact = models.ModelArtifact("test/pose", "pose.onnx", "1" * 64)
+        selected_source = self.cache_root / "motion_models" / "sources" / depth_source.name
+        selected_weight = self.cache_root / "motion_models" / depth_artifact.filename
+        calls = []
+
+        def source_checkout(_root, source):
+            calls.append(("source", source.name))
+            return selected_source
+
+        def model_artifact(_root, artifact, _progress, _cancelled):
+            calls.append(("artifact", artifact.filename))
+            return selected_weight
+
+        with patch.object(models, "GIT_SOURCES", (depth_source, pose_source)), patch.object(
+            models, "MODEL_ARTIFACTS", (depth_artifact, pose_artifact)
+        ), patch.object(models, "ensure_source_checkout", side_effect=source_checkout), patch.object(
+            models, "ensure_model_artifact", side_effect=model_artifact
+        ), patch.object(
+            models, "verify_source_checkout"
+        ):
+            assets = models.ensure_motion_assets(
+                self.cache_root,
+                lambda _message, _progress: None,
+                lambda: False,
+                source_names=(depth_source.name,),
+                artifact_names=(depth_artifact.filename,),
+            )
+
+        self.assertEqual(calls, [("source", depth_source.name), ("artifact", depth_artifact.filename)])
+        self.assertEqual(assets, {depth_source.name: selected_source, depth_artifact.filename: selected_weight})
+
+    def test_depth_asset_helper_requests_only_vda_small_assets(self):
+        """A depth branch must never expand into the DWPose asset set."""
+        with patch.object(models, "ensure_motion_assets", return_value={}) as prepare:
+            models.ensure_depth_assets(self.cache_root, lambda _message, _progress: None, lambda: False)
+
+        self.assertEqual(
+            prepare.call_args.kwargs,
+            {
+                "source_names": (models.VIDEO_DEPTH_ANYTHING_SOURCE.name,),
+                "artifact_names": ("video_depth_anything_vits.pth",),
+            },
+        )
+
     def test_verified_source_imports_allow_clean_repeat_use(self):
         source, _checkout, module_name, _module_path, git_run = self.make_source_fixture("repeat")
 

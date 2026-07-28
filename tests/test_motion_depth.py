@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import chain
 from pathlib import Path
 import sys
 import tempfile
@@ -15,22 +16,41 @@ sys.path.insert(0, str(ROOT))
 
 from motion_extractor import media
 from motion_extractor.depth import DepthProcessor
-from motion_extractor.errors import MotionMediaError, MotionOutOfMemory
+from motion_extractor.errors import MotionMediaError, MotionOutOfMemory, MotionRuntimeError
 
 
 class FakeDepthModel:
-    """A bounded fake for the upstream ``infer_video_depth`` boundary."""
+    """A bounded fake for the VDA ``infer_depth_window`` boundary."""
 
     def __init__(self, depths: list[np.ndarray], *, error: Exception | None = None) -> None:
         self.depths = depths
         self.error = error
         self.calls: list[dict[str, object]] = []
 
-    def infer_video_depth(self, frames: np.ndarray, target_fps: float, **options: object) -> tuple[object, float]:
-        self.calls.append({"frame_shape": frames.shape, "target_fps": target_fps, **options})
+    def infer_depth_window(self, frames: np.ndarray, start: int, **options: object) -> np.ndarray:
+        self.calls.append({"frame_shape": frames.shape, "start": start, **options})
         if self.error is not None:
             raise self.error
-        return iter(self.depths), target_fps
+        return np.stack([self.depths[min(start + index, len(self.depths) - 1)] for index in range(32)])
+
+
+class FakeWindowedDepthModel:
+    """A fake VDA window boundary; it never returns a full-clip depth result."""
+
+    def __init__(self, depths: list[np.ndarray], *, error: Exception | None = None, work_dir: Path | None = None) -> None:
+        self.depths = depths
+        self.error = error
+        self.work_dir = work_dir
+        self.calls: list[dict[str, object]] = []
+        self.persisted_before_second_window = False
+
+    def infer_depth_window(self, frames: np.ndarray, start: int, **options: object) -> np.ndarray:
+        self.calls.append({"start": start, "frame_shape": frames.shape, **options})
+        if len(self.calls) == 2 and self.work_dir is not None:
+            self.persisted_before_second_window = bool(list(self.work_dir.rglob("*.depth")))
+        if self.error is not None:
+            raise self.error
+        return np.stack([self.depths[min(start + index, len(self.depths) - 1)] for index in range(32)])
 
 
 class MotionDepthTests(unittest.TestCase):
@@ -236,6 +256,102 @@ class MotionDepthTests(unittest.TestCase):
             self.assertEqual(progress[0], 0.0)
             self.assertEqual(progress[-1], 1.0)
             self.assertEqual(progress, sorted(progress))
+
+    def test_window_adapter_uses_bounded_overlapping_windows_and_persists_between_calls(self) -> None:
+        """Replacing the window path with infer_video_depth would lose bounded persistence."""
+        frames = np.zeros((46, 4, 6, 3), dtype=np.uint8)
+        depths = [np.full((2, 3), index / 46, dtype=np.float32) for index in range(46)]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            store = self._store(directory, frames)
+            model = FakeWindowedDepthModel(depths, work_dir=directory / "work")
+            rendered: list[np.ndarray] = []
+            try:
+                result = self._processor(directory, model, rendered).run(
+                    store, directory / "depth.mp4", lambda _value: None, lambda: False
+                )
+            finally:
+                store.close()
+            self.assertEqual(result.state, "completed")
+            self.assertEqual([call["start"] for call in model.calls], [0, 22, 44])
+            self.assertTrue(model.persisted_before_second_window)
+            self.assertEqual(len(rendered), 46)
+
+    def test_cancellation_at_a_window_boundary_skips_the_next_inference_call(self) -> None:
+        """Checking cancellation only after inference would still run one unwanted window."""
+        frames = np.zeros((46, 4, 6, 3), dtype=np.uint8)
+        depths = [np.full((2, 3), index / 46, dtype=np.float32) for index in range(46)]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            store = self._store(directory, frames)
+            model = FakeWindowedDepthModel(depths)
+            cancelled = False
+            infer_window = model.infer_depth_window
+
+            def cancel_after_first_window(*arguments, **keywords):
+                nonlocal cancelled
+                result = infer_window(*arguments, **keywords)
+                cancelled = True
+                return result
+
+            model.infer_depth_window = cancel_after_first_window
+            try:
+                result = self._processor(directory, model, []).run(
+                    store, directory / "depth.mp4", lambda _value: None, lambda: cancelled
+                )
+            finally:
+                store.close()
+            self.assertEqual(result.state, "cancelled")
+            self.assertEqual([call["start"] for call in model.calls], [0])
+
+    def test_missing_cuda_is_a_sanitized_runtime_error(self) -> None:
+        """Falling back to CPU violates the local FP16/CUDA processing contract."""
+        frames = np.zeros((1, 4, 6, 3), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            store = self._store(directory, frames)
+            try:
+                with self.assertRaises(MotionRuntimeError):
+                    self._processor(
+                        directory, FakeWindowedDepthModel([np.ones((2, 3), dtype=np.float32)]), [], cuda_available=False
+                    ).run(store, directory / "depth.mp4", lambda _value: None, lambda: False)
+            finally:
+                store.close()
+
+    def test_cancellation_inside_encode_generator_aborts_without_publishing_output(self) -> None:
+        """Checking only before encode allows a cancelled frame stream to publish an MP4."""
+        frames = np.zeros((2, 4, 6, 3), dtype=np.uint8)
+        depths = [np.full((2, 3), value, dtype=np.float32) for value in (0.1, 0.9)]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            store = self._store(directory, frames)
+            cancel_requested = False
+
+            def cancelled() -> bool:
+                return cancel_requested
+
+            def encode(frame_iterable, metadata, destination, source, preserve_audio):
+                nonlocal cancel_requested
+                iterator = iter(frame_iterable)
+                first = next(iterator)
+                cancel_requested = True
+                return media.encode_rgb_frames(
+                    chain((first,), iterator), metadata, destination, source, preserve_audio
+                )
+
+            processor = DepthProcessor(
+                cache_root=directory / "cache", work_dir=directory / "work",
+                model_factory=lambda _assets, _device: FakeWindowedDepthModel(depths),
+                cuda_available=lambda: True, encoder=encode,
+            )
+            output = directory / "depth.mp4"
+            try:
+                result = processor.run(store, output, lambda _value: None, cancelled)
+            finally:
+                store.close()
+            self.assertEqual(result.state, "cancelled")
+            self.assertFalse(output.exists())
+            self.assertFalse(list(directory.glob("*.tmp.mp4")))
 
 
 if __name__ == "__main__":
