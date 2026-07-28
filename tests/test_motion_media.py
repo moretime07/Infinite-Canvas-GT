@@ -143,15 +143,58 @@ class MotionMediaTests(unittest.TestCase):
                 patch("motion_extractor.media.probe_video", return_value=metadata):
             work_dir = Path(temporary)
 
-            def fail_after_partial_decode(command: list[str], **_keywords: object) -> None:
-                partial = Path(command[-1])
-                partial.write_bytes(b"partial")
-                raise subprocess.CalledProcessError(1, command, stderr="decoder diagnostic")
+            class FailedDecodeProcess:
+                def __init__(self, command: list[str], **_keywords: object) -> None:
+                    self.returncode = 1
+                    Path(command[-1]).write_bytes(b"partial")
 
-            with patch("motion_extractor.media.subprocess.run", side_effect=fail_after_partial_decode):
+                def poll(self) -> int:
+                    return self.returncode
+
+            with patch("motion_extractor.media.subprocess.Popen", FailedDecodeProcess):
                 with self.assertRaises(media.MotionMediaError) as raised:
                     media.decode_video_once(self.source, work_dir)
             self.assertNotIn(str(work_dir), str(raised.exception))
+            self.assertFalse(list(work_dir.glob("*.rgb")))
+
+    def test_decode_cancellation_terminates_kills_and_removes_partial_rgb(self) -> None:
+        metadata = media.VideoMetadata(2, 2, 1, 1, 1, 1.0, 0, False)
+        processes = []
+
+        class StubbornProcess:
+            def __init__(self, command, **_kwargs):
+                self.command = command
+                self.returncode = None
+                self.terminated = False
+                self.killed = False
+                Path(command[-1]).write_bytes(b"partial")
+                processes.append(self)
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                if not self.killed:
+                    raise subprocess.TimeoutExpired(self.command, timeout)
+                self.returncode = -9
+                return self.returncode
+
+            def kill(self):
+                self.killed = True
+
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch("motion_extractor.media.probe_video", return_value=metadata), \
+                patch("motion_extractor.media.subprocess.Popen", StubbornProcess):
+            work_dir = Path(temporary)
+            with self.assertRaises(media.MotionCancelled):
+                media.decode_video_once(self.source, work_dir, lambda: True)
+
+            self.assertEqual(len(processes), 1)
+            self.assertTrue(processes[0].terminated)
+            self.assertTrue(processes[0].killed)
             self.assertFalse(list(work_dir.glob("*.rgb")))
 
     def test_encode_failure_removes_partial_mp4_and_spool_without_diagnostics(self) -> None:

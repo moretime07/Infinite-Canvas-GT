@@ -8,13 +8,14 @@ from dataclasses import dataclass, field
 import gc
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
 from typing import Any, Callable
 from uuid import uuid4
+import warnings
 
 from .depth import BranchResult, DepthProcessor
 from .errors import (
@@ -36,8 +37,19 @@ _PUBLIC_RUNTIME_ERROR = "Local motion processing failed."
 _PUBLIC_OOM_ERROR = "Insufficient local GPU memory."
 _PUBLIC_CANCELLED = "Task cancelled."
 _PUBLIC_WARNING = "Motion processing completed with a warning."
+_NO_PEOPLE_WARNING = "No people were detected; the pose reference is black."
+_CPU_INITIALIZATION_WARNING = "CUDA ONNX provider initialization failed; using CPU fallback."
+_CPU_UNAVAILABLE_WARNING = "CUDA ONNX provider was unavailable; rebuilding with the CPU fallback."
+_AUDIO_TRANSCODE_WARNING = "Source audio was transcoded to AAC for MP4 compatibility."
+_APPROVED_PUBLIC_WARNINGS = frozenset({
+    _NO_PEOPLE_WARNING,
+    _CPU_INITIALIZATION_WARNING,
+    _CPU_UNAVAILABLE_WARNING,
+    _AUDIO_TRANSCODE_WARNING,
+})
 _PROCESS_TIMEOUT_SECONDS = 180
-_WINDOWS_PATH = re.compile(r"""(?i)(?:^|[\s"'(])(?:[a-z]:[\\/]|\\\\)""")
+_PROCESS_POLL_SECONDS = 0.01
+_PROCESS_STOP_TIMEOUT_SECONDS = 1.0
 
 
 def _safe_unlink(path: Path | None) -> None:
@@ -47,20 +59,55 @@ def _safe_unlink(path: Path | None) -> None:
         path.unlink(missing_ok=True)
 
 
-def _run_mux(command: list[str]) -> bool:
+def _stop_process(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+    with suppress(OSError):
+        process.terminate()
     try:
-        result = subprocess.run(
+        process.wait(timeout=_PROCESS_STOP_TIMEOUT_SECONDS)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    with suppress(OSError):
+        process.kill()
+    with suppress(OSError, subprocess.TimeoutExpired):
+        process.wait(timeout=_PROCESS_STOP_TIMEOUT_SECONDS)
+
+
+def _run_mux(command: list[str], cancelled: Callable[[], bool]) -> bool:
+    try:
+        process = subprocess.Popen(
             command,
-            check=False,
-            capture_output=True,
-            timeout=_PROCESS_TIMEOUT_SECONDS,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        return result.returncode == 0
-    except (OSError, subprocess.SubprocessError):
+    except OSError:
         return False
+    deadline = time.monotonic() + _PROCESS_TIMEOUT_SECONDS
+    try:
+        while True:
+            if cancelled():
+                _stop_process(process)
+                raise MotionCancelled(_PUBLIC_CANCELLED)
+            if time.monotonic() >= deadline:
+                _stop_process(process)
+                return False
+            return_code = process.poll()
+            if return_code is not None:
+                return return_code == 0
+            time.sleep(_PROCESS_POLL_SECONDS)
+    except BaseException:
+        _stop_process(process)
+        raise
 
 
-def mux_source_audio(video_path: Path, source_path: Path, destination: Path) -> None:
+def mux_source_audio(
+    video_path: Path,
+    source_path: Path,
+    destination: Path,
+    cancelled: Callable[[], bool] = lambda: False,
+) -> bool:
     """Mux source audio onto an encoded branch without decoding its video stream."""
     executable = shutil.which("ffmpeg")
     try:
@@ -95,12 +142,17 @@ def mux_source_audio(video_path: Path, source_path: Path, destination: Path) -> 
             "copy",
         ]
         copy_command = [*common, "-c:a", "copy", "-shortest", "-movflags", "+faststart", str(target)]
-        copied = _run_mux(copy_command)
+        copied = _run_mux(copy_command, cancelled)
         if not copied or not target.is_file() or target.stat().st_size <= 0:
             _safe_unlink(target)
             aac_command = [*common, "-c:a", "aac", "-shortest", "-movflags", "+faststart", str(target)]
-            if not _run_mux(aac_command) or not target.is_file() or target.stat().st_size <= 0:
+            if not _run_mux(aac_command, cancelled) or not target.is_file() or target.stat().st_size <= 0:
                 raise MotionMediaError(_PUBLIC_MEDIA_ERROR)
+            return True
+        return False
+    except MotionCancelled:
+        _safe_unlink(Path(destination))
+        raise
     except MotionMediaError:
         _safe_unlink(Path(destination))
         raise
@@ -119,6 +171,12 @@ class _PrivateTask:
     incomplete_paths: set[Path] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class _ProcessorOutcome:
+    result: BranchResult
+    warnings: tuple[str, ...]
+
+
 class MotionTaskService:
     """Own one FIFO worker and path-free public task records."""
 
@@ -129,9 +187,9 @@ class MotionTaskService:
         *,
         depth_factory: Callable[[], Any] = DepthProcessor,
         pose_factory: Callable[[], Any] = PoseProcessor,
-        decoder: Callable[[Path, Path], SharedFrameStore] = decode_video_once,
+        decoder: Callable[[Path, Path, Callable[[], bool]], SharedFrameStore] = decode_video_once,
         prober: Callable[[Path], VideoMetadata] = probe_video,
-        audio_muxer: Callable[[Path, Path, Path], None] | None = None,
+        audio_muxer: Callable[[Path, Path, Path, Callable[[], bool]], bool] | None = None,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.work_dir = Path(work_dir)
@@ -211,6 +269,9 @@ class MotionTaskService:
                     "queue_position": 0,
                 })
                 self._cancel_unfinished_branches(record)
+                private.done_event.set()
+                self._refresh_queue_positions_locked()
+                return self._public_copy(record)
             done_event = private.done_event
         await done_event.wait()
         return await self.get(task_id)
@@ -237,6 +298,8 @@ class MotionTaskService:
     async def _worker_loop(self) -> None:
         while True:
             task_id = await self._queue.get()
+            terminal_state: str | None = None
+            failure: Exception | None = None
             try:
                 async with self._lock:
                     record = self._records[task_id]
@@ -247,23 +310,36 @@ class MotionTaskService:
                     private.active = True
                     record["queue_position"] = 0
                     self._refresh_queue_positions_locked()
-                await self._run_task(task_id)
+                terminal_state = await self._run_task(task_id)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                await self._fail_task(task_id, error)
+                private = self._private.get(task_id)
+                terminal_state = "cancelled" if private is not None and private.cancel_event.is_set() else "failed"
+                failure = error
             finally:
                 private = self._private.get(task_id)
                 if private is not None:
-                    await asyncio.to_thread(self._cleanup_incomplete, private)
-                    await asyncio.to_thread(self._cleanup_task_directory, task_id)
+                    try:
+                        await asyncio.to_thread(self._cleanup_incomplete, private)
+                        await asyncio.to_thread(self._cleanup_task_directory, task_id)
+                    except Exception as cleanup_error:
+                        if terminal_state != "cancelled":
+                            terminal_state = "failed"
+                            failure = cleanup_error
                     async with self._lock:
+                        if terminal_state is not None:
+                            self._apply_terminal_locked(
+                                self._records[task_id],
+                                terminal_state,
+                                failure,
+                            )
                         private.active = False
                         private.done_event.set()
                         self._refresh_queue_positions_locked()
                 self._queue.task_done()
 
-    async def _run_task(self, task_id: str) -> None:
+    async def _run_task(self, task_id: str) -> str:
         private = self._private[task_id]
         await self._update(task_id, state="downloading", stage="preparing", progress=0.0)
         self._raise_if_cancelled(private)
@@ -271,7 +347,12 @@ class MotionTaskService:
         self._raise_if_cancelled(private)
         await self._update(task_id, state="running", stage="decoding", progress=10.0)
         task_work_dir = self.work_dir / task_id
-        frame_store = await asyncio.to_thread(self._decoder, private.source_path, task_work_dir)
+        frame_store = await asyncio.to_thread(
+            self._decoder,
+            private.source_path,
+            task_work_dir,
+            private.cancel_event.is_set,
+        )
         entered_store = frame_store
         has_context = hasattr(frame_store, "__enter__") and hasattr(frame_store, "__exit__")
         if has_context:
@@ -294,10 +375,9 @@ class MotionTaskService:
                     20.0 + share * (index + 1),
                 )
             if private.cancel_event.is_set():
-                await self._mark_cancelled(task_id)
-            else:
-                await self._update(task_id, stage="publishing", progress=95.0)
-                await self._finalize_task(task_id)
+                return "cancelled"
+            await self._update(task_id, stage="publishing", progress=95.0)
+            return await self._derived_terminal_state(task_id)
         finally:
             if has_context:
                 await asyncio.to_thread(frame_store.__exit__, None, None, None)
@@ -329,7 +409,7 @@ class MotionTaskService:
         try:
             if branch == "depth":
                 try:
-                    result = await asyncio.to_thread(
+                    outcome = await asyncio.to_thread(
                         self._invoke_processor,
                         self._depth_factory,
                         frame_store,
@@ -342,7 +422,7 @@ class MotionTaskService:
                     await self._update(task_id, low_memory_retry=True)
                     _safe_unlink(temporary_output)
                     self._raise_if_cancelled(private)
-                    result = await asyncio.to_thread(
+                    outcome = await asyncio.to_thread(
                         self._invoke_processor,
                         self._depth_factory,
                         frame_store,
@@ -352,7 +432,7 @@ class MotionTaskService:
                         392,
                     )
             else:
-                result = await asyncio.to_thread(
+                outcome = await asyncio.to_thread(
                     self._invoke_processor,
                     self._pose_factory,
                     frame_store,
@@ -361,6 +441,7 @@ class MotionTaskService:
                     private.cancel_event.is_set,
                     None,
                 )
+            result = outcome.result
             if not isinstance(result, BranchResult):
                 raise MotionRuntimeError(_PUBLIC_RUNTIME_ERROR)
             if result.state == "cancelled" or private.cancel_event.is_set():
@@ -369,10 +450,19 @@ class MotionTaskService:
             if result.state != "completed" or not temporary_output.is_file() or temporary_output.is_symlink():
                 raise MotionRuntimeError(_PUBLIC_RUNTIME_ERROR)
             self._raise_if_cancelled(private)
-            public_url = await self._publish_branch(task_id, branch, frame_store.metadata, temporary_output)
+            public_url, audio_transcoded = await self._publish_branch(
+                task_id,
+                branch,
+                frame_store.metadata,
+                temporary_output,
+            )
             await self._update_branch(task_id, branch, state="completed", url=public_url, error=None)
+            for runtime_warning in outcome.warnings:
+                await self._append_warning(task_id, self._public_warning(runtime_warning))
             if result.warning:
-                await self._append_warning(task_id, self._sanitize_warning(result.warning))
+                await self._append_warning(task_id, self._public_warning(result.warning))
+            if audio_transcoded:
+                await self._append_warning(task_id, _AUDIO_TRANSCODE_WARNING)
             await self._update(task_id, progress=progress_end)
         except MotionCancelled:
             await self._update_branch(task_id, branch, state="cancelled", url=None, error=None)
@@ -386,7 +476,8 @@ class MotionTaskService:
             )
         finally:
             _safe_unlink(temporary_output)
-            private.incomplete_paths.discard(temporary_output)
+            if not temporary_output.exists():
+                private.incomplete_paths.discard(temporary_output)
 
     async def _publish_branch(
         self,
@@ -394,7 +485,7 @@ class MotionTaskService:
         branch: str,
         metadata: VideoMetadata,
         temporary_output: Path,
-    ) -> str:
+    ) -> tuple[str, bool]:
         private = self._private[task_id]
         final_name = f"{uuid4().hex}-{branch}.mp4"
         final_path = self.output_dir / final_name
@@ -404,12 +495,13 @@ class MotionTaskService:
         if preserve_audio and metadata.has_audio:
             muxed_output = self.output_dir / f".{uuid4().hex}-{branch}.mux.mp4"
             private.incomplete_paths.add(muxed_output)
-            await asyncio.to_thread(
+            audio_transcoded = bool(await asyncio.to_thread(
                 self._audio_muxer,
                 temporary_output,
                 private.source_path,
                 muxed_output,
-            )
+                private.cancel_event.is_set,
+            ))
             if not muxed_output.is_file() or muxed_output.is_symlink():
                 raise MotionMediaError(_PUBLIC_MEDIA_ERROR)
             publication_source = muxed_output
@@ -418,7 +510,7 @@ class MotionTaskService:
         private.incomplete_paths.discard(publication_source)
         if muxed_output is not None:
             _safe_unlink(temporary_output)
-        return f"/assets/output/motion/{final_name}"
+        return f"/assets/output/motion/{final_name}", bool(muxed_output is not None and audio_transcoded)
 
     def _private_preserve_audio(self, task_id: str) -> bool:
         return self._private[task_id].preserve_audio
@@ -431,12 +523,22 @@ class MotionTaskService:
         progress: Callable[[float], None],
         cancelled: Callable[[], bool],
         input_size: int | None,
-    ) -> BranchResult:
+    ) -> _ProcessorOutcome:
         processor = factory()
         try:
-            if input_size is None:
-                return processor.run(frame_store, output_path, progress, cancelled)
-            return processor.run(frame_store, output_path, progress, cancelled, input_size=input_size)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                if input_size is None:
+                    result = processor.run(frame_store, output_path, progress, cancelled)
+                else:
+                    result = processor.run(
+                        frame_store,
+                        output_path,
+                        progress,
+                        cancelled,
+                        input_size=input_size,
+                    )
+            return _ProcessorOutcome(result, tuple(str(item.message) for item in caught))
         finally:
             for method_name in ("close", "release"):
                 method = getattr(processor, method_name, None)
@@ -484,9 +586,10 @@ class MotionTaskService:
 
     async def _append_warning(self, task_id: str, warning: str) -> None:
         async with self._lock:
-            self._records[task_id]["warnings"].append(warning)
+            if warning not in self._records[task_id]["warnings"]:
+                self._records[task_id]["warnings"].append(warning)
 
-    async def _finalize_task(self, task_id: str) -> None:
+    async def _derived_terminal_state(self, task_id: str) -> str:
         async with self._lock:
             record = self._records[task_id]
             enabled_states = [
@@ -495,36 +598,30 @@ class MotionTaskService:
                 if record[f"{branch}_state"] != "disabled"
             ]
             if enabled_states and all(state == "completed" for state in enabled_states):
-                state = "completed"
-            elif any(state == "completed" for state in enabled_states):
-                state = "partial"
-            else:
-                state = "failed"
-            record.update({"state": state, "stage": state, "progress": 100.0, "queue_position": 0})
+                return "completed"
+            if any(state == "completed" for state in enabled_states):
+                return "partial"
+            return "failed"
 
-    async def _mark_cancelled(self, task_id: str) -> None:
-        async with self._lock:
-            record = self._records[task_id]
+    def _apply_terminal_locked(
+        self,
+        record: dict[str, Any],
+        state: str,
+        error: Exception | None,
+    ) -> None:
+        if state == "cancelled":
             self._cancel_unfinished_branches(record)
-            record.update({"state": "cancelled", "stage": "cancelled", "queue_position": 0})
-
-    async def _fail_task(self, task_id: str, error: Exception) -> None:
-        async with self._lock:
-            record = self._records.get(task_id)
-            private = self._private.get(task_id)
-            if record is None:
-                return
-            if private is not None and private.cancel_event.is_set():
-                self._cancel_unfinished_branches(record)
-                record.update({"state": "cancelled", "stage": "cancelled", "queue_position": 0})
-                return
+        elif state == "failed" and error is not None:
             public_error = self._public_error(error)
             for branch in _BRANCHES:
                 if record[f"{branch}_state"] in {"pending", "running"}:
                     record[f"{branch}_state"] = "failed"
                     record[f"{branch}_url"] = None
                     record[f"{branch}_error"] = public_error
-            record.update({"state": "failed", "stage": "failed", "queue_position": 0})
+        changes = {"state": state, "stage": state, "queue_position": 0}
+        if state != "cancelled":
+            changes["progress"] = 100.0
+        record.update(changes)
 
     def _refresh_queue_positions_locked(self) -> None:
         position = 1
@@ -549,13 +646,26 @@ class MotionTaskService:
     @staticmethod
     def _cleanup_incomplete(private: _PrivateTask) -> None:
         for path in tuple(private.incomplete_paths):
-            _safe_unlink(path)
-            private.incomplete_paths.discard(path)
+            try:
+                path.unlink(missing_ok=True)
+                private.incomplete_paths.discard(path)
+            except OSError:
+                raise MotionMediaError(_PUBLIC_MEDIA_ERROR) from None
 
     def _cleanup_task_directory(self, task_id: str) -> None:
         task_directory = self.work_dir / task_id
-        with suppress(OSError):
-            task_directory.rmdir()
+        try:
+            if not task_directory.exists():
+                return
+            work_root = self.work_dir.resolve(strict=True)
+            resolved = task_directory.resolve(strict=True)
+            if self.work_dir.is_symlink() or task_directory.is_symlink() or resolved.parent != work_root:
+                raise MotionMediaError(_PUBLIC_MEDIA_ERROR)
+            shutil.rmtree(resolved)
+        except MotionMediaError:
+            raise
+        except (OSError, ValueError):
+            raise MotionMediaError(_PUBLIC_MEDIA_ERROR) from None
 
     @staticmethod
     def _safe_source_url(source_url: str) -> str:
@@ -585,18 +695,6 @@ class MotionTaskService:
         return _PUBLIC_RUNTIME_ERROR
 
     @staticmethod
-    def _sanitize_warning(warning: object) -> str:
+    def _public_warning(warning: object) -> str:
         text = str(warning or "").strip()
-        lowered = text.lower()
-        unsafe_markers = (
-            "traceback", "sk-", "api_key", "apikey", "secret", "token=", "bearer ",
-            "/users/", "/home/",
-        )
-        if (
-            not text
-            or len(text) > 240
-            or _WINDOWS_PATH.search(text)
-            or any(marker in lowered for marker in unsafe_markers)
-        ):
-            return _PUBLIC_WARNING
-        return text
+        return text if text in _APPROVED_PUBLIC_WARNINGS else _PUBLIC_WARNING

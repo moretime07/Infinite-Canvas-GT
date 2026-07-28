@@ -202,6 +202,11 @@ async def startup_event():
     except Exception as exc:
         print(f"纠正图片扩展名失败: {exc}")
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    await MOTION_TASK_SERVICE.close()
+
+
 @app.websocket("/ws/stats")
 async def websocket_endpoint(websocket: WebSocket, client_id: str = None):
     await manager.connect(websocket, client_id)

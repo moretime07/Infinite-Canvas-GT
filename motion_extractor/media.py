@@ -8,6 +8,7 @@ processed frames without retaining a complete output clip in memory.
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
+from contextlib import suppress
 from dataclasses import dataclass, replace
 import json
 import math
@@ -15,7 +16,8 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-from typing import Any
+import time
+from typing import Any, Callable
 from uuid import uuid4
 
 import numpy as np
@@ -26,6 +28,8 @@ from .errors import MotionCancelled, MotionMediaError
 _MAX_DURATION_SECONDS = 30.0
 _PUBLIC_MEDIA_ERROR = "媒体文件无效或无法读取"
 _PROCESS_TIMEOUT_SECONDS = 180
+_PROCESS_POLL_SECONDS = 0.01
+_PROCESS_STOP_TIMEOUT_SECONDS = 1.0
 _MP4_STREAM_COPY_AUDIO_CODECS = frozenset({"aac", "ac3", "alac", "eac3", "mp3"})
 
 
@@ -235,7 +239,56 @@ def _safe_work_directory(work_dir: Path) -> Path:
         raise _media_error() from None
 
 
-def decode_video_once(path: Path, work_dir: Path) -> SharedFrameStore:
+def _stop_process(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+    with suppress(OSError):
+        process.terminate()
+    try:
+        process.wait(timeout=_PROCESS_STOP_TIMEOUT_SECONDS)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    with suppress(OSError):
+        process.kill()
+    with suppress(OSError, subprocess.TimeoutExpired):
+        process.wait(timeout=_PROCESS_STOP_TIMEOUT_SECONDS)
+
+
+def _decode_to_raw(command: list[str], cancelled: Callable[[], bool]) -> None:
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        raise _media_error() from None
+    deadline = time.monotonic() + _PROCESS_TIMEOUT_SECONDS
+    try:
+        while True:
+            if cancelled():
+                _stop_process(process)
+                raise MotionCancelled("Task cancelled.")
+            if time.monotonic() >= deadline:
+                _stop_process(process)
+                raise _media_error()
+            return_code = process.poll()
+            if return_code is not None:
+                if return_code != 0:
+                    raise _media_error()
+                return
+            time.sleep(_PROCESS_POLL_SECONDS)
+    except BaseException:
+        _stop_process(process)
+        raise
+
+
+def decode_video_once(
+    path: Path,
+    work_dir: Path,
+    cancelled: Callable[[], bool] = lambda: False,
+) -> SharedFrameStore:
     """Decode a source once into a display-oriented, task-local RGB memmap."""
     source = _safe_readable_file(path)
     metadata = probe_video(source)
@@ -243,17 +296,14 @@ def decode_video_once(path: Path, work_dir: Path) -> SharedFrameStore:
     raw_path = directory / f"motion-frames-{uuid4().hex}.rgb"
     frame_bytes = metadata.width * metadata.height * 3
     try:
-        subprocess.run(
+        _decode_to_raw(
             [
                 _required_executable("ffmpeg"),
                 "-hide_banner", "-loglevel", "error", "-y",
                 "-i", str(source), "-map", "0:v:0", "-an", "-sn", "-dn",
                 "-pix_fmt", "rgb24", "-f", "rawvideo", str(raw_path),
             ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=_PROCESS_TIMEOUT_SECONDS,
+            cancelled,
         )
         byte_count = raw_path.stat().st_size
         if byte_count == 0 or byte_count % frame_bytes:
@@ -269,7 +319,7 @@ def decode_video_once(path: Path, work_dir: Path) -> SharedFrameStore:
             shape=(frame_count, metadata.height, metadata.width, 3),
         )
         return SharedFrameStore(actual_metadata, raw_path, frames)
-    except MotionMediaError:
+    except (MotionCancelled, MotionMediaError):
         _cleanup_artifact(raw_path, preserve_failure=True)
         raise
     except (OSError, subprocess.SubprocessError, ValueError):
