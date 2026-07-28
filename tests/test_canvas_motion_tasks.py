@@ -487,6 +487,55 @@ class CanvasMotionTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["state"], "completed")
         self.assertEqual(list(service.work_dir.rglob("*")), [])
 
+    async def test_cancel_during_frame_store_close_wins_and_preserves_published_output(self):
+        close_started = threading.Event()
+        release_close = threading.Event()
+
+        class BlockingCloseStore(FakeFrameStore):
+            def __exit__(self, _exc_type, _exc, _traceback):
+                close_started.set()
+                release_close.wait()
+                self.closed = True
+
+        service = self.make_service(
+            decoder=lambda _path, _work_dir, _cancelled: BlockingCloseStore(),
+        )
+        created = await service.submit("/assets/input/source.mp4", self.source, True, False, False)
+        self.assertTrue(await asyncio.to_thread(close_started.wait, 1.0))
+        while_closing = await service.get(created["task_id"])
+        self.assertEqual(while_closing["depth_state"], "completed")
+        published_url = while_closing["depth_url"]
+        self.assertIsNotNone(published_url)
+
+        cancel_task = asyncio.create_task(service.cancel(created["task_id"]))
+        try:
+            deadline = time.monotonic() + 1.0
+            private = service._private[created["task_id"]]
+            while not private.cancel_event.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
+            self.assertTrue(private.cancel_event.is_set())
+            self.assertFalse(cancel_task.done())
+        finally:
+            release_close.set()
+
+        record = await asyncio.wait_for(cancel_task, timeout=0.5)
+        self.assertEqual(record["state"], "cancelled")
+        self.assertEqual(record["depth_state"], "completed")
+        self.assertEqual(record["depth_url"], published_url)
+        self.assertTrue((service.output_dir / Path(published_url).name).is_file())
+
+    async def test_cancel_after_terminal_completion_does_not_change_state(self):
+        service = self.make_service()
+        created = await service.submit("/assets/input/source.mp4", self.source, True, False, False)
+        completed = await self.wait_for_state(service, created["task_id"], {"completed"})
+        private = service._private[created["task_id"]]
+        self.assertFalse(private.cancel_event.is_set())
+
+        after_cancel = await service.cancel(created["task_id"])
+
+        self.assertEqual(after_cancel, completed)
+        self.assertFalse(private.cancel_event.is_set())
+
     async def test_frame_store_cleanup_failure_never_exposes_terminal_success(self):
         close_started = threading.Event()
         release_close = threading.Event()

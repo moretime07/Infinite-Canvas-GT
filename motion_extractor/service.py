@@ -329,6 +329,9 @@ class MotionTaskService:
                             failure = cleanup_error
                     async with self._lock:
                         if terminal_state is not None:
+                            if private.cancel_event.is_set():
+                                terminal_state = "cancelled"
+                                failure = None
                             self._apply_terminal_locked(
                                 self._records[task_id],
                                 terminal_state,
