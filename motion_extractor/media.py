@@ -20,15 +20,13 @@ from uuid import uuid4
 
 import numpy as np
 
+from .errors import MotionMediaError
+
 
 _MAX_DURATION_SECONDS = 30.0
 _PUBLIC_MEDIA_ERROR = "媒体文件无效或无法读取"
 _PROCESS_TIMEOUT_SECONDS = 180
 _MP4_STREAM_COPY_AUDIO_CODECS = frozenset({"aac", "ac3", "alac", "eac3", "mp3"})
-
-
-class MotionMediaError(Exception):
-    """A stable, path-free error for invalid local media."""
 
 
 def _cleanup_artifact(path: Path | None, *, preserve_failure: bool = False) -> None:
