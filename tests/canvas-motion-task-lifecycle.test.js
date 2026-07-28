@@ -377,6 +377,10 @@ function motionNode(overrides={}){
         'encoded=%2Fprivate%2Fvideo.mp4',
         '\\\\server\\share\\video.mp4',
         'C:\\private\\video.mp4',
+        '\\private\\video.mp4',
+        'source_path=\\private\\video.mp4',
+        '\\Users\\PC\\video.mp4',
+        'source_path=\\Users\\PC\\video.mp4',
         'failed\u0000with control text',
         'Authorization: Bearer secret-value',
     ].forEach(value => assert.equal(context.motionTaskSafeMessage(value), 'Motion task failed'));

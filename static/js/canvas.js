@@ -2750,7 +2750,7 @@ function motionTaskSafeMessage(value){
         if(!separator || previousIsSeparator || previousIsWord) continue;
         let end = index;
         while(normalized[end] === '/' || normalized[end] === '\\') end += 1;
-        if(end < normalized.length && !/\s/.test(normalized[end]) && (normalized[index] === '/' || end - index > 1)){
+        if(end < normalized.length && !/\s/.test(normalized[end])){
             hasAbsolutePath = true;
             break;
         }
