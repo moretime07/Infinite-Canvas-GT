@@ -27,3 +27,61 @@ vm.runInContext(`${productionFunction('canConnect')}\nthis.canConnect = canConne
 
 // Break caught: motion results must be usable as LLM input.
 assert.equal(connectionContext.canConnect(motion.id, llm.id), true);
+
+const depthUrl = '/assets/motion/depth.mp4';
+const poseUrl = '/assets/motion/pose.mp4';
+const motionReady = {
+    id:'motion-ready',
+    type:'motionExtract',
+    depthEnabled:true,
+    depthState:'completed',
+    depthUrl,
+    poseEnabled:true,
+    poseState:'completed',
+    poseUrl,
+};
+const motionPending = {
+    id:'motion-pending',
+    type:'motionExtract',
+    depthEnabled:true,
+    depthState:'processing',
+    depthUrl:'',
+    poseEnabled:false,
+    poseState:'disabled',
+    poseUrl:'',
+};
+const targetLLM = {id:'llm-target', type:'llm'};
+const mediaContext = {
+    nodes:[motionReady, motionPending, targetLLM],
+    connections:[
+        {from:motionReady.id, to:targetLLM.id, fromPort:'pose'},
+        {from:motionReady.id, to:targetLLM.id, fromPort:'depth'},
+        {from:motionReady.id, to:targetLLM.id, fromPort:'depth'},
+        {from:motionPending.id, to:targetLLM.id, fromPort:'depth'},
+        {from:motionPending.id, to:targetLLM.id, fromPort:'pose'},
+        {from:motionReady.id, to:targetLLM.id},
+    ],
+    tr:key => key,
+    mediaKindForNode:() => 'video',
+    isVideoUrl:url => String(url).endsWith('.mp4'),
+    outputUrlValue:item => typeof item === 'string' ? item : item?.url || '',
+};
+vm.createContext(mediaContext);
+vm.runInContext([
+    productionFunction('motionVideoRefMetadata'),
+    productionFunction('motionOutputVideoRefs'),
+    productionFunction('normalizedFromPort'),
+    productionFunction('llmInputVideos'),
+    'this.llmInputVideos = llmInputVideos;',
+].join('\n'), mediaContext);
+
+assert.deepEqual(
+    Array.from(mediaContext.llmInputVideos(targetLLM)),
+    [poseUrl, depthUrl]
+);
+
+mediaContext.connections = [{from:motionReady.id, to:targetLLM.id, fromPort:'depth'}];
+assert.deepEqual(Array.from(mediaContext.llmInputVideos(targetLLM)), [depthUrl]);
+
+mediaContext.connections = [{from:motionReady.id, to:targetLLM.id, fromPort:'pose'}];
+assert.deepEqual(Array.from(mediaContext.llmInputVideos(targetLLM)), [poseUrl]);

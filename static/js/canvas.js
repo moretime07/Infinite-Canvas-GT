@@ -8703,14 +8703,29 @@ function llmInputImages(node){
 }
 function llmInputVideos(node){
     const urls = [];
-    connections.filter(c => c.to === node.id).map(c => nodes.find(n => n.id === c.from)).filter(Boolean).forEach(n => {
-        if(n.type === 'image' && n.url && mediaKindForNode(n) === 'video') urls.push(n.url);
+    const seen = new Set();
+    const addUrl = url => {
+        if(!url || seen.has(url)) return;
+        seen.add(url);
+        urls.push(url);
+    };
+    connections.filter(c => c.to === node.id).forEach(connection => {
+        const n = nodes.find(candidate => candidate.id === connection.from);
+        if(!n) return;
+        if(n.type === 'motionExtract'){
+            motionOutputVideoRefs(n, normalizedFromPort(connection)).forEach(ref => addUrl(ref?.url));
+            return;
+        }
+        if(n.type === 'image' && n.url && mediaKindForNode(n) === 'video') addUrl(n.url);
         if(n.type === 'output' && (n.images||[]).length){
             const last = [...n.images].reverse().map(outputUrlValue).find(url => url && isVideoUrl(url));
-            if(last) urls.push(last);
+            addUrl(last);
         }
         if(n.type === 'group'){
-            (n.items || []).map(id => nodes.find(x => x.id === id)).filter(x => x?.type === 'image' && x?.url && mediaKindForNode(x) === 'video').forEach(video => urls.push(video.url));
+            (n.items || [])
+                .map(id => nodes.find(candidate => candidate.id === id))
+                .filter(item => item?.type === 'image' && item?.url && mediaKindForNode(item) === 'video')
+                .forEach(video => addUrl(video.url));
         }
     });
     return urls;
