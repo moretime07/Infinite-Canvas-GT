@@ -553,6 +553,7 @@ const context = {
     tr:key => key === 'canvas.motionRuntimeUnavailable' ? guidance : key,
     render:() => {},
     scheduleSave:() => {},
+    syncConnectedOutputsFromMotion:() => 0,
     JSON,
     Math,
     String,
