@@ -85,3 +85,42 @@ assert.deepEqual(Array.from(mediaContext.llmInputVideos(targetLLM)), [depthUrl])
 
 mediaContext.connections = [{from:motionReady.id, to:targetLLM.id, fromPort:'pose'}];
 assert.deepEqual(Array.from(mediaContext.llmInputVideos(targetLLM)), [poseUrl]);
+
+mediaContext.connections = [
+    {from:motionReady.id, to:targetLLM.id, fromPort:'depth'},
+    {from:motionReady.id, to:targetLLM.id, fromPort:'pose'},
+];
+mediaContext.llmInputImages = () => [];
+mediaContext.syncDefaultCanvasNodeProvider = () => {};
+mediaContext.unresolvedDefaultCanvasNodeError = () => '';
+mediaContext.resolveCanvasNodeRequest = () => ({providerId:'openrouter', model:'vision-model'});
+mediaContext.chatProviderModeOptions = () => ({});
+mediaContext.resolveChatModel = value => value;
+mediaContext.responseErrorMessage = async () => 'LLM failed';
+mediaContext.capturedRequests = [];
+mediaContext.cascadeFetch = async (url, options={}) => {
+    mediaContext.capturedRequests.push({url, body:JSON.parse(options.body)});
+    return {ok:true, json:async () => ({text:'motion recognized'})};
+};
+targetLLM.llmProvider = 'openrouter';
+targetLLM.model = 'vision-model';
+targetLLM.systemPrompt = 'Analyze the motion references.';
+
+vm.runInContext(
+    `${productionFunction('callCanvasLLM')}\nthis.callCanvasLLM = callCanvasLLM;`,
+    mediaContext
+);
+
+(async () => {
+    const text = await mediaContext.callCanvasLLM(targetLLM, 'Describe the movement');
+    assert.equal(text, 'motion recognized');
+    assert.equal(mediaContext.capturedRequests[0].url, '/api/canvas-llm');
+    assert.deepEqual(
+        Array.from(mediaContext.capturedRequests[0].body.videos),
+        [depthUrl, poseUrl]
+    );
+    assert.deepEqual(Array.from(mediaContext.capturedRequests[0].body.images), []);
+})().catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+});
