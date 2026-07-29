@@ -14867,7 +14867,7 @@ function canConnect(fromId, toId){
         return false;
     }
     if(to.type === 'motionExtract') return ['image','group','output','loop'].includes(from.type) || CANVAS_MEDIA_OUTPUT_TYPES.includes(from.type);
-    if(from.type === 'motionExtract') return to.type === 'output' || CANVAS_GENERATOR_TYPES.includes(to.type);
+    if(from.type === 'motionExtract') return to.type === 'llm' || to.type === 'output' || CANVAS_GENERATOR_TYPES.includes(to.type);
     if(to.type === 'llm') return ['prompt','loop','promptGroup','llm','image','group','output'].includes(from.type);
     if(from.type === 'llm') return CANVAS_GENERATOR_TYPES.includes(to.type);
     return CANVAS_GENERATOR_TYPES.includes(to.type) && ['image','prompt','loop','group','promptGroup','output','llm'].includes(from.type);
