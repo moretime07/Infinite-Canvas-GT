@@ -50,9 +50,23 @@ const motionPending = {
     poseState:'disabled',
     poseUrl:'',
 };
+const motionFailed = {
+    id:'motion-failed',
+    type:'motionExtract',
+    depthEnabled:true,
+    depthState:'failed',
+    depthUrl:'/assets/motion/failed.mp4',
+};
+const motionCompletedWithoutUrl = {
+    id:'motion-completed-without-url',
+    type:'motionExtract',
+    depthEnabled:true,
+    depthState:'completed',
+    depthUrl:'',
+};
 const targetLLM = {id:'llm-target', type:'llm'};
 const mediaContext = {
-    nodes:[motionReady, motionPending, targetLLM],
+    nodes:[motionReady, motionPending, motionFailed, motionCompletedWithoutUrl, targetLLM],
     connections:[
         {from:motionReady.id, to:targetLLM.id, fromPort:'pose'},
         {from:motionReady.id, to:targetLLM.id, fromPort:'depth'},
@@ -62,7 +76,7 @@ const mediaContext = {
         {from:motionReady.id, to:targetLLM.id},
     ],
     tr:key => key,
-    mediaKindForNode:() => 'video',
+    mediaKindForNode:node => node?.mediaKind || (String(node?.url || '').endsWith('.mp4') ? 'video' : 'image'),
     isVideoUrl:url => String(url).endsWith('.mp4'),
     outputUrlValue:item => typeof item === 'string' ? item : item?.url || '',
 };
@@ -85,6 +99,44 @@ assert.deepEqual(Array.from(mediaContext.llmInputVideos(targetLLM)), [depthUrl])
 
 mediaContext.connections = [{from:motionReady.id, to:targetLLM.id, fromPort:'pose'}];
 assert.deepEqual(Array.from(mediaContext.llmInputVideos(targetLLM)), [poseUrl]);
+
+// Break caught: failed results must not become usable video references.
+mediaContext.connections = [{from:motionFailed.id, to:targetLLM.id, fromPort:'depth'}];
+assert.deepEqual(Array.from(mediaContext.llmInputVideos(targetLLM)), []);
+
+// Break caught: a completed branch without a URL is still unavailable.
+mediaContext.connections = [{from:motionCompletedWithoutUrl.id, to:targetLLM.id, fromPort:'depth'}];
+assert.deepEqual(Array.from(mediaContext.llmInputVideos(targetLLM)), []);
+
+const normalVideo = {id:'normal-video', type:'image', url:'/assets/input/normal.mp4'};
+const output = {
+    id:'video-output',
+    type:'output',
+    images:[
+        {url:'/assets/output/older.mp4'},
+        {url:'/assets/output/latest.mp4'},
+        {url:'/assets/output/final-still.png'},
+    ],
+};
+const groupVideo = {id:'group-video', type:'image', url:'/assets/group/unique.mp4'};
+const duplicateGroupVideo = {id:'group-duplicate', type:'image', url:normalVideo.url};
+const groupImage = {id:'group-image', type:'image', url:'/assets/group/still.png'};
+const group = {id:'video-group', type:'group', items:[duplicateGroupVideo.id, groupImage.id, groupVideo.id]};
+mediaContext.nodes.push(normalVideo, output, groupVideo, duplicateGroupVideo, groupImage, group);
+mediaContext.connections = [
+    {from:normalVideo.id, to:targetLLM.id},
+    {from:output.id, to:targetLLM.id},
+    {from:group.id, to:targetLLM.id},
+    {from:motionReady.id, to:targetLLM.id, fromPort:'pose'},
+    {from:motionReady.id, to:targetLLM.id, fromPort:'depth'},
+    {from:normalVideo.id, to:targetLLM.id},
+];
+
+// Break caught: motion support must preserve ordinary video, Output, and group ordering and deduplication.
+assert.deepEqual(
+    Array.from(mediaContext.llmInputVideos(targetLLM)),
+    [normalVideo.url, '/assets/output/latest.mp4', groupVideo.url, poseUrl, depthUrl]
+);
 
 mediaContext.connections = [
     {from:motionReady.id, to:targetLLM.id, fromPort:'depth'},

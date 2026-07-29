@@ -23,7 +23,7 @@
    - `name`（`depth.mp4` 或 `pose.mp4`）
    - `kind: "video"`
    - 已有的视频元数据
-5. LLM 请求继续通过现有 `/api/llm` 接口发送，动作提取结果进入 `videos` 数组，不进入 `images` 数组。
+5. LLM 请求继续通过现有 `/api/canvas-llm` 接口发送，动作提取结果进入 `videos` 数组，不进入 `images` 数组。
 
 ## 顺序与去重
 
@@ -54,5 +54,5 @@
 - 同时连接两个端口时，两个视频按连接顺序发送。
 - 重复 URL 只发送一次。
 - 禁用、未完成、失败和缺少 URL 的端口不发送。
-- `/api/llm` 请求中视频位于 `videos`，不会进入 `images`。
+- `/api/canvas-llm` 请求中视频位于 `videos`，不会进入 `images`。
 - 现有普通视频输入测试继续通过。
