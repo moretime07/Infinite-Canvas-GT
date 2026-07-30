@@ -12291,6 +12291,62 @@ function canvasWorkflowEdges(){
     });
     return direct;
 }
+function findWorkflowCycle(anchorId){
+    const runTypes = new Set(canvasRunTypes());
+    const edges = canvasWorkflowEdges();
+    const relevant = new Set([anchorId]);
+    let changed = true;
+    while(changed){
+        changed = false;
+        edges.forEach(([from, to]) => {
+            if(relevant.has(to) && !relevant.has(from)){
+                relevant.add(from);
+                changed = true;
+            }
+        });
+    }
+    const adjacency = new Map();
+    relevant.forEach(id => adjacency.set(id, []));
+    edges.forEach(([from, to]) => {
+        if(relevant.has(from) && relevant.has(to)) adjacency.get(from)?.push(to);
+    });
+    const state = new Map();
+    const stack = [];
+    let found = [];
+    const visit = id => {
+        state.set(id, 1);
+        stack.push(id);
+        for(const next of adjacency.get(id) || []){
+            if(!runTypes.has(nodes.find(node => node.id === next)?.type)) continue;
+            if(state.get(next) === 1){
+                found = [...stack.slice(stack.indexOf(next)), next];
+                return true;
+            }
+            if(!state.get(next) && visit(next)) return true;
+        }
+        stack.pop();
+        state.set(id, 2);
+        return false;
+    };
+    for(const node of nodes){
+        if(relevant.has(node.id) && !state.get(node.id) && visit(node.id)) break;
+    }
+    return found;
+}
+function workflowCycleLabels(cycleIds){
+    return (cycleIds || []).map(id => {
+        const node = nodes.find(candidate => candidate.id === id);
+        if(!node) return id;
+        if(node.type === 'llm') return 'LLM';
+        if(node.type === 'video') return tr('canvas.videoGenerateNode');
+        if(node.type === 'generator') return tr('canvas.apiGenerate');
+        if(node.type === 'msgen') return tr('canvas.modelscopeGenerate');
+        if(node.type === 'rh') return 'RunningHub';
+        if(node.type === 'comfy') return 'ComfyUI';
+        if(node.type === 'motionExtract') return tr('canvas.motionExtract');
+        return node.type;
+    });
+}
 function computeConnectedWorkflowOrder(anchorId){
     const anchor = nodes.find(n => n.id === anchorId);
     const runTypes = canvasRunTypes();
