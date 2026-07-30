@@ -297,6 +297,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str = None):
 
 CLIENT_ID = str(uuid.uuid4())
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_INSTANCE_ID = uuid.uuid4().hex
+BACKEND_RESTART_LOCK = Lock()
+BACKEND_RESTART_SCHEDULED = False
 WORKFLOW_DIR = os.path.join(BASE_DIR, "workflows")
 WORKFLOW_PATH = os.path.join(WORKFLOW_DIR, "Z-Image.json")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -1848,6 +1851,40 @@ def app_info():
         "update_notes": read_local_update_notes(version),
     }
 
+
+@app.get("/api/system/status")
+def system_status(request: Request):
+    return {
+        "ok": True,
+        "instance_id": APP_INSTANCE_ID,
+        "version": current_app_version(),
+        "can_restart": is_loopback_client(request),
+    }
+
+
+@app.post("/api/system/restart")
+def restart_backend(request: Request):
+    global BACKEND_RESTART_SCHEDULED
+    if not _is_authorized_backend_restart_request(request):
+        raise HTTPException(status_code=403, detail="仅允许在服务器本机重启后端")
+    with BACKEND_RESTART_LOCK:
+        if BACKEND_RESTART_SCHEDULED:
+            return {
+                "ok": True,
+                "scheduled": True,
+                "already_scheduled": True,
+                "instance_id": APP_INSTANCE_ID,
+            }
+        if not schedule_backend_restart():
+            raise HTTPException(status_code=500, detail="无法创建后台重启进程，当前服务仍在运行")
+        BACKEND_RESTART_SCHEDULED = True
+    return {
+        "ok": True,
+        "scheduled": True,
+        "already_scheduled": False,
+        "instance_id": APP_INSTANCE_ID,
+    }
+
 def connectivity_probe(name: str, url: str, timeout: float = 5.0) -> Dict[str, Any]:
     started = time.time()
     item = {
@@ -2136,6 +2173,114 @@ def safe_static_dir() -> str:
     if target != expected or os.path.commonpath([base, target]) != base:
         raise RuntimeError(f"static 路径不安全：{target}")
     return target
+
+def is_loopback_client(request: Request) -> bool:
+    host = str(getattr(getattr(request, "client", None), "host", "") or "").strip()
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    mapped = getattr(address, "ipv4_mapped", None)
+    return bool(mapped and mapped.is_loopback)
+
+
+def _normalized_loopback_hostname(hostname: str) -> Optional[str]:
+    host = str(hostname or "").strip().lower()
+    if host == "localhost":
+        return host
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return str(address) if address.is_loopback else None
+
+
+def _parse_restart_host(value: str) -> Optional[Tuple[str, int]]:
+    try:
+        parsed = urllib.parse.urlsplit(f"//{str(value or '').strip()}")
+        if not parsed.netloc or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
+            return None
+        hostname = _normalized_loopback_hostname(parsed.hostname or "")
+        if hostname is None:
+            return None
+        return hostname, parsed.port
+    except ValueError:
+        return None
+
+
+def _is_authorized_backend_restart_request(request: Request) -> bool:
+    if not is_loopback_client(request):
+        return False
+    host = _parse_restart_host(request.headers.get("host", ""))
+    if host is None:
+        return False
+    hostname, port = host
+    scheme = str(request.scope.get("scheme") or "").lower()
+    if scheme not in {"http", "https"}:
+        return False
+    effective_port = port if port is not None else (443 if scheme == "https" else 80)
+    origin = str(request.headers.get("origin") or "").strip()
+    try:
+        parsed_origin = urllib.parse.urlsplit(origin)
+        origin_hostname = _normalized_loopback_hostname(parsed_origin.hostname or "")
+        origin_port = parsed_origin.port
+    except ValueError:
+        return False
+    if (
+        not origin
+        or parsed_origin.scheme.lower() != scheme
+        or not parsed_origin.netloc
+        or parsed_origin.username
+        or parsed_origin.password
+        or parsed_origin.path
+        or parsed_origin.query
+        or parsed_origin.fragment
+        or origin_hostname != hostname
+        or (origin_port if origin_port is not None else (443 if scheme == "https" else 80)) != effective_port
+    ):
+        return False
+    fetch_site = str(request.headers.get("sec-fetch-site") or "").strip().lower()
+    if fetch_site and fetch_site != "same-origin":
+        return False
+    return request.headers.get("x-infinite-canvas-restart") == "1"
+
+
+def schedule_backend_restart(delay_seconds: float = 1.5) -> bool:
+    helper = os.path.join(BASE_DIR, "tools", "restart_backend.py")
+    log_path = os.path.join(BASE_DIR, "_backend_restart.log")
+    command = [
+        sys.executable,
+        helper,
+        "--pid", str(os.getpid()),
+        "--python", sys.executable,
+        "--app-dir", BASE_DIR,
+        "--port", "3000",
+        "--delay", str(max(0.5, float(delay_seconds))),
+        "--log", log_path,
+    ]
+    kwargs = {"cwd": BASE_DIR, "close_fds": True}
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+    else:
+        kwargs["start_new_session"] = True
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+    try:
+        subprocess.Popen(command, **kwargs)
+        return True
+    except Exception:
+        logging.exception("Unable to schedule backend restart")
+        return False
+
 
 def schedule_self_restart(delay_seconds: int = 3) -> bool:
     """派生脱离父进程的小脚本，等几秒后启动启动服务脚本，并干掉当前 PID。"""

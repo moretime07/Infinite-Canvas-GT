@@ -1,6 +1,17 @@
 (function(){
     if(!window.StudioI18n) return;
     window.StudioI18n.register({
+        "canvas.restartBackend": { zh: "重启后台", en: "Restart backend" },
+        "canvas.restartBackendConfirm": {
+            zh: "重启会中断当前生成任务，并让局域网用户短暂断开。只会重启 Infinite Canvas 后台，确定继续吗？",
+            en: "Restarting interrupts active generation tasks and briefly disconnects LAN users. Only the Infinite Canvas backend will restart. Continue?"
+        },
+        "canvas.restartBackendWaiting": { zh: "后台正在重启，请稍候…", en: "Backend is restarting. Please wait…" },
+        "canvas.restartBackendTimeout": {
+            zh: "后台未在 45 秒内恢复，请手动刷新页面或运行“启动服务.bat”。",
+            en: "The backend did not recover within 45 seconds. Refresh manually or run 启动服务.bat."
+        },
+        "canvas.restartBackendFailed": { zh: "后台重启失败", en: "Backend restart failed" },
         "canvas.followDefaultApi": { zh: "\u8ddf\u968f\u9ed8\u8ba4 API", en: "Follow default API" },
         "canvas.providerUnavailable": { zh: "API \u5e73\u53f0\u201c{provider}\u201d\u4e0d\u53ef\u7528\u3002", en: "API provider \"{provider}\" is unavailable for this node." },
         "canvas.modelUnavailable": { zh: "\u6a21\u578b\u201c{model}\u201d\u5728 API \u5e73\u53f0\u201c{provider}\u201d\u4e2d\u4e0d\u53ef\u7528\u3002", en: "Model \"{model}\" is unavailable for provider \"{provider}\"." },

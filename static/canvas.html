@@ -78,6 +78,13 @@
                 <button class="menu-btn" onclick="menuAdd('comfy')"><i data-lucide="workflow" class="w-4 h-4"></i><span data-i18n="canvas.comfyGenerate">ComfyUI 生成</span></button>
                 <button class="menu-btn" onclick="menuAdd('ltxDirector')"><i data-lucide="film" class="w-4 h-4"></i><span data-i18n="canvas.ltxDirector">LTX Director</span></button>
                 <button class="menu-btn" onclick="menuAdd('output')"><i data-lucide="circle-dot" class="w-4 h-4"></i>Output</button>
+                <div id="backendRestartMenuSection" hidden>
+                    <div class="menu-divider"></div>
+                    <button id="backendRestartMenuBtn" class="menu-btn" type="button" onclick="restartCanvasBackend()">
+                        <i data-lucide="rotate-cw" class="w-4 h-4"></i>
+                        <span data-i18n="canvas.restartBackend">重启后台</span>
+                    </button>
+                </div>
             </div>
             <div id="linkCreateMenu" class="create-menu"></div>
             <div id="nodeInputMenu" class="create-menu"></div>
