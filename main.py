@@ -1865,7 +1865,7 @@ def system_status(request: Request):
 @app.post("/api/system/restart")
 def restart_backend(request: Request):
     global BACKEND_RESTART_SCHEDULED
-    if not is_loopback_client(request):
+    if not _is_authorized_backend_restart_request(request):
         raise HTTPException(status_code=403, detail="仅允许在服务器本机重启后端")
     with BACKEND_RESTART_LOCK:
         if BACKEND_RESTART_SCHEDULED:
@@ -2184,6 +2184,70 @@ def is_loopback_client(request: Request) -> bool:
         return True
     mapped = getattr(address, "ipv4_mapped", None)
     return bool(mapped and mapped.is_loopback)
+
+
+def _normalized_loopback_hostname(hostname: str) -> Optional[str]:
+    host = str(hostname or "").strip().lower()
+    if host == "localhost":
+        return host
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return str(address) if address.is_loopback else None
+
+
+def _parse_restart_host(value: str) -> Optional[Tuple[str, int]]:
+    try:
+        parsed = urllib.parse.urlsplit(f"//{str(value or '').strip()}")
+        if not parsed.netloc or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
+            return None
+        hostname = _normalized_loopback_hostname(parsed.hostname or "")
+        if hostname is None:
+            return None
+        return hostname, parsed.port
+    except ValueError:
+        return None
+
+
+def _is_authorized_backend_restart_request(request: Request) -> bool:
+    if not is_loopback_client(request):
+        return False
+    host = _parse_restart_host(request.headers.get("host", ""))
+    if host is None:
+        return False
+    hostname, port = host
+    scheme = str(request.scope.get("scheme") or "").lower()
+    if scheme not in {"http", "https"}:
+        return False
+    effective_port = port if port is not None else (443 if scheme == "https" else 80)
+    origin = str(request.headers.get("origin") or "").strip()
+    try:
+        parsed_origin = urllib.parse.urlsplit(origin)
+        origin_hostname = _normalized_loopback_hostname(parsed_origin.hostname or "")
+        origin_port = parsed_origin.port
+    except ValueError:
+        return False
+    if (
+        not origin
+        or parsed_origin.scheme.lower() != scheme
+        or not parsed_origin.netloc
+        or parsed_origin.username
+        or parsed_origin.password
+        or parsed_origin.path
+        or parsed_origin.query
+        or parsed_origin.fragment
+        or origin_hostname != hostname
+        or (origin_port if origin_port is not None else (443 if scheme == "https" else 80)) != effective_port
+    ):
+        return False
+    fetch_site = str(request.headers.get("sec-fetch-site") or "").strip().lower()
+    if fetch_site and fetch_site != "same-origin":
+        return False
+    return request.headers.get("x-infinite-canvas-restart") == "1"
 
 
 def schedule_backend_restart(delay_seconds: float = 1.5) -> bool:

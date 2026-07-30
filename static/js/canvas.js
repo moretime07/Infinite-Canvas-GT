@@ -3660,11 +3660,36 @@ function syncBackendRestartMenuVisibility(){
     if(!backendRestartMenuSection) return;
     backendRestartMenuSection.hidden = !isLocalRestartHost();
 }
+async function fetchWithTimeout(input, init={}, timeoutMs=5000){
+    const controller = new AbortController();
+    const timeout = Math.max(1, Number(timeoutMs) || 1);
+    let timer;
+    try {
+        const timeoutPromise = new Promise((resolve, reject) => {
+            timer = setTimeout(() => {
+                controller.abort();
+                reject(new Error('Request timed out'));
+            }, timeout);
+        });
+        return await Promise.race([
+            fetch(input, {...init, signal:controller.signal}),
+            timeoutPromise,
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
 async function waitForBackendInstance(oldInstanceId, {timeoutMs=45000, intervalMs=800}={}){
     const deadline = Date.now() + timeoutMs;
-    while(Date.now() < deadline){
+    while(true){
+        const remaining = deadline - Date.now();
+        if(remaining <= 0) break;
         try {
-            const response = await fetch('/api/system/status', {cache:'no-store'});
+            const response = await fetchWithTimeout(
+                '/api/system/status',
+                {cache:'no-store'},
+                Math.min(5000, remaining)
+            );
             if(response.ok){
                 const data = await response.json();
                 if(data?.instance_id && data.instance_id !== oldInstanceId) return data;
@@ -3672,7 +3697,9 @@ async function waitForBackendInstance(oldInstanceId, {timeoutMs=45000, intervalM
         } catch(error) {
             // The old process is expected to become unreachable during restart.
         }
-        await new Promise(resolve => setTimeout(resolve, intervalMs));
+        const remainingAfterRequest = deadline - Date.now();
+        if(remainingAfterRequest <= 0) break;
+        await new Promise(resolve => setTimeout(resolve, Math.min(intervalMs, remainingAfterRequest)));
     }
     throw new Error(tr('canvas.restartBackendTimeout'));
 }
@@ -3685,10 +3712,10 @@ async function restartCanvasBackend(){
     if(backendRestartMenuBtn) backendRestartMenuBtn.disabled = true;
     setStatus(tr('canvas.restartBackendWaiting'));
     try {
-        const response = await fetch('/api/system/restart', {
+        const response = await fetchWithTimeout('/api/system/restart', {
             method:'POST',
-            headers:{'Content-Type':'application/json'},
-        });
+            headers:{'Content-Type':'application/json', 'X-Infinite-Canvas-Restart':'1'},
+        }, 10000);
         if(!response.ok){
             throw new Error(await responseErrorMessage(response, tr('canvas.restartBackendFailed')));
         }
