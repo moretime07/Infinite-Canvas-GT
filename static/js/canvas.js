@@ -3654,7 +3654,7 @@ function openCreateMenu(clientX, clientY){
 }
 function isLocalRestartHost(hostname=window.location.hostname){
     const host = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
-    return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '::ffff:127.0.0.1';
 }
 function syncBackendRestartMenuVisibility(){
     if(!backendRestartMenuSection) return;

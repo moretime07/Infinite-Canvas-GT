@@ -30,6 +30,7 @@ assert.equal(hostContext.isLocalRestartHost('localhost'), true);
 assert.equal(hostContext.isLocalRestartHost('127.0.0.1'), true);
 assert.equal(hostContext.isLocalRestartHost('::1'), true);
 assert.equal(hostContext.isLocalRestartHost('[::1]'), true);
+assert.equal(hostContext.isLocalRestartHost('::ffff:127.0.0.1'), true);
 assert.equal(hostContext.isLocalRestartHost('192.168.2.88'), false);
 
 let statusCalls = 0;
