@@ -178,6 +178,9 @@ const linksEl = document.getElementById('links');
 const linkControlsEl = document.getElementById('linkControls');
 const dropOverlay = document.getElementById('dropOverlay');
 const createMenu = document.getElementById('createMenu');
+const backendRestartMenuSection = document.getElementById('backendRestartMenuSection');
+const backendRestartMenuBtn = document.getElementById('backendRestartMenuBtn');
+let backendRestartInFlight = false;
 const linkCreateMenu = document.getElementById('linkCreateMenu');
 const nodeInputMenu = document.getElementById('nodeInputMenu');
 const nodeOutputMenu = document.getElementById('nodeOutputMenu');
@@ -3643,10 +3646,62 @@ function addOutputNode(point){
 function openCreateMenu(clientX, clientY){
     menuPoint = screenToWorld(clientX, clientY);
     closeLinkCreateMenu();
+    syncBackendRestartMenuVisibility();
     createMenu.style.left = `${clientX}px`;
     createMenu.style.top = `${clientY}px`;
     createMenu.classList.add('open');
     refreshIcons();
+}
+function isLocalRestartHost(hostname=window.location.hostname){
+    const host = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+}
+function syncBackendRestartMenuVisibility(){
+    if(!backendRestartMenuSection) return;
+    backendRestartMenuSection.hidden = !isLocalRestartHost();
+}
+async function waitForBackendInstance(oldInstanceId, {timeoutMs=45000, intervalMs=800}={}){
+    const deadline = Date.now() + timeoutMs;
+    while(Date.now() < deadline){
+        try {
+            const response = await fetch('/api/system/status', {cache:'no-store'});
+            if(response.ok){
+                const data = await response.json();
+                if(data?.instance_id && data.instance_id !== oldInstanceId) return data;
+            }
+        } catch(error) {
+            // The old process is expected to become unreachable during restart.
+        }
+        await new Promise(resolve => setTimeout(resolve, intervalMs));
+    }
+    throw new Error(tr('canvas.restartBackendTimeout'));
+}
+async function restartCanvasBackend(){
+    if(backendRestartInFlight || !isLocalRestartHost()) return;
+    closeCreateMenu();
+    if(!window.confirm(tr('canvas.restartBackendConfirm'))) return;
+
+    backendRestartInFlight = true;
+    if(backendRestartMenuBtn) backendRestartMenuBtn.disabled = true;
+    setStatus(tr('canvas.restartBackendWaiting'));
+    try {
+        const response = await fetch('/api/system/restart', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+        });
+        if(!response.ok){
+            throw new Error(await responseErrorMessage(response, tr('canvas.restartBackendFailed')));
+        }
+        const data = await response.json();
+        await waitForBackendInstance(data.instance_id);
+        window.location.reload();
+    } catch(error) {
+        showErrorModal(error?.message || tr('canvas.restartBackendFailed'), tr('canvas.restartBackendFailed'));
+        setStatus('Ready');
+    } finally {
+        backendRestartInFlight = false;
+        if(backendRestartMenuBtn) backendRestartMenuBtn.disabled = false;
+    }
 }
 function closeCreateMenu(){
     createMenu.classList.remove('open');
