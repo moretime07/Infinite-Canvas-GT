@@ -42,11 +42,14 @@ vm.runInContext([
     productionFunction('findWorkflowCycle'),
     productionFunction('workflowCycleLabels'),
     productionFunction('computeCascadeOrder'),
+    productionFunction('upstreamNodeIds'),
+    productionFunction('resolveCascadeLoop'),
     productionFunction('runNodeCascade'),
     productionFunction('cascadeBtnHtml'),
     'this.findWorkflowCycle = findWorkflowCycle;',
     'this.workflowCycleLabels = workflowCycleLabels;',
     'this.computeCascadeOrder = computeCascadeOrder;',
+    'this.resolveCascadeLoop = resolveCascadeLoop;',
     'this.runNodeCascade = runNodeCascade;',
     'this.cascadeBtnHtml = cascadeBtnHtml;',
 ].join('\n'), context);
@@ -69,7 +72,6 @@ assert.deepEqual(new Set(order), new Set(['llm','video']));
 
 // Break caught: cyclic workflows must still expose the one-click action without a terminal generator.
 context.isTerminalGenerator = () => false;
-context.resolveCascadeLoop = () => null;
 context.isCascadeActive = () => false;
 assert.match(context.cascadeBtnHtml(nodes[1]), /data-cascade="video"/);
 
@@ -117,6 +119,38 @@ vm.runInContext([
     assert.deepEqual(started, ['llm','video']);
     assert.equal(new Set(started).size, started.length);
     assert.equal(cascadeBegins, 1);
+
+    const loop = {id:'loop', type:'loop', count:3, mode:'serial', loopStart:1};
+    nodes.push(loop);
+    connections.push({id:'loop-upstream', from:'loop', to:'llm'});
+    context.loopCount = node => node.count;
+    context.loopCascadeContextForRound = (_loop, round, total) => ({index:round, total, nodeId:'loop'});
+    context.loopInputVideoRefs = () => [];
+    context.cascadeParallelLimit = () => 3;
+    context.runLimitedCascadeRounds = async (rounds, _limit, runner) => Promise.allSettled(rounds.map(runner));
+
+    const startsByMode = {};
+    const cascadeBeginsByMode = {};
+    for(const mode of ['serial', 'parallel']){
+        loop.mode = mode;
+        started.length = 0;
+        cascadeBegins = 0;
+
+        await context.runNodeCascade('video');
+        startsByMode[mode] = [...started];
+        cascadeBeginsByMode[mode] = cascadeBegins;
+    }
+
+    // Break caught: confirmed serial and parallel feedback cycles must each override an upstream loop to one pass.
+    assert.deepEqual(startsByMode, {
+        serial:['llm','video'],
+        parallel:['llm','video'],
+    });
+    assert.deepEqual(cascadeBeginsByMode, {serial:1, parallel:1});
+
+    // Break caught: cyclic one-click copy must not advertise loop rounds that confirmation will suppress.
+    assert.doesNotMatch(context.cascadeBtnHtml(nodes[1]), /×\s*3/);
+    assert.doesNotMatch(productionFunction('runNodeCascade'), /typeof confirmWorkflowCycleBeforeRun/);
 
     const modalClassList = {
         open:false,

@@ -12209,7 +12209,7 @@ function cascadeBtnHtml(node){
     const order = computeCascadeOrder(node.id);
     const loop = resolveCascadeLoop(node.id);
     if(order.length <= 1 && !loop && !cycle.length) return '';
-    const suffix = loop ? ` × ${loop.count} ${tr('canvas.loopRounds')}` : '';
+    const suffix = loop && !cycle.length ? ` × ${loop.count} ${tr('canvas.loopRounds')}` : '';
     if(isCascadeActive(node.id)){
         const stopping = isCascadeStopping(node.id);
         return `<button class="gen-cascade-btn gen-cascade-stop" type="button" data-cascade-stop="${node.id}" ${stopping ? 'disabled' : ''}><i data-lucide="square" class="w-4 h-4"></i><span>${stopping ? '停止中…' : '停止运行'}</span></button>`;
@@ -12476,11 +12476,12 @@ async function runNodeCascade(nodeId){
     const target = nodes.find(n => n.id === nodeId);
     if(!target) return;
     if(target.running){ alert('当前节点正在运行'); return; }
-    if(typeof confirmWorkflowCycleBeforeRun === 'function' && !await confirmWorkflowCycleBeforeRun(nodeId)) return;
+    const workflowCycle = findWorkflowCycle(nodeId);
+    if(!await confirmWorkflowCycleBeforeRun(nodeId)) return;
     const order = computeCascadeOrder(nodeId);
     if(!order.length){ alert('没有可运行的生成节点'); return; }
     const loop = resolveCascadeLoop(nodeId);
-    const totalRounds = loop?.count || 1;
+    const totalRounds = workflowCycle.length ? 1 : (loop?.count || 1);
     const startIdx = Math.max(1, Number(loop?.node?.loopStart) || 1);
     const endIdx = startIdx + totalRounds - 1;
     const ctx = beginCascade(nodeId, order, {serial:true, mode:loop?.mode || 'serial'});
