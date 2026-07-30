@@ -953,6 +953,9 @@ body.theme-dark .error-title { color:#fca5a5; }
 .error-actions { display:flex; justify-content:flex-end; gap:8px; }
 .error-btn { height:36px; padding:0 13px; border-radius:12px; display:inline-flex; align-items:center; justify-content:center; gap:7px; font-size:11.5px; font-weight:850; border:1px solid var(--line); color:var(--muted); background:var(--card-solid); }
 .error-btn.primary { background:var(--strong); color:var(--strong-text); border-color:var(--strong); }
+.workflow-cycle-panel { width:min(620px, 100%); }
+.workflow-cycle-copy { color:var(--muted); font-size:12px; line-height:1.55; }
+.workflow-cycle-path { min-height:64px; color:#f59e0b; font-weight:850; }
 .model-panel { width:min(560px, 100%); border-radius:24px; background:#fff; border:1px solid #e8edf3; box-shadow:0 30px 80px rgba(15,23,42,.18); padding:18px; }
 .model-panel-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
 .model-panel-title { font-size:13px; font-weight:900; color:#111827; }

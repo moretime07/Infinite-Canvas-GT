@@ -322,6 +322,22 @@
                 </div>
             </div>
         </div>
+        <div id="workflowCycleModal" class="error-modal" role="dialog" aria-modal="true" aria-labelledby="workflowCycleTitle" onclick="closeWorkflowCycleModal(false)">
+            <div class="error-panel workflow-cycle-panel" onclick="event.stopPropagation()">
+                <div class="error-head">
+                    <div id="workflowCycleTitle" class="error-title">检测到反馈回路</div>
+                    <button class="preview-icon-btn" type="button" title="关闭" aria-label="关闭" onclick="closeWorkflowCycleModal(false)">
+                        <i data-lucide="x" class="w-4 h-4"></i>
+                    </button>
+                </div>
+                <div class="workflow-cycle-copy">本工作流包含循环依赖，不能自动无限循环。本次可以让每个节点仅运行一次。</div>
+                <div id="workflowCyclePath" class="error-message workflow-cycle-path"></div>
+                <div class="error-actions">
+                    <button class="error-btn" type="button" onclick="closeWorkflowCycleModal(false)">取消运行</button>
+                    <button class="error-btn primary" type="button" onclick="closeWorkflowCycleModal(true)">仅运行一轮</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script src="/static/js/ltx-director-timeline.js?v=2026.06.23.1782155110"></script>

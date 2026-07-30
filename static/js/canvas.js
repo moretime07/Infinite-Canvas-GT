@@ -256,6 +256,9 @@ const logList = document.getElementById('logList');
 const errorModal = document.getElementById('errorModal');
 const errorTitle = document.getElementById('errorTitle');
 const errorMessage = document.getElementById('errorMessage');
+const workflowCycleModal = document.getElementById('workflowCycleModal');
+const workflowCyclePath = document.getElementById('workflowCyclePath');
+let workflowCycleResolver = null;
 let canvases = [];
 let deletedCanvases = [];
 let canvas = null;
@@ -935,6 +938,27 @@ async function responseErrorMessage(response, fallback='请求失败'){
 }
 function closeErrorModal(){
     if(errorModal) errorModal.classList.remove('open');
+}
+function closeWorkflowCycleModal(allowRun=false){
+    workflowCycleModal?.classList.remove('open');
+    const resolve = workflowCycleResolver;
+    workflowCycleResolver = null;
+    if(resolve) resolve(Boolean(allowRun));
+}
+function confirmWorkflowCycleRun(cycleIds){
+    if(!workflowCycleModal || !workflowCyclePath){
+        return Promise.resolve(window.confirm(`检测到反馈回路：\n${workflowCycleLabels(cycleIds).join(' → ')}\n\n仅运行一轮？`));
+    }
+    closeWorkflowCycleModal(false);
+    workflowCyclePath.textContent = workflowCycleLabels(cycleIds).join(' → ');
+    workflowCycleModal.classList.add('open');
+    refreshIcons();
+    return new Promise(resolve => { workflowCycleResolver = resolve; });
+}
+async function confirmWorkflowCycleBeforeRun(anchorId){
+    const cycle = findWorkflowCycle(anchorId);
+    if(!cycle.length) return true;
+    return confirmWorkflowCycleRun(cycle);
 }
 async function copyErrorMessage(){
     const text = errorMessage?.textContent || '';
@@ -12179,11 +12203,12 @@ function findLoopCascadeTarget(loopId){
 }
 function cascadeBtnHtml(node){
     // 仅链尾节点显示一键运行
-    if(!isTerminalGenerator(node.id)) return '';
+    const cycle = findWorkflowCycle(node.id);
+    if(!isTerminalGenerator(node.id) && !cycle.length) return '';
     // 也要求至少有上游生成节点，否则没意义
     const order = computeCascadeOrder(node.id);
     const loop = resolveCascadeLoop(node.id);
-    if(order.length <= 1 && !loop) return '';
+    if(order.length <= 1 && !loop && !cycle.length) return '';
     const suffix = loop ? ` × ${loop.count} ${tr('canvas.loopRounds')}` : '';
     if(isCascadeActive(node.id)){
         const stopping = isCascadeStopping(node.id);
@@ -12451,6 +12476,7 @@ async function runNodeCascade(nodeId){
     const target = nodes.find(n => n.id === nodeId);
     if(!target) return;
     if(target.running){ alert('当前节点正在运行'); return; }
+    if(typeof confirmWorkflowCycleBeforeRun === 'function' && !await confirmWorkflowCycleBeforeRun(nodeId)) return;
     const order = computeCascadeOrder(nodeId);
     if(!order.length){ alert('没有可运行的生成节点'); return; }
     const loop = resolveCascadeLoop(nodeId);
