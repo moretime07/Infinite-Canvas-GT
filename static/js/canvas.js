@@ -6672,8 +6672,8 @@ function renderNode(node){
         startNodeDrag(e, node);
     };
     const namedOutputPorts = nodeOutputPorts(node);
-    const canInput = ['generator','comfy','ltxDirector','output','llm','msgen','video','rh','motionExtract'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.videoInput || node.showPrompt));
-    const canOutput = namedOutputPorts.length || ['image','prompt','loop','group','promptGroup','generator','comfy','ltxDirector','llm','msgen','video','rh','output'].includes(node.type);
+    const canInput = nodeCanReceive(node);
+    const canOutput = nodeCanEmit(node);
     if(canInput) el.insertAdjacentHTML('beforeend', `<div class="port in" title="${tr('canvas.connectHere')}"></div>`);
     if(namedOutputPorts.length){
         el.insertAdjacentHTML('beforeend', namedOutputPorts.map(port => `<div class="port out named-port ${port.disabled ? 'disabled' : ''}" data-port-kind="out" data-port-name="${escapeAttr(port.name)}" title="${escapeAttr(port.label)}"><span class="port-label">${escapeHtml(port.label)}</span></div>`).join(''));
@@ -14763,6 +14763,16 @@ function normalizedFromPort(connection){
 function connectionKey(fromId, toId, fromPort=''){
     return `${fromId}\u0000${toId}\u0000${fromPort || ''}`;
 }
+function nodeCanReceive(node){
+    if(!node) return false;
+    if(node.type === 'loop') return Boolean(node.imageInput || node.videoInput || node.showPrompt);
+    return ['generator','comfy','ltxDirector','output','llm','msgen','video','rh','motionExtract'].includes(node.type);
+}
+function nodeCanEmit(node){
+    if(!node) return false;
+    if(nodeOutputPorts(node).length) return true;
+    return ['image','prompt','loop','group','promptGroup','generator','comfy','ltxDirector','llm','msgen','video','rh','output'].includes(node.type);
+}
 function startLink(e, originId, originKind, originPort=''){
     e.stopPropagation();
     originKind = originKind || 'out';
@@ -14864,31 +14874,32 @@ function wouldCreateGeneratorCycle(fromId, toId){
 }
 function canConnect(fromId, toId){
     if(!fromId || !toId || fromId === toId) return false;
-    const from = nodes.find(n => n.id === fromId);
-    const to = nodes.find(n => n.id === toId);
-    if(!from || !to) return false;
-    if(to.type === 'loop'){
-        const allowImage = Boolean(to.imageInput) && ['image','group','output'].includes(from.type);
-        const allowPrompt = Boolean(to.showPrompt) && ['prompt','promptGroup','loop','llm'].includes(from.type);
-        const allowVideo = Boolean(to.videoInput) && ['image','group','output','loop','generator','msgen','comfy','ltxDirector','video','rh','motionExtract'].includes(from.type);
-        return allowImage || allowVideo || allowPrompt;
-    }
-    if(CANVAS_GENERATOR_TYPES.includes(from.type)){
-        if(to.type === 'motionExtract') return CANVAS_MEDIA_OUTPUT_TYPES.includes(from.type);
-        if(to.type === 'output') return true;
-        if(CANVAS_MEDIA_OUTPUT_TYPES.includes(from.type) && CANVAS_GENERATOR_TYPES.includes(to.type)){
-            return !wouldCreateGeneratorCycle(fromId, toId);
-        }
-        return false;
-    }
-    if(to.type === 'motionExtract') return ['image','group','output','loop'].includes(from.type) || CANVAS_MEDIA_OUTPUT_TYPES.includes(from.type);
-    if(from.type === 'motionExtract') return to.type === 'llm' || to.type === 'output' || CANVAS_GENERATOR_TYPES.includes(to.type);
-    if(to.type === 'llm') return ['prompt','loop','promptGroup','llm','image','group','output'].includes(from.type);
-    if(from.type === 'llm') return CANVAS_GENERATOR_TYPES.includes(to.type);
-    return CANVAS_GENERATOR_TYPES.includes(to.type) && ['image','prompt','loop','group','promptGroup','output','llm'].includes(from.type);
+    const from = nodes.find(node => node.id === fromId);
+    const to = nodes.find(node => node.id === toId);
+    const canReceive = typeof nodeCanReceive === 'function'
+        ? nodeCanReceive
+        : node => Boolean(node) && (node.type === 'loop'
+            ? Boolean(node.imageInput || node.videoInput || node.showPrompt)
+            : ['generator','comfy','ltxDirector','output','llm','msgen','video','rh','motionExtract'].includes(node.type));
+    const canEmit = typeof nodeCanEmit === 'function'
+        ? nodeCanEmit
+        : node => Boolean(node) && ['image','prompt','loop','group','promptGroup','generator','comfy','ltxDirector','llm','msgen','video','rh','motionExtract','output'].includes(node.type);
+    return Boolean(from && to && canEmit(from) && canReceive(to));
 }
 function sanitizeConnections(){
-    connections = (connections || []).filter(c => canConnect(c.from, c.to));
+    const seen = new Set();
+    connections = (connections || []).filter(connection => {
+        if(!canConnect(connection?.from, connection?.to)) return false;
+        const fromPort = typeof normalizedFromPort === 'function'
+            ? normalizedFromPort(connection)
+            : typeof connection?.fromPort === 'string' ? connection.fromPort : '';
+        const key = typeof connectionKey === 'function'
+            ? connectionKey(connection.from, connection.to, fromPort)
+            : `${connection.from}\u0000${connection.to}\u0000${fromPort}`;
+        if(seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
 }
 function endDrag(event=null){
     const hadContentDrag = Boolean(dragNode || resizeNode || llmPaneDrag || knifeChanged || tempLink);
