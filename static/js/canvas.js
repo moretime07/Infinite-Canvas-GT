@@ -14876,26 +14876,13 @@ function canConnect(fromId, toId){
     if(!fromId || !toId || fromId === toId) return false;
     const from = nodes.find(node => node.id === fromId);
     const to = nodes.find(node => node.id === toId);
-    const canReceive = typeof nodeCanReceive === 'function'
-        ? nodeCanReceive
-        : node => Boolean(node) && (node.type === 'loop'
-            ? Boolean(node.imageInput || node.videoInput || node.showPrompt)
-            : ['generator','comfy','ltxDirector','output','llm','msgen','video','rh','motionExtract'].includes(node.type));
-    const canEmit = typeof nodeCanEmit === 'function'
-        ? nodeCanEmit
-        : node => Boolean(node) && ['image','prompt','loop','group','promptGroup','generator','comfy','ltxDirector','llm','msgen','video','rh','motionExtract','output'].includes(node.type);
-    return Boolean(from && to && canEmit(from) && canReceive(to));
+    return Boolean(from && to && nodeCanEmit(from) && nodeCanReceive(to));
 }
 function sanitizeConnections(){
     const seen = new Set();
     connections = (connections || []).filter(connection => {
         if(!canConnect(connection?.from, connection?.to)) return false;
-        const fromPort = typeof normalizedFromPort === 'function'
-            ? normalizedFromPort(connection)
-            : typeof connection?.fromPort === 'string' ? connection.fromPort : '';
-        const key = typeof connectionKey === 'function'
-            ? connectionKey(connection.from, connection.to, fromPort)
-            : `${connection.from}\u0000${connection.to}\u0000${fromPort}`;
+        const key = connectionKey(connection.from, connection.to, normalizedFromPort(connection));
         if(seen.has(key)) return false;
         seen.add(key);
         return true;

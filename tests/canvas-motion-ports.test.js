@@ -12,6 +12,10 @@ function productionFunction(name){
     return source.slice(start, next === -1 ? source.length : next);
 }
 
+// Break caught: connection validation must share the capability and key helpers used by the canvas, not retain a fallback policy.
+assert.doesNotMatch(productionFunction('canConnect'), /typeof nodeCan(?:Receive|Emit)/);
+assert.doesNotMatch(productionFunction('sanitizeConnections'), /typeof (?:normalizedFromPort|connectionKey)/);
+
 function helperContext(){
     const context = {};
     vm.createContext(context);
@@ -68,6 +72,11 @@ function connectionValidationContext(){
     };
     vm.createContext(context);
     vm.runInContext([
+        productionFunction('nodeOutputPorts'),
+        productionFunction('normalizedFromPort'),
+        productionFunction('connectionKey'),
+        productionFunction('nodeCanReceive'),
+        productionFunction('nodeCanEmit'),
         productionFunction('canConnect'),
         productionFunction('sanitizeConnections'),
         'this.canConnect = canConnect;',
