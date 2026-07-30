@@ -23,7 +23,13 @@ const connectionContext = {
     wouldCreateGeneratorCycle:() => false,
 };
 vm.createContext(connectionContext);
-vm.runInContext(`${productionFunction('canConnect')}\nthis.canConnect = canConnect;`, connectionContext);
+vm.runInContext([
+    productionFunction('nodeOutputPorts'),
+    productionFunction('nodeCanReceive'),
+    productionFunction('nodeCanEmit'),
+    productionFunction('canConnect'),
+    'this.canConnect = canConnect;',
+].join('\n'), connectionContext);
 
 // Break caught: motion results must be usable as LLM input.
 assert.equal(connectionContext.canConnect(motion.id, llm.id), true);
