@@ -73,6 +73,7 @@ const motionCompletedWithoutUrl = {
 const targetLLM = {id:'llm-target', type:'llm'};
 const mediaContext = {
     nodes:[motionReady, motionPending, motionFailed, motionCompletedWithoutUrl, targetLLM],
+    CANVAS_MEDIA_OUTPUT_TYPES:[],
     connections:[
         {from:motionReady.id, to:targetLLM.id, fromPort:'pose'},
         {from:motionReady.id, to:targetLLM.id, fromPort:'depth'},

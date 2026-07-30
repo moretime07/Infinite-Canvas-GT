@@ -8713,7 +8713,15 @@ function llmInputText(node){
 }
 function llmInputImages(node){
     const urls = [];
-    connections.filter(c => c.to === node.id).map(c => nodes.find(n => n.id === c.from)).filter(Boolean).forEach(n => {
+    connections.filter(c => c.to === node.id).forEach(connection => {
+        const n = nodes.find(candidate => candidate.id === connection.from);
+        if(!n) return;
+        if(CANVAS_MEDIA_OUTPUT_TYPES.includes(n.type)){
+            mediaRefsFromNode(n, normalizedFromPort(connection))
+                .filter(ref => ref?.kind === 'image' && ref?.url)
+                .forEach(ref => urls.push(ref.url));
+            return;
+        }
         if(n.type === 'image' && n.url && mediaKindForNode(n) === 'image') urls.push(n.url);
         if(n.type === 'output' && (n.images||[]).length){
             const last = [...n.images].reverse().map(outputUrlValue).find(url => url && !isVideoUrl(url) && !isAudioUrl(url));
@@ -8738,6 +8746,12 @@ function llmInputVideos(node){
         if(!n) return;
         if(n.type === 'motionExtract'){
             motionOutputVideoRefs(n, normalizedFromPort(connection)).forEach(ref => addUrl(ref?.url));
+            return;
+        }
+        if(CANVAS_MEDIA_OUTPUT_TYPES.includes(n.type)){
+            mediaRefsFromNode(n, normalizedFromPort(connection))
+                .filter(ref => ref?.kind === 'video')
+                .forEach(ref => addUrl(ref?.url));
             return;
         }
         if(n.type === 'image' && n.url && mediaKindForNode(n) === 'video') addUrl(n.url);
