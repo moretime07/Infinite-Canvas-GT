@@ -33,6 +33,8 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from threading import Lock, Thread
 import httpx
+import tencent_vod
+import aiide_video
 from PIL import Image, ImageOps
 from io import BytesIO
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, Request
@@ -352,7 +354,74 @@ JIMENG_LOGIN_SESSION = {
 }
 
 PROVIDER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{2,40}$")
-SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "volcengine", "runninghub", "jimeng"}
+SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "volcengine", "runninghub", "jimeng", "wand", "tencent-vod"}
+WAND_INTL_BASE = "https://tokenhub-intl.tencentcloudmaas.com"
+# International TokenHub vision catalog. Chat, embedding, 3D, and speech models stay out of the canvas image/video lists.
+TOKENHUB_IMAGE_MODELS = (
+    "wand-vega-image-lite",
+    "wand-vega-image-flash",
+    "wand-vega-image-pro",
+    "hy-image-v3",
+    "hy-image-v3.5-preview",
+    "vidu-image-q2",
+    "seedream-image-v5.0-pro",
+    "seedream-image-v5.0-lite",
+    "seedream-image-v5.0-flash",
+    "kling-image-v3",
+    "kling-image-o1",
+    "kling-image-v3-omni",
+)
+TOKENHUB_VIDEO_MODELS = (
+    "wand-vega-video-1.0-lite",
+    "hy-video-v1.5",
+    "vidu-video-q4-preview",
+    "pixverse-video-v6.0",
+    "pixverse-video-c1",
+    "kling-video-v4",
+    "kling-video-v3",
+    "kling-video-v3-omni",
+    "kling-video-v3-turbo",
+    "kling-video-motion-control-v3.0",
+    "kling-video-motion-control-v2.6",
+    "minimax-video-h3",
+    "minimax-video-h3-max",
+)
+WAND_IMAGE_MODEL = TOKENHUB_IMAGE_MODELS[0]
+WAND_VIDEO_MODEL = TOKENHUB_VIDEO_MODELS[0]
+TOKENHUB_IMAGE_PROMPT_LIMIT = {
+    "wand-vega-image-lite": 2000,
+    "wand-vega-image-flash": 2000,
+    "wand-vega-image-pro": 2000,
+    "hy-image-v3": 8192,
+    "vidu-image-q2": 2000,
+    "seedream-image-v5.0-pro": 600,
+    "seedream-image-v5.0-lite": 600,
+    "seedream-image-v5.0-flash": 600,
+    "kling-image-v3": 2500,
+    "kling-image-o1": 2500,
+    "kling-image-v3-omni": 2500,
+}
+TOKENHUB_RATIO_VALUES = {
+    "21:9": 21 / 9,
+    "16:9": 16 / 9,
+    "3:2": 3 / 2,
+    "4:3": 4 / 3,
+    "1:1": 1.0,
+    "3:4": 3 / 4,
+    "2:3": 2 / 3,
+    "9:16": 9 / 16,
+}
+WAND_IMAGE_PRESETS = (
+    (1024, 1024), (1080, 1080), (2048, 2048), (2160, 2160), (4096, 4096),
+    (1024, 1536), (1080, 1620), (1440, 2160), (3328, 4992),
+    (1536, 1024), (1620, 1080), (2160, 1440), (4992, 3328),
+    (1080, 1440), (1440, 1920), (2160, 2880), (3584, 4800),
+    (1440, 1080), (1920, 1440), (2880, 2160), (4800, 3584),
+    (720, 1280), (1080, 1920), (1440, 2560), (2160, 3840),
+    (1280, 720), (1920, 1080), (2560, 1440), (3840, 2160),
+    (1512, 648), (2520, 1080), (5040, 2160),
+)
+WAND_VIDEO_RATIOS = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16", "adaptive"}
 SUPPORTED_IMAGE_REQUEST_MODES = {"openai", "openai-json"}
 RUNNINGHUB_DEFAULT_BASE_URL = "https://www.runninghub.cn"
 RUNNINGHUB_OPENAPI_BASE_URL = "https://www.runninghub.cn/openapi/v2"
@@ -759,6 +828,11 @@ def runninghub_wallet_key_value() -> str:
 def provider_has_primary_credential(provider: dict, credential_overrides: dict | None = None) -> bool:
     provider_id = str((provider or {}).get("id") or "").strip().lower()
     overrides = credential_overrides or {}
+    if tencent_vod.is_provider(provider):
+        if provider_id in overrides:
+            return bool(overrides[provider_id])
+        config = tencent_vod_config(provider)
+        return bool(config["secret_id"] and config["secret_key"])
     standard_key = str(
         overrides[provider_id] if provider_id in overrides else provider_env_key_value(provider_id) or ""
     ).strip()
@@ -1323,6 +1397,13 @@ def ominilink_chat_api_url(provider) -> str:
     chat_url, _ = normalize_ominilink_urls(authoritative_url)
     return chat_url
 
+def tokenhub_catalog_models(saved, official):
+    merged = [str(item) for item in official]
+    for item in model_list_from_values(saved or []):
+        if item not in merged:
+            merged.append(item)
+    return merged
+
 def normalize_provider(item):
     ominilink_config = is_ominilink_provider_config(item)
     provider_id = str(item.get("id") or "").strip().lower()
@@ -1355,6 +1436,19 @@ def normalize_provider(item):
     if provider_id == "runninghub":
         protocol = "runninghub"
         base_url = base_url or RUNNINGHUB_DEFAULT_BASE_URL
+    if tencent_vod.is_provider({"protocol": protocol, "base_url": base_url}):
+        protocol = tencent_vod.PROTOCOL
+        base_url = tencent_vod.endpoint(base_url)
+        video_base_url = ""
+    elif protocol == "wand" or is_wand_api_url(base_url):
+        protocol = "wand"
+        base_url = WAND_INTL_BASE
+        video_base_url = ""
+        item = {
+            **item,
+            "image_models": tokenhub_catalog_models(item.get("image_models"), TOKENHUB_IMAGE_MODELS),
+            "video_models": tokenhub_catalog_models(item.get("video_models"), TOKENHUB_VIDEO_MODELS),
+        }
     if ominilink_config:
         protocol = "openai"
     return {
@@ -1378,6 +1472,8 @@ def normalize_provider(item):
         "rh_workflows": normalize_runninghub_entries(item.get("rh_workflows") or [], "workflow"),
         "volcengine_project_name": volc_project,
         "volcengine_region": volc_region,
+        "tencent_sub_app_id": int(item.get("tencent_sub_app_id") or 0),
+        "tencent_region": str(item.get("tencent_region") or "ap-guangzhou").strip(),
     }
 
 def load_api_providers():
@@ -1412,6 +1508,16 @@ def public_provider(provider):
         "key_preview": mask_secret(key),
         "key_env": provider_key_env(provider["id"]),
     }
+    if tencent_vod.is_provider(provider):
+        config = tencent_vod_config(provider)
+        item.update({
+            "has_key": bool(config["secret_id"] and config["secret_key"]),
+            "key_preview": "",
+            "has_tencent_secret_id": bool(config["secret_id"]),
+            "has_tencent_secret_key": bool(config["secret_key"]),
+            "has_tencent_token": bool(config["token"]),
+            "model_metadata": tencent_vod.model_metadata(config, provider.get("tencent_sub_app_id", 0)),
+        })
     if provider.get("id") == "runninghub":
         wallet_key = runninghub_wallet_key_value()
         item.update({
@@ -2833,6 +2939,12 @@ class ApiProviderPayload(BaseModel):
     clear_wallet_key: bool = False
     clear_volcengine_access_key_id: bool = False
     clear_volcengine_secret_access_key: bool = False
+    tencent_sub_app_id: int = Field(default=0, ge=0)
+    tencent_region: str = "ap-guangzhou"
+    tencent_secret_id: Optional[str] = None
+    tencent_secret_key: Optional[str] = None
+    tencent_token: Optional[str] = None
+    clear_tencent_credentials: bool = False
 
 class ChatRequest(BaseModel):
     conversation_id: str = ""
@@ -4157,7 +4269,7 @@ def effective_protocol(provider, model=""):
         return "openai"
     base = provider_protocol(provider)
     pid = str((provider or {}).get("id") or "").strip().lower()
-    if pid in FIXED_PROTOCOL_PROVIDER_IDS:
+    if pid in FIXED_PROTOCOL_PROVIDER_IDS or base == tencent_vod.PROTOCOL:
         return base
     overrides = (provider or {}).get("model_protocols")
     if isinstance(overrides, dict):
@@ -4198,6 +4310,43 @@ def is_runninghub_provider(provider):
 
 def is_jimeng_provider(provider):
     return provider_protocol(provider) == "jimeng" or str((provider or {}).get("id") or "").strip().lower() == "jimeng"
+
+def is_wand_api_url(value) -> bool:
+    host = (urllib.parse.urlsplit(str(value or "").strip()).hostname or "").lower()
+    return host == "tencentcloudmaas.com" or host.endswith(".tencentcloudmaas.com")
+
+def is_wand_provider(provider) -> bool:
+    if not isinstance(provider, dict):
+        provider = {
+            "id": getattr(provider, "id", ""),
+            "protocol": getattr(provider, "protocol", ""),
+            "base_url": getattr(provider, "base_url", ""),
+            "video_base_url": getattr(provider, "video_base_url", ""),
+        }
+    if tencent_vod.is_provider(provider):
+        return False
+    if str(provider.get("protocol") or "").strip().lower() == "wand":
+        return True
+    return is_wand_api_url(provider.get("base_url")) or is_wand_api_url(provider.get("video_base_url"))
+
+def wand_model_catalog():
+    image_models = list(TOKENHUB_IMAGE_MODELS)
+    video_models = list(TOKENHUB_VIDEO_MODELS)
+    models = image_models + video_models
+    return {
+        "ok": True,
+        "status": 200,
+        "protocol": "wand",
+        "message": "这 25 个模型来自腾讯国际站文档，不是从你的账号拉取的。",
+        "total": len(models),
+        "model_count": len(models),
+        "image_models": image_models,
+        "chat_models": [],
+        "video_models": video_models,
+        "all": models,
+        "catalog_fallback": True,
+        "connection_verified": False,
+    }
 
 def is_yuli_provider(provider):
     # 玉玉API（yuli.host）的视频接口走自有格式（/v1/video/create + /v1/video/query），
@@ -9408,8 +9557,797 @@ async def generate_openrouter_provider_image(prompt, size, quality, model, refer
         return extract_image(raw), raw
 
 
+def wand_api_key(provider) -> str:
+    provider_id = str((provider or {}).get("id") or "custom-api-3").strip().lower()
+    key = provider_env_key_value(provider_id) or read_api_env_value("TENCENT_TOKENHUB_API_KEY") or os.getenv("TENCENT_TOKENHUB_API_KEY", "")
+    key = str(key or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="未配置腾讯 TokenHub API Key。请在「腾讯api」里保存国际站 API Key。")
+    return key
+
+def wand_response_data(response):
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    if response.status_code >= 400:
+        message = ""
+        if isinstance(data, dict):
+            err = data.get("error")
+            if isinstance(err, dict):
+                message = str(err.get("message") or err.get("code") or "")
+            message = message or str(data.get("message") or "")
+        if response.status_code in (401, 403):
+            message = "TokenHub 没有接受这把 API Key。请到国际站控制台 https://console.tencentcloud.com/tokenhub/apikey 重新复制 Key，再保存到「腾讯api」。"
+        raise HTTPException(status_code=response.status_code, detail=message or (response.text or "")[:300])
+    return data if isinstance(data, dict) else {}
+
+_WAND_PUBLIC_URL_CACHE = {}
+
+async def wand_media_url(value: str) -> str:
+    text = str(value or "").strip()
+    if text.startswith(("http://", "https://")):
+        return text
+    public = local_asset_public_url(text)
+    if public:
+        return public
+    path = output_file_from_url(text)
+    if not path:
+        raise HTTPException(
+            status_code=400,
+            detail="找不到这块本机素材。请重新放到画布上再试。文生图和文生视频可以不带素材。",
+        )
+    stat = os.stat(path)
+    cache_key = (path, stat.st_mtime_ns, stat.st_size)
+    cached = _WAND_PUBLIC_URL_CACHE.get(cache_key)
+    if cached:
+        return cached
+    uploaded = await upload_local_video_to_cloud(
+        text,
+        "auto",
+        ("image/", "video/", "audio/", "application/octet-stream"),
+    )
+    url = str(uploaded.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=502, detail="本机素材上传后没有得到公网地址。")
+    _WAND_PUBLIC_URL_CACHE[cache_key] = url
+    if len(_WAND_PUBLIC_URL_CACHE) > 200:
+        _WAND_PUBLIC_URL_CACHE.pop(next(iter(_WAND_PUBLIC_URL_CACHE)))
+    return url
+
+def wand_image_size(size: str) -> str:
+    match = re.match(r"^\s*(\d+)\s*[xX*]\s*(\d+)\s*$", str(size or ""))
+    if not match:
+        return "2048x2048"
+    width, height = int(match.group(1)), int(match.group(2))
+    for preset_w, preset_h in WAND_IMAGE_PRESETS:
+        if preset_w == width and preset_h == height:
+            return f"{width}x{height}"
+    target_ratio = width / height if height else 1
+    best = min(
+        WAND_IMAGE_PRESETS,
+        key=lambda item: abs((item[0] / item[1]) - target_ratio) * 10 + abs(max(item) - max(width, height)) / max(max(width, height), 1),
+    )
+    return f"{best[0]}x{best[1]}"
+
+def wand_video_resolution(value: str) -> str:
+    text = str(value or "").upper().replace(" ", "")
+    if "4K" in text:
+        return "4K"
+    if "2K" in text:
+        return "2K"
+    if "1080" in text:
+        return "1080P"
+    return "768P"
+
+def wand_video_ratio(value: str) -> str:
+    text = str(value or "").strip()
+    if text in WAND_VIDEO_RATIOS:
+        return text
+    mapped = {"3:2": "4:3", "2:3": "3:4"}
+    return mapped.get(text, "adaptive")
+
+async def wand_probe_key(api_key: str):
+    """Probe the international TokenHub WAND task route.
+
+    400/404 means the route exists and the key was accepted.
+    401/403 still means the address and WAND protocol answered; only the key was rejected.
+    The first return value is whether the key itself was accepted.
+    """
+    url = f"{WAND_INTL_BASE}/v1/wand/vega-images/tasks/probe-not-a-real-task"
+    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.get(url, headers=headers)
+    if response.status_code in (401, 403):
+        return False, response.status_code, "国际站地址和 WAND 协议已连通。这把 API Key 被拒绝，请到 https://console.tencentcloud.com/tokenhub/apikey 重新复制后再保存。"
+    if response.status_code in (404, 400):
+        return True, response.status_code, "国际站 TokenHub 已接受这把 API Key，WAND 协议可用。"
+    if response.status_code < 400:
+        return True, response.status_code, "国际站 TokenHub 可连接，WAND 协议可用。"
+    return False, response.status_code, (response.text or "")[:300]
+
+def tokenhub_headers(provider):
+    return {
+        "Authorization": f"Bearer {wand_api_key(provider)}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+def tokenhub_require_prompt(prompt, model_id, limit=None):
+    text = str(prompt or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="提示词不能为空")
+    cap = TOKENHUB_IMAGE_PROMPT_LIMIT.get(model_id) if limit is None else limit
+    if cap and len(text) > cap:
+        raise HTTPException(status_code=400, detail=f"{model_id} 的提示词上限是 {cap} 字。")
+    return text
+
+async def tokenhub_reference_urls(reference_images, limit):
+    urls = []
+    for ref in reference_images or []:
+        url = ref.get("url") if isinstance(ref, dict) else getattr(ref, "url", "")
+        if not str(url or "").strip():
+            continue
+        urls.append(await wand_media_url(url))
+        if len(urls) >= limit:
+            break
+    return urls
+
+def tokenhub_dimensions(size):
+    match = re.match(r"^\s*(\d+)\s*[xX*]\s*(\d+)\s*$", str(size or ""))
+    if not match:
+        return 2048, 2048
+    return max(1, int(match.group(1))), max(1, int(match.group(2)))
+
+def tokenhub_fit_pixels(size, min_pixels, max_pixels, min_edge, max_edge):
+    width, height = tokenhub_dimensions(size)
+    area = width * height
+    if area < min_pixels:
+        scale = (min_pixels / area) ** 0.5
+        width = max(1, int(round(width * scale)))
+        height = max(1, int(round(height * scale)))
+    elif area > max_pixels:
+        scale = (max_pixels / area) ** 0.5
+        width = max(1, int(round(width * scale)))
+        height = max(1, int(round(height * scale)))
+    width = min(max(width, min_edge), max_edge)
+    height = min(max(height, min_edge), max_edge)
+    if width * height > max_pixels:
+        height = max(min_edge, max_pixels // max(width, 1))
+    if width * height < min_pixels and width:
+        height = min(max_edge, max(height, (min_pixels + width - 1) // width))
+    return f"{width}x{height}"
+
+def tokenhub_nearest_ratio(size, allowed, default="1:1"):
+    choices = [item for item in allowed if item in TOKENHUB_RATIO_VALUES]
+    if not choices:
+        return default
+    width, height = tokenhub_dimensions(size)
+    target = width / height if height else 1
+    return min(choices, key=lambda item: abs(TOKENHUB_RATIO_VALUES[item] - target))
+
+def tokenhub_clamp_duration(value, low, high, default):
+    try:
+        duration = int(value if value is not None else default)
+    except Exception:
+        duration = default
+    return min(high, max(low, duration))
+
+def tokenhub_raise_if_failed(data, label):
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail=f"{label}返回异常：{str(data)[:300]}")
+    code = data.get("code")
+    if code not in (None, 0, "0"):
+        raise HTTPException(status_code=502, detail=f"{label}失败：{data.get('message') or code}")
+    err_code = data.get("ErrCode")
+    if err_code not in (None, 0, "0"):
+        raise HTTPException(status_code=502, detail=f"{label}失败：{data.get('ErrMsg') or err_code}")
+    error = data.get("error") if isinstance(data.get("error"), dict) else {}
+    if str(data.get("status") or "").lower() == "failed" or error.get("message"):
+        raise HTTPException(status_code=502, detail=f"{label}失败：{error.get('message') or error.get('code') or str(data)[:300]}")
+
+def tokenhub_task_id(data):
+    if isinstance(data, list):
+        for item in data:
+            found = tokenhub_task_id(item)
+            if found:
+                return found
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    for key in ("task_id", "video_id"):
+        value = str(data.get(key) or "").strip()
+        if value and not value.startswith(("http://", "https://")):
+            return value
+    for key in ("data", "Resp", "resp", "task"):
+        found = tokenhub_task_id(data.get(key))
+        if found:
+            return found
+    value = str(data.get("id") or "").strip()
+    if value and not value.startswith(("http://", "https://")):
+        return value
+    return ""
+
+def tokenhub_image_from_payload(data):
+    urls = []
+
+    def add(value):
+        text = str(value or "").strip()
+        if text.startswith(("http://", "https://")) and text not in urls:
+            urls.append(text)
+
+    if isinstance(data, dict):
+        choices = data.get("choices") or []
+        if choices and isinstance(choices[0], dict):
+            delta = choices[0].get("delta") or {}
+            image = delta.get("image") if isinstance(delta, dict) else {}
+            if isinstance(image, dict):
+                add(image.get("url"))
+        for item in data.get("data") or []:
+            if isinstance(item, dict):
+                add(item.get("url"))
+        nested = data.get("data") if isinstance(data.get("data"), dict) else {}
+        task_result = nested.get("task_result") if isinstance(nested, dict) else {}
+        if isinstance(task_result, dict):
+            for key in ("images", "series_images"):
+                for item in task_result.get(key) or []:
+                    if isinstance(item, dict):
+                        add(item.get("url"))
+        for item in data.get("creations") or []:
+            if isinstance(item, dict):
+                add(item.get("url"))
+    if urls:
+        return {"type": "url", "value": urls[0]}
+    try:
+        return extract_image(data)
+    except HTTPException:
+        raise HTTPException(status_code=502, detail=f"腾讯生图完成但没有图片地址：{str(data)[:300]}")
+
+def tokenhub_video_url(data):
+    if isinstance(data, list):
+        for item in data:
+            found = tokenhub_video_url(item)
+            if found:
+                return found
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    content = data.get("content")
+    if isinstance(content, dict):
+        for key in ("video_url", "url"):
+            url = content.get(key)
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                return url
+    resp = data.get("Resp") if isinstance(data.get("Resp"), dict) else data.get("resp")
+    if isinstance(resp, dict):
+        url = resp.get("url")
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            return url
+    for key in ("videos", "creations", "outputs"):
+        for item in data.get(key) or []:
+            if isinstance(item, dict):
+                url = item.get("url")
+                if isinstance(url, str) and url.startswith(("http://", "https://")):
+                    return url
+    for key in ("task", "data"):
+        found = tokenhub_video_url(data.get(key))
+        if found:
+            return found
+    return ""
+
+def tokenhub_status_text(data):
+    if isinstance(data, list):
+        return tokenhub_status_text(data[0]) if data else ""
+    if not isinstance(data, dict):
+        return ""
+    for key in ("status", "state", "task_status"):
+        value = str(data.get(key) or "").strip()
+        if value:
+            return value.lower()
+    for key in ("task", "data", "Resp", "resp"):
+        found = tokenhub_status_text(data.get(key))
+        if found:
+            return found
+    return ""
+
+async def tokenhub_poll(client, url, headers, timeout, interval=5):
+    deadline = time.monotonic() + timeout
+    last = {}
+    while time.monotonic() < deadline:
+        await asyncio.sleep(interval)
+        result = await client.get(url, headers=headers)
+        last = wand_response_data(result)
+        tokenhub_raise_if_failed(last, "腾讯任务")
+        status = tokenhub_status_text(last)
+        if status in {"completed", "succeeded", "succeed", "success"}:
+            return last
+        if status in {"failed", "fail", "error", "cancelled", "canceled", "incomplete"}:
+            error = last.get("error") if isinstance(last.get("error"), dict) else {}
+            message = error.get("message") or error.get("code") or last.get("task_status_msg") or status
+            raise HTTPException(status_code=502, detail=f"腾讯生成失败：{str(message)[:400]}")
+    raise HTTPException(status_code=504, detail=f"腾讯生成超时，task_id={tokenhub_task_id(last)}")
+
+async def tokenhub_submit_json(client, path, headers, body):
+    response = await client.post(f"{WAND_INTL_BASE}{path}", headers=headers, json=body)
+    data = wand_response_data(response)
+    tokenhub_raise_if_failed(data, "腾讯任务")
+    return data
+
+async def tokenhub_video_media(payload):
+    images = [ref for ref in (payload.images or []) if str(getattr(ref, "url", "") or "").strip()]
+    first = [ref for ref in images if str(getattr(ref, "role", "") or "") == "first_frame"][:1]
+    last = [ref for ref in images if str(getattr(ref, "role", "") or "") == "last_frame"][:1]
+    others = [ref for ref in images if ref not in first and ref not in last]
+    videos = []
+    for url in payload.videos or []:
+        url = str(url or "").strip()
+        if url:
+            videos.append(await wand_media_url(url))
+    audios = []
+    for url in payload.audios or []:
+        url = str(url or "").strip()
+        if url:
+            audios.append(await wand_media_url(url))
+    return first, last, others, videos, audios
+
+def tokenhub_pixverse_quality(value):
+    text = str(value or "").lower().replace(" ", "")
+    if "360" in text:
+        return "360p"
+    if "540" in text:
+        return "540p"
+    if "1080" in text or "2k" in text or "4k" in text:
+        return "1080p"
+    return "720p"
+
+def tokenhub_vidu_resolution(value):
+    text = str(value or "").upper().replace(" ", "")
+    if "4K" in text:
+        return "4K"
+    if "2K" in text:
+        return "2K"
+    if "1080" in text:
+        return "1080p"
+    if "540" in text:
+        return "540p"
+    if re.match(r"^\d+X\d+$", text):
+        edge = max(int(part) for part in text.split("X"))
+        if edge >= 3000:
+            return "4K"
+        if edge >= 1600:
+            return "2K"
+        return "1080p"
+    return "720p"
+
+def tokenhub_kling_video_resolution(model_id, value):
+    text = str(value or "").lower().replace(" ", "")
+    if model_id in {"kling-video-v3", "kling-video-v3-omni"} and "4k" in text:
+        return "4k"
+    if "720" in text or "768" in text:
+        return "720p"
+    return "1080p"
+
+def tokenhub_kling_aspect(model_id, ratio, omni=False):
+    text = str(ratio or "").strip()
+    if model_id == "kling-video-v4":
+        allowed = {"21:9", "16:9", "9:16", "1:1"}
+        if omni:
+            allowed = allowed | {"adaptive"}
+        if text in allowed:
+            return text
+        if text in {"3:4", "2:3"}:
+            return "9:16"
+        return "adaptive" if omni else "16:9"
+    if text in {"16:9", "9:16", "1:1"}:
+        return text
+    if text in {"3:4", "2:3"}:
+        return "9:16"
+    return "16:9"
+
+def tokenhub_minimax_resolution(model_id, value):
+    text = str(value or "").upper().replace(" ", "")
+    if model_id.endswith("-max"):
+        return "480P" if "480" in text else "768P"
+    return "2K" if ("2K" in text or "4K" in text) else "768P"
+
+async def tokenhub_finish_video(client, task_url, headers, label):
+    last = await tokenhub_poll(client, task_url, headers, min(float(VIDEO_POLL_TIMEOUT or 900), 900), 6)
+    video_url = tokenhub_video_url(last)
+    if not video_url:
+        raise HTTPException(status_code=502, detail=f"{label}完成但没有视频地址：{str(last)[:300]}")
+    local_url = await save_remote_video_to_output(video_url, prefix="wand_")
+    return {"videos": [local_url], "task_id": tokenhub_task_id(last), "raw": last}
+
+async def generate_tokenhub_vega_image(prompt, size, model_id, reference_images, headers, client):
+    prompt = tokenhub_require_prompt(prompt, model_id)
+    limit = 3 if model_id.endswith("-lite") else 10
+    body = {"model": model_id, "prompt": prompt, "size": wand_image_size(size)}
+    image_urls = await tokenhub_reference_urls(reference_images, limit)
+    if image_urls:
+        body["input"] = [{"content": [{"type": "input_image", "image_url": url} for url in image_urls]}]
+    created = await tokenhub_submit_json(client, "/v1/wand/vega-images/generations", headers, body)
+    task_id = tokenhub_task_id(created)
+    if not task_id:
+        raise HTTPException(status_code=502, detail=f"WAND 生图没有返回 task_id：{str(created)[:300]}")
+    last = await tokenhub_poll(client, f"{WAND_INTL_BASE}/v1/wand/vega-images/tasks/{task_id}", headers, 180, 4)
+    return tokenhub_image_from_payload(last), last
+
+async def generate_tokenhub_hy_image(prompt, size, model_id, reference_images, headers, client):
+    if model_id == "hy-image-v3.5-preview":
+        prompt = tokenhub_require_prompt(prompt, model_id, limit=0)
+        content = [{"type": "text", "text": prompt}]
+        for url in await tokenhub_reference_urls(reference_images, 20):
+            content.append({"type": "image_url", "image_url": {"url": url}})
+        body = {
+            "model": model_id,
+            "size": tokenhub_fit_pixels(size, 256 * 256, 4096 * 4096, 256, 8192),
+            "messages": [{"role": "user", "content": content}],
+        }
+        created = await tokenhub_submit_json(client, "/v1/wand/hunyuan-image/v35-generation", headers, body)
+        return tokenhub_image_from_payload(created), created
+    prompt = tokenhub_require_prompt(prompt, model_id)
+    body = {
+        "model": model_id,
+        "prompt": prompt,
+        "size": tokenhub_fit_pixels(size, 512 * 512, 1024 * 1024, 512, 2048),
+    }
+    images = await tokenhub_reference_urls(reference_images, 3)
+    if images:
+        body["images"] = images
+    created = await tokenhub_submit_json(client, "/v1/wand/hunyuan-image/v3-generation", headers, body)
+    return tokenhub_image_from_payload(created), created
+
+async def generate_tokenhub_direct_image(prompt, size, model_id, reference_images, headers, client):
+    prompt = tokenhub_require_prompt(prompt, model_id)
+    if model_id.startswith("seedream-image-"):
+        if model_id.endswith("-lite"):
+            fitted = tokenhub_fit_pixels(size, 3686400, 4096 * 4096, 256, 4096)
+            limit = 14
+        else:
+            fitted = tokenhub_fit_pixels(size, 921600, 4624220, 720, 4096)
+            limit = 10
+        body = {"model": model_id, "prompt": prompt, "size": fitted, "watermark": False, "response_format": "url"}
+        images = await tokenhub_reference_urls(reference_images, limit)
+        if images:
+            body["images"] = images
+        created = await tokenhub_submit_json(client, "/v1/wand/si-image/generation", headers, body)
+        return tokenhub_image_from_payload(created), created
+    if model_id == "vidu-image-q2":
+        body = {
+            "model": model_id,
+            "prompt": prompt,
+            "aspect_ratio": tokenhub_nearest_ratio(size, ["16:9", "9:16", "1:1", "3:4", "4:3", "21:9", "2:3", "3:2"], "1:1"),
+            "resolution": tokenhub_vidu_resolution(size),
+        }
+        images = await tokenhub_reference_urls(reference_images, 7)
+        if images:
+            body["images"] = images
+        created = await tokenhub_submit_json(client, "/v1/wand/vidu-image/generation", headers, body)
+        task_id = tokenhub_task_id(created)
+        if not task_id:
+            raise HTTPException(status_code=502, detail=f"Vidu 生图没有返回 task_id：{str(created)[:300]}")
+        last = await tokenhub_poll(client, f"{WAND_INTL_BASE}/v1/wand/vidu-image/tasks/{task_id}", headers, 180, 4)
+        return tokenhub_image_from_payload(last), last
+    resolution = "1k"
+    edge = max(tokenhub_dimensions(size))
+    if model_id == "kling-image-v3-omni" and edge >= 3000:
+        resolution = "4k"
+    elif edge >= 1500:
+        resolution = "2k"
+    ratios = ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "21:9"]
+    body = {
+        "model": model_id,
+        "prompt": prompt,
+        "aspect_ratio": tokenhub_nearest_ratio(size, ratios, "1:1"),
+        "resolution": resolution,
+        "n": 1,
+    }
+    if model_id == "kling-image-v3":
+        images = await tokenhub_reference_urls(reference_images, 1)
+        if images:
+            body["image"] = images[0]
+    else:
+        images = await tokenhub_reference_urls(reference_images, 10)
+        if images:
+            body["image_list"] = images
+    created = await tokenhub_submit_json(client, "/v1/wand/kling-image/generation", headers, body)
+    task_id = tokenhub_task_id(created)
+    if not task_id:
+        raise HTTPException(status_code=502, detail=f"可灵生图没有返回 task_id：{str(created)[:300]}")
+    last = await tokenhub_poll(client, f"{WAND_INTL_BASE}/v1/wand/kling-image/tasks/{task_id}", headers, 180, 4)
+    return tokenhub_image_from_payload(last), last
+
+async def generate_wand_provider_image(prompt, size, model, reference_images=None, provider=None):
+    model_id = selected_model(model, WAND_IMAGE_MODEL)
+    headers = tokenhub_headers(provider)
+    timeout = httpx.Timeout(connect=20.0, read=180.0, write=60.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        if model_id.startswith("wand-vega-image"):
+            return await generate_tokenhub_vega_image(prompt, size, model_id, reference_images, headers, client)
+        if model_id.startswith("hy-image-"):
+            return await generate_tokenhub_hy_image(prompt, size, model_id, reference_images, headers, client)
+        if model_id.startswith(("vidu-image-", "seedream-image-", "kling-image-")):
+            return await generate_tokenhub_direct_image(prompt, size, model_id, reference_images, headers, client)
+    raise HTTPException(status_code=400, detail=f"腾讯国际站没有这个生图模型：{model_id}")
+
+async def generate_tokenhub_vega_video(payload, model_id, prompt, headers, client):
+    duration = tokenhub_clamp_duration(payload.duration, 4, 15, 5)
+    content = [{"type": "text", "text": prompt}]
+    images = [ref for ref in (payload.images or []) if str(getattr(ref, "url", "") or "").strip()]
+    first_frames = [ref for ref in images if str(getattr(ref, "role", "") or "") == "first_frame"][:1]
+    last_frames = [ref for ref in images if str(getattr(ref, "role", "") or "") == "last_frame"][:1]
+    if first_frames or last_frames:
+        if first_frames:
+            content.append({"type": "image_url", "image_url": {"url": await wand_media_url(first_frames[0].url)}, "role": "first_frame"})
+        if last_frames:
+            content.append({"type": "image_url", "image_url": {"url": await wand_media_url(last_frames[0].url)}, "role": "last_frame"})
+    else:
+        for ref in images[:9]:
+            content.append({"type": "image_url", "image_url": {"url": await wand_media_url(ref.url)}, "role": "reference_image"})
+        for url in [str(item or "").strip() for item in (payload.videos or [])][:3]:
+            if url:
+                content.append({"type": "video_url", "video_url": {"url": await wand_media_url(url)}, "role": "reference_video"})
+        for url in [str(item or "").strip() for item in (payload.audios or [])][:3]:
+            if url:
+                content.append({"type": "audio_url", "audio_url": {"url": await wand_media_url(url)}, "role": "reference_audio"})
+    body = {
+        "model": model_id,
+        "content": content,
+        "resolution": wand_video_resolution(payload.resolution or payload.size),
+        "ratio": wand_video_ratio(payload.aspect_ratio),
+        "duration": duration,
+    }
+    if payload.return_last_frame:
+        body["options"] = {"return_last_frame": True}
+    created = await tokenhub_submit_json(client, "/v1/wand/vega-videos/tasks", headers, body)
+    task_id = tokenhub_task_id(created)
+    if not task_id:
+        raise HTTPException(status_code=502, detail=f"WAND 生视频没有返回任务 ID：{str(created)[:300]}")
+    return await tokenhub_finish_video(client, f"{WAND_INTL_BASE}/v1/wand/vega-videos/tasks/{task_id}", headers, "WAND 生视频")
+
+async def generate_tokenhub_hy_video(payload, model_id, prompt, headers, client):
+    body = {"model": model_id, "prompt": prompt}
+    first, _last, others, _videos, _audios = await tokenhub_video_media(payload)
+    image = (first or others[:1] or [None])[0]
+    if image is not None:
+        body["image_url"] = await wand_media_url(image.url)
+    else:
+        ratio = str(payload.aspect_ratio or "").strip()
+        body["aspect_ratio"] = ratio if ratio in {"16:9", "9:16", "1:1", "4:3", "3:4"} else "16:9"
+    created = await tokenhub_submit_json(client, "/v1/wand/hunyuan-video/generation", headers, body)
+    task_id = tokenhub_task_id(created)
+    if not task_id:
+        raise HTTPException(status_code=502, detail=f"混元生视频没有返回 task_id：{str(created)[:300]}")
+    return await tokenhub_finish_video(client, f"{WAND_INTL_BASE}/v1/wand/hunyuan-video/tasks/{task_id}", headers, "混元生视频")
+
+async def generate_tokenhub_vidu_video(payload, model_id, prompt, headers, client):
+    first, _last, others, _videos, _audios = await tokenhub_video_media(payload)
+    images = await tokenhub_reference_urls(first + others, 15)
+    if not images:
+        raise HTTPException(status_code=400, detail="vidu-video-q4-preview 需要至少一张参考图。纯文字请改用 WAND、混元、PixVerse、可灵或 MiniMax。")
+    duration = tokenhub_clamp_duration(payload.duration, 3, 16, 5)
+    resolution = tokenhub_vidu_resolution(payload.resolution or payload.size)
+    if len(images) == 1:
+        path = "/v1/wand/vidu/image-to-video"
+        body = {"model": model_id, "images": images, "prompt": prompt, "duration": duration, "resolution": resolution, "audio": bool(payload.generate_audio)}
+    else:
+        path = "/v1/wand/vidu/reference-to-video"
+        body = {"model": model_id, "images": images, "prompt": prompt, "duration": duration, "resolution": resolution}
+    created = await tokenhub_submit_json(client, path, headers, body)
+    task_id = tokenhub_task_id(created)
+    if not task_id:
+        raise HTTPException(status_code=502, detail=f"Vidu 生视频没有返回 task_id：{str(created)[:300]}")
+    return await tokenhub_finish_video(client, f"{WAND_INTL_BASE}/v1/wand/vidu/tasks/{task_id}", headers, "Vidu 生视频")
+
+async def generate_tokenhub_pixverse_video(payload, model_id, prompt, headers, client):
+    prompt = tokenhub_require_prompt(prompt, model_id, limit=5000)
+    first, last, others, _videos, _audios = await tokenhub_video_media(payload)
+    if not first and others:
+        first = others[:1]
+        others = others[1:]
+    duration = tokenhub_clamp_duration(payload.duration, 1, 15, 5)
+    quality = tokenhub_pixverse_quality(payload.resolution or payload.size)
+    if first and last:
+        path = "/v1/wand/pixverse/start-end-to-video"
+        body = {
+            "model": model_id,
+            "prompt": prompt,
+            "first_frame_img": await wand_media_url(first[0].url),
+            "last_frame_img": await wand_media_url(last[0].url),
+            "duration": duration,
+            "quality": quality,
+        }
+    elif first:
+        path = "/v1/wand/pixverse/image-to-video"
+        body = {"model": model_id, "prompt": prompt, "img_id": await wand_media_url(first[0].url), "duration": duration, "quality": quality}
+    elif others:
+        path = "/v1/wand/pixverse/reference-to-video"
+        image_references = []
+        for ref in others[:7]:
+            image_references.append({"img_id": await wand_media_url(ref.url), "type": "subject"})
+        ratio = str(payload.aspect_ratio or "16:9").strip()
+        if ratio not in {"16:9", "4:3", "1:1", "3:4", "9:16", "2:3", "3:2", "21:9"}:
+            ratio = "16:9"
+        body = {
+            "model": model_id,
+            "prompt": prompt,
+            "image_references": image_references,
+            "duration": duration,
+            "quality": quality,
+            "aspect_ratio": ratio,
+        }
+    else:
+        path = "/v1/wand/pixverse/text-to-video"
+        ratio = str(payload.aspect_ratio or "16:9").strip()
+        if ratio not in {"16:9", "4:3", "1:1", "3:4", "9:16", "2:3", "3:2", "21:9"}:
+            ratio = "16:9"
+        body = {"model": model_id, "prompt": prompt, "duration": duration, "quality": quality, "aspect_ratio": ratio}
+    if payload.generate_audio and path != "/v1/wand/pixverse/start-end-to-video":
+        body["generate_audio_switch"] = True
+    created = await tokenhub_submit_json(client, path, headers, body)
+    task_id = tokenhub_task_id(created)
+    if not task_id:
+        raise HTTPException(status_code=502, detail=f"PixVerse 生视频没有返回任务 ID：{str(created)[:300]}")
+    deadline = time.monotonic() + min(float(VIDEO_POLL_TIMEOUT or 900), 900)
+    last = created
+    while time.monotonic() < deadline:
+        await asyncio.sleep(6)
+        result = await client.get(f"{WAND_INTL_BASE}/v1/wand/pixverse/tasks/{task_id}", headers=headers)
+        last = wand_response_data(result)
+        resp = last.get("Resp") if isinstance(last.get("Resp"), dict) else last
+        try:
+            status = int((resp or {}).get("status"))
+        except Exception:
+            status = 0
+        if status == 1:
+            video_url = tokenhub_video_url(last)
+            if not video_url:
+                raise HTTPException(status_code=502, detail=f"PixVerse 完成但没有视频地址：{str(last)[:300]}")
+            local_url = await save_remote_video_to_output(video_url, prefix="wand_")
+            return {"videos": [local_url], "task_id": task_id, "raw": last}
+        if status in {6, 7, 8}:
+            raise HTTPException(status_code=502, detail=f"PixVerse 生视频失败，status={status}：{str(last)[:300]}")
+    raise HTTPException(status_code=504, detail=f"PixVerse 生视频超时，task_id={task_id}")
+
+async def generate_tokenhub_kling_video(payload, model_id, prompt, headers, client):
+    first, last, others, videos, _audios = await tokenhub_video_media(payload)
+    if not first and others:
+        first = others[:1]
+        others = others[1:]
+    resolution = tokenhub_kling_video_resolution(model_id, payload.resolution or payload.size)
+    if model_id.startswith("kling-video-motion-control"):
+        if not first or not videos:
+            raise HTTPException(status_code=400, detail=f"{model_id} 需要一张人物参考图和一段动作参考视频。")
+        body = {
+            "model": model_id,
+            "contents": [
+                {"type": "prompt", "text": prompt},
+                {"type": "image", "url": await wand_media_url(first[0].url)},
+                {"type": "video", "url": videos[0]},
+            ],
+            "settings": {"character_orientation": "video", "resolution": resolution},
+        }
+        path = "/v1/wand/kling/motion-control"
+    elif model_id == "kling-video-v3-omni" or (model_id == "kling-video-v4" and (videos or others)):
+        if model_id == "kling-video-v3-omni" and not (first or others or videos):
+            raise HTTPException(status_code=400, detail="kling-video-v3-omni 需要参考图或参考视频。纯文字请改用 kling-video-v3 或 kling-video-v4。")
+        contents = [{"type": "prompt", "text": prompt}]
+        for ref in (first + others)[:9]:
+            contents.append({"type": "refer_image", "url": await wand_media_url(ref.url)})
+        for url in videos[:3]:
+            contents.append({"type": "feature_video", "url": url})
+        high = 30 if model_id == "kling-video-v4" else 15
+        settings = {
+            "resolution": resolution,
+            "aspect_ratio": tokenhub_kling_aspect(model_id, payload.aspect_ratio, omni=True),
+            "duration": tokenhub_clamp_duration(payload.duration, 3, high, 5),
+        }
+        if model_id == "kling-video-v3-omni":
+            settings["audio"] = "original" if videos else ("native" if payload.generate_audio else "off")
+        body = {"model": model_id, "contents": contents, "settings": settings}
+        path = "/v1/wand/kling/omni-video"
+    elif first:
+        if last and model_id == "kling-video-v3-turbo":
+            raise HTTPException(status_code=400, detail="kling-video-v3-turbo 不支持尾帧。请改用 kling-video-v3 或 kling-video-v4。")
+        contents = [{"type": "prompt", "text": prompt}, {"type": "first_frame", "url": await wand_media_url(first[0].url)}]
+        if last:
+            contents.append({"type": "last_frame", "url": await wand_media_url(last[0].url)})
+        high = 30 if model_id == "kling-video-v4" else 15
+        settings = {"resolution": resolution, "duration": tokenhub_clamp_duration(payload.duration, 3, high, 5)}
+        if model_id == "kling-video-v3" and payload.generate_audio:
+            settings["audio"] = "native"
+        body = {"model": model_id, "contents": contents, "settings": settings}
+        path = "/v1/wand/kling/image-to-video"
+    else:
+        high = 30 if model_id == "kling-video-v4" else 15
+        settings = {
+            "resolution": resolution,
+            "aspect_ratio": tokenhub_kling_aspect(model_id, payload.aspect_ratio),
+            "duration": tokenhub_clamp_duration(payload.duration, 3, high, 5),
+        }
+        if model_id == "kling-video-v3" and payload.generate_audio:
+            settings["audio"] = "native"
+        body = {"model": model_id, "prompt": prompt, "settings": settings}
+        path = "/v1/wand/kling/text-to-video"
+    created = await tokenhub_submit_json(client, path, headers, body)
+    task_id = tokenhub_task_id(created)
+    if not task_id:
+        raise HTTPException(status_code=502, detail=f"可灵生视频没有返回任务 ID：{str(created)[:300]}")
+    return await tokenhub_finish_video(client, f"{WAND_INTL_BASE}/v1/wand/kling/tasks/{task_id}", headers, "可灵生视频")
+
+async def generate_tokenhub_minimax_video(payload, model_id, prompt, headers, client):
+    first, last, others, videos, audios = await tokenhub_video_media(payload)
+    low = 5 if model_id.endswith("-max") else 4
+    duration = tokenhub_clamp_duration(payload.duration, low, 15, 6 if low == 4 else 5)
+    resolution = tokenhub_minimax_resolution(model_id, payload.resolution or payload.size)
+    content = [{"type": "text", "text": prompt}]
+    uses_reference = bool(others or videos or audios) and not first and not last
+    if model_id.endswith("-max") and (others or videos or audios) and not first:
+        if others:
+            first = others[:1]
+            others = []
+            videos = []
+            audios = []
+            uses_reference = False
+        else:
+            raise HTTPException(status_code=400, detail="minimax-video-h3-max 不支持参考视频和参考音频，只支持首帧或尾帧。")
+    if uses_reference and not model_id.endswith("-max"):
+        for ref in others[:9]:
+            content.append({"type": "image_url", "image_url": {"url": await wand_media_url(ref.url)}, "role": "reference_image"})
+        for url in videos[:3]:
+            content.append({"type": "video_url", "video_url": {"url": url}, "role": "reference_video"})
+        for url in audios[:3]:
+            content.append({"type": "audio_url", "audio_url": {"url": url}, "role": "reference_audio"})
+        ratio = wand_video_ratio(payload.aspect_ratio)
+    else:
+        if not first and others:
+            first = others[:1]
+        if first:
+            content.append({"type": "image_url", "image_url": {"url": await wand_media_url(first[0].url)}, "role": "first_frame"})
+        if last and not model_id.endswith("-max"):
+            content.append({"type": "image_url", "image_url": {"url": await wand_media_url(last[0].url)}, "role": "last_frame"})
+        elif last and model_id.endswith("-max"):
+            content.append({"type": "image_url", "image_url": {"url": await wand_media_url(last[0].url)}, "role": "last_frame"})
+        ratio = "adaptive" if (first or last) else wand_video_ratio(payload.aspect_ratio)
+        if ratio == "adaptive" and not (first or last):
+            ratio = "16:9"
+    body = {"model": model_id, "content": content, "resolution": resolution, "duration": duration, "ratio": ratio}
+    created = await tokenhub_submit_json(client, "/v1/wand/minimax-video-v2/generation", headers, body)
+    task_id = tokenhub_task_id(created)
+    if not task_id:
+        raise HTTPException(status_code=502, detail=f"MiniMax 生视频没有返回 task_id：{str(created)[:300]}")
+    return await tokenhub_finish_video(client, f"{WAND_INTL_BASE}/v1/wand/minimax-video-v2/tasks/{task_id}", headers, "MiniMax 生视频")
+
+async def generate_wand_video(payload, provider):
+    prompt = str(payload.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="提示词不能为空")
+    model_id = selected_model(payload.model, WAND_VIDEO_MODEL)
+    headers = tokenhub_headers(provider)
+    timeout = httpx.Timeout(connect=20.0, read=60.0, write=60.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        if model_id.startswith("wand-vega-video"):
+            return await generate_tokenhub_vega_video(payload, model_id, prompt, headers, client)
+        if model_id == "hy-video-v1.5":
+            return await generate_tokenhub_hy_video(payload, model_id, prompt, headers, client)
+        if model_id.startswith("vidu-video-"):
+            return await generate_tokenhub_vidu_video(payload, model_id, prompt, headers, client)
+        if model_id.startswith("pixverse-video-"):
+            return await generate_tokenhub_pixverse_video(payload, model_id, prompt, headers, client)
+        if model_id.startswith("kling-video-"):
+            return await generate_tokenhub_kling_video(payload, model_id, prompt, headers, client)
+        if model_id.startswith("minimax-video-"):
+            return await generate_tokenhub_minimax_video(payload, model_id, prompt, headers, client)
+    raise HTTPException(status_code=400, detail=f"腾讯国际站没有这个生视频模型：{model_id}")
+
 async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly"):
     provider = get_api_provider(provider_id)
+    if tencent_vod.is_provider(provider):
+        body = tencent_vod.image_request(prompt, size, model, reference_images,
+                                        provider.get("tencent_sub_app_id"), reference_to_data_url)
+        return await tencent_vod.generate(tencent_vod_config(provider), body)
+    if is_wand_provider(provider):
+        return await generate_wand_provider_image(prompt, size, model, reference_images, provider)
     if provider["id"] == "modelscope":
         return await generate_modelscope_provider_image(prompt, size, model, reference_images, provider)
     if is_jimeng_provider(provider):
@@ -10615,7 +11553,7 @@ async def temp_sh_upload(payload: TempShUploadRequest, request: Request):
 @app.post("/api/cloud-video/upload")
 async def cloud_video_upload(payload: CloudVideoUploadRequest, request: Request):
     ensure_same_origin_request(request)
-    return await upload_local_video_to_cloud(payload.url, payload.service)
+    return await upload_local_video_to_cloud(payload.url, payload.service, ("image/", "video/", "audio/"))
 
 @app.post("/api/ai/import-local-image")
 async def import_local_ai_reference(payload: LocalImageImportRequest, request: Request):
@@ -11163,6 +12101,19 @@ async def save_providers(payload: List[ApiProviderPayload]):
             api_key = item.api_key.strip()
             env_updates[key_env] = api_key
             credential_overrides[provider["id"]] = api_key
+        if tencent_vod.is_provider(provider):
+            for field in ("secret_id", "secret_key", "token"):
+                name = tencent_vod_env(provider["id"], field)
+                value = getattr(item, f"tencent_{field}")
+                if item.clear_tencent_credentials:
+                    env_updates[name] = ""
+                elif value is not None and (value.strip() or field == "token"):
+                    env_updates[name] = value.strip()
+            config = tencent_vod_config(provider)
+            credential_overrides[provider["id"]] = bool(
+                env_updates.get(tencent_vod_env(provider["id"], "secret_id"), config["secret_id"])
+                and env_updates.get(tencent_vod_env(provider["id"], "secret_key"), config["secret_key"])
+            )
         if provider["id"] == "runninghub":
             wallet_env = runninghub_wallet_key_env()
             if item.clear_wallet_key:
@@ -11237,12 +12188,43 @@ class TestConnectionPayload(BaseModel):
     provider_id: str = ""
     protocol: str = "openai"
     image_request_mode: str = "openai"
+    tencent_sub_app_id: Optional[int] = Field(default=None, ge=0)
+    tencent_region: str = ""
+    tencent_secret_id: str = ""
+    tencent_secret_key: str = ""
+    tencent_token: Optional[str] = None
+
+def tencent_vod_env(provider_id, field):
+    return f"{provider_key_env(provider_id)}_TENCENT_{field.upper()}"
+
+def tencent_vod_config(provider, payload=None):
+    config = {"base_url": provider.get("base_url") or tencent_vod.DEFAULT_BASE,
+              "region": provider.get("tencent_region") or "ap-guangzhou"}
+    for field in ("secret_id", "secret_key", "token"):
+        name = tencent_vod_env(provider["id"], field)
+        value = getattr(payload, f"tencent_{field}", None) if payload else None
+        config[field] = str(value if value is not None and (value or field == "token")
+                            else os.getenv(name, "") or read_api_env_value(name)).strip()
+    return config
+
+async def tencent_vod_models(payload):
+    provider_id = getattr(payload, "provider_id", "")
+    saved = next((p for p in load_api_providers() if p["id"] == provider_id), {})
+    provider = {**saved, "id": provider_id or "tencent-vod", "protocol": tencent_vod.PROTOCOL,
+                "base_url": payload.base_url or saved.get("base_url") or tencent_vod.DEFAULT_BASE,
+                "tencent_region": payload.tencent_region or saved.get("tencent_region") or "ap-guangzhou"}
+    sub_app_id = payload.tencent_sub_app_id if payload.tencent_sub_app_id is not None else saved.get("tencent_sub_app_id", 0)
+    return await tencent_vod.discover(tencent_vod_config(provider, payload), sub_app_id)
 
 def protocol_from_payload(payload):
     base_url = str(getattr(payload, "base_url", "") or "").strip()
     if is_ominilink_provider_config(payload):
         return "openai"
     provider_id = str(getattr(payload, "provider_id", "") or "").strip().lower()
+    if tencent_vod.is_provider(payload):
+        return tencent_vod.PROTOCOL
+    if is_wand_api_url(base_url) or str(getattr(payload, "protocol", "") or "").strip().lower() == "wand":
+        return "wand"
     if provider_id == "volcengine":
         return "volcengine"
     if provider_id == "runninghub":
@@ -11562,6 +12544,20 @@ def ominilink_catalog_fallback_payload(base_url, status=0, raw=None):
 async def test_provider_connection(payload: TestConnectionPayload):
     """测试请求地址是否可用：调上游 /v1/models。验证通过时同时把模型清单按类别返回，避免再调一次拉取接口。"""
     protocol = protocol_from_payload(payload)
+    if protocol == tencent_vod.PROTOCOL:
+        return await tencent_vod_models(payload)
+    if protocol == "wand":
+        api_key = api_key_from_payload(payload, protocol)
+        if not api_key:
+            raise HTTPException(status_code=400, detail="请先填写或保存 TokenHub API Key")
+        try:
+            key_ok, status, message = await wand_probe_key(api_key)
+        except httpx.HTTPError as exc:
+            return {"ok": False, "status": 0, "protocol": "wand", "message": f"连接国际站 TokenHub 失败：{exc}"}
+        catalog = wand_model_catalog()
+        address_ok = key_ok or status in (400, 401, 403, 404)
+        catalog.update({"ok": address_ok, "status": status, "message": message, "connection_verified": key_ok})
+        return catalog
     if protocol == "jimeng":
         status = await jimeng_status()
         return {
@@ -11675,12 +12671,28 @@ async def probe_async_endpoint(payload: TestConnectionPayload):
     """验证异步协议：用假 task_id 请求 GET /v1/tasks/{fake_id}。
     收到 400 Invalid task ID = 端点存在且 Key 有效；401/403 = Key 无效；404/连接失败 = 不支持异步端点。"""
     base_url = provider_probe_base_url(payload)
-    if not base_url:
-        raise HTTPException(status_code=400, detail="请先填写请求地址")
     protocol = protocol_from_payload(payload)
+    if protocol == tencent_vod.PROTOCOL:
+        return await tencent_vod_models(payload)
+    if protocol != "wand" and not base_url:
+        raise HTTPException(status_code=400, detail="请先填写请求地址")
     api_key = api_key_from_payload(payload, protocol)
     if not api_key:
         raise HTTPException(status_code=400, detail="请先填写或保存 API Key")
+    if protocol == "wand":
+        try:
+            key_ok, status, message = await wand_probe_key(api_key)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"连接国际站 TokenHub 失败：{exc}") from exc
+        recognized = key_ok or status in (400, 401, 403, 404)
+        return {
+            "ok": recognized,
+            "protocol": "wand",
+            "status_code": status,
+            "message": message if recognized else f"国际站 TokenHub 没有按 WAND 协议应答（HTTP {status}）",
+            "connection_verified": key_ok,
+            "raw": {"status": status},
+        }
     if is_ominilink_provider_config(payload):
         try:
             async with httpx.AsyncClient(timeout=15) as client:
@@ -11872,6 +12884,16 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
     protocol = protocol if protocol in SUPPORTED_PROVIDER_PROTOCOLS else "openai"
     if is_ominilink_api_url(base_url):
         protocol = "openai"
+    if protocol == "wand":
+        catalog = wand_model_catalog()
+        if api_key:
+            try:
+                key_ok, status, message = await wand_probe_key(api_key)
+            except httpx.HTTPError as exc:
+                catalog.update({"status": 0, "message": f"连接国际站 TokenHub 失败：{exc}"})
+                return catalog
+            catalog.update({"status": status, "connection_verified": key_ok, "message": message if not key_ok else catalog["message"]})
+        return catalog
     if protocol == "jimeng":
         return {
             "total": len(JIMENG_DEFAULT_IMAGE_MODELS) + len(JIMENG_DEFAULT_VIDEO_MODELS),
@@ -12007,6 +13029,8 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
 async def fetch_upstream_models_from_payload(payload: TestConnectionPayload):
     """按页面当前表单值拉取模型，支持新增平台未保存时直接使用临时 Base URL / Key。"""
     protocol = protocol_from_payload(payload)
+    if protocol == tencent_vod.PROTOCOL:
+        return await tencent_vod_models(payload)
     api_key = api_key_from_payload(payload, protocol)
     return await fetch_models_from_upstream(provider_probe_base_url(payload), api_key, protocol, payload.image_request_mode)
 
@@ -12014,6 +13038,8 @@ async def fetch_upstream_models_from_payload(payload: TestConnectionPayload):
 async def fetch_upstream_models(provider_id: str):
     """从已保存的上游 OpenAI 兼容接口拉取 /v1/models 列表，按名称智能分类为 image/chat/video。"""
     provider = get_api_provider_exact(provider_id)
+    if tencent_vod.is_provider(provider):
+        return await tencent_vod_models(TestConnectionPayload(provider_id=provider_id, protocol=tencent_vod.PROTOCOL))
     if is_ominilink_provider_config(provider):
         base_url = ominilink_chat_api_url(provider)
         api_key = provider_env_key_value(provider["id"])
@@ -12301,6 +13327,13 @@ def build_image_param_fields(engine: str, provider: dict, model: str):
         "options": [1, 2, 3, 4], "default": 1,
     }
     refs_field = {"key": "reference_images", "type": "refs", "label": "参考图", "max": ONLINE_IMAGE_REFERENCE_MAX}
+    if tencent_vod.is_provider(provider):
+        spec = tencent_vod.model_spec(model or tencent_vod.MODEL_ID, "image")
+        refs_field["max"] = spec["max_references"] if spec["max_references"] is not None else ONLINE_IMAGE_REFERENCE_MAX
+        size_field["ratios"] = [{"value": ratio, "label": ratio} for ratio in spec["aspect_ratios"]]
+        size_field["resolutions"] = [{"value": "1k" if value.lower() == "1080p" else value.lower(), "label": value}
+                                     for value in spec["resolutions"]]
+        return [size_field, count_field, refs_field]
 
     if engine == "runninghub":
         # RunningHub 参数按 app/工作流动态，需先选工作流再用 /api/runninghub/workflow-info 拉字段。
@@ -12349,6 +13382,7 @@ VIDEO_URL_KEYS = (
     "video", "src", "uri", "preview_url", "previewUrl", "path",
     "last_frame_url", "lastFrameUrl", "remixed_from_video_id",
     "unsigned_urls", "unsignedUrls", "signed_urls", "signedUrls", "content_url", "contentUrl",
+    "result_url", "resultUrl",
 )
 
 def _collect_video_url(value, urls):
@@ -12690,6 +13724,123 @@ async def build_ominilink_omni_request(payload: CanvasVideoRequest, resolver=Non
         },
     }
 
+def is_ominilink_seedance_model(model: str) -> bool:
+    """Seedance 2.x on OminiLink can take image, video, and audio references.
+
+    The gateway ids are seedance-2.0 and seedance-2.0-fast. BytePlus and
+    Dreamina checkpoints use ids such as dreamina-seedance-2-0-260128.
+    Seedance 1.x stays on the basic text-to-video path.
+    """
+    value = str(model or "").strip().lower()
+    leaf = value.rsplit("/", 1)[-1]
+    if leaf in {"seedance-2.0", "seedance-2.0-fast", "seedance-2.5"}:
+        return True
+    return bool(re.fullmatch(
+        r"(?:dreamina-|doubao-)?seedance-2-[05](?:-(?:fast|mini))?(?:-\d{6})?",
+        leaf,
+    ))
+
+OMINILINK_SEEDANCE_IMAGE_MAX_EDGE = 1536
+
+def ominilink_seedance_image_reference_url(value: str) -> str:
+    """Local Seedance images stay inline. Litterbox and temp.sh are not required."""
+    text = str(value or "").strip()
+    if text.startswith(("http://", "https://", "data:image/")):
+        return text
+    data_url = reference_to_data_url(
+        {"url": text},
+        max_size=OMINILINK_SEEDANCE_IMAGE_MAX_EDGE,
+    )
+    if not str(data_url).startswith("data:image/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Seedance 参考图片无法读取，请确认本地文件还在画布里。",
+        )
+    return data_url
+
+async def ominilink_seedance_reference_url(value: str, allowed_prefix: str) -> str:
+    text = str(value or "").strip()
+    if allowed_prefix == "image/":
+        return ominilink_seedance_image_reference_url(text)
+    if text.startswith(("http://", "https://")):
+        return text
+    uploaded = await upload_local_video_to_cloud(
+        text,
+        "auto",
+        (allowed_prefix,),
+    )
+    url = str(uploaded.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=502,
+            detail="Seedance 参考素材上传后没有返回可访问的网络地址。",
+        )
+    return url
+
+def ominilink_seedance_api_root(provider: dict) -> str:
+    """ByteDance Seedance root. The JSON route is the overseas prefix.
+
+    https://vg-api.aig-ai.com/v3/bytedance-cn still returns the gateway HTML
+    page. https://vg-api.aig-ai.com/v3/bytedance/api/v3 answers JSON.
+    """
+    configured = str(
+        (provider or {}).get("video_base_url")
+        or (provider or {}).get("base_url")
+        or ""
+    ).strip().rstrip("/")
+    marker = "/v3/bytedance/api/v3"
+    if marker in configured:
+        return configured.split(marker, 1)[0] + marker
+    parsed = urllib.parse.urlsplit(configured)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}{marker}"
+
+async def build_ominilink_seedance_request(payload: CanvasVideoRequest) -> dict:
+    content = [{"type": "text", "text": str(payload.prompt or "")}]
+    for ref in payload.images or []:
+        if not str(getattr(ref, "url", "") or "").strip():
+            continue
+        role = str(getattr(ref, "role", "") or "").strip().lower()
+        if role not in {"first_frame", "last_frame", "reference_image"}:
+            role = "reference_image"
+        url = await ominilink_seedance_reference_url(ref.url, "image/")
+        content.append({
+            "type": "image_url",
+            "role": role,
+            "image_url": {"url": url},
+        })
+    for value in payload.videos or []:
+        if not str(value or "").strip():
+            continue
+        url = await ominilink_seedance_reference_url(value, "video/")
+        content.append({
+            "type": "video_url",
+            "role": "reference_video",
+            "video_url": {"url": url},
+        })
+    for value in payload.audios or []:
+        if not str(value or "").strip():
+            continue
+        url = await ominilink_seedance_reference_url(value, "audio/")
+        content.append({
+            "type": "audio_url",
+            "role": "reference_audio",
+            "audio_url": {"url": url},
+        })
+    body = {
+        "model": selected_model(payload.model, "dreamina-seedance-2-0-260128"),
+        "content": content,
+        "duration": int(payload.duration),
+        "ratio": str(payload.aspect_ratio or "16:9").strip() or "16:9",
+        "generate_audio": bool(payload.generate_audio),
+        "watermark": bool(payload.watermark),
+    }
+    resolution = volcengine_video_resolution(payload.resolution)
+    if resolution:
+        body["resolution"] = resolution
+    return body
+
 def looks_like_html_response(text: str) -> bool:
     sample = str(text or "").lstrip()[:200].lower()
     return sample.startswith("<!doctype html") or sample.startswith("<html") or "<head" in sample
@@ -12708,7 +13859,13 @@ def video_submit_url_candidates(provider, base_url):
         return [f"{base_url}/api/v3/contents/generations/tasks"]
     if is_yuli_provider(provider):
         return [f"{base_url}/v1/video/create"]
-    return [f"{base_url}/v1/videos/generations", f"{base_url}/v2/videos/generations"]
+    # 国内 New API / 聚合网关常代理阿里系视频端点为单数 /v1/video/generations；
+    # 404 会自动 fall-through 到后面的 OpenAI 复数路径，不影响已有 provider。
+    return [
+        f"{base_url}/v1/video/generations",
+        f"{base_url}/v1/videos/generations",
+        f"{base_url}/v2/videos/generations",
+    ]
 
 def video_task_url_candidates(provider, base_url, task_id, submit_url=""):
     if is_openrouter_provider(provider):
@@ -12732,12 +13889,16 @@ def video_task_url_candidates(provider, base_url, task_id, submit_url=""):
         # 玉玉API 两种视频格式：OpenAI（/v1/videos/{id}）与原生（/v1/video/query?id=）。
         # 两个都试，谁返回成功就用谁，兼容 veo OpenAI 路径与 doubao 原生路径。
         return [f"{base_url}/v1/videos/{task_id}", f"{base_url}/v1/video/query?id={task_id}"]
+    v1_singular_task = f"{base_url}/v1/video/generations/{task_id}"
     v1_task = f"{base_url}/v1/videos/generations/{task_id}"
     v1_generic_task = f"{base_url}/v1/tasks/{task_id}"
     v2_task = f"{base_url}/v2/videos/generations/{task_id}"
-    if "/v2/videos/generations" in str(submit_url or ""):
-        return [v2_task, v1_task, v1_generic_task]
-    return [v1_task, v1_generic_task, v2_task]
+    submit = str(submit_url or "")
+    if "/v2/videos/generations" in submit:
+        return [v2_task, v1_task, v1_singular_task, v1_generic_task]
+    if "/v1/video/generations" in submit:
+        return [v1_singular_task, v1_task, v1_generic_task]
+    return [v1_task, v1_singular_task, v1_generic_task, v2_task]
 
 VIDEO_TASK_SUCCESS_STATUSES = {
     "SUCCESS", "SUCCEED", "SUCCEEDED", "COMPLETED", "COMPLETE",
@@ -12831,7 +13992,7 @@ def humanize_video_task_failure(reason) -> str:
         )
     return f"视频生成任务失败：{text}"
 
-def _ominilink_response_json(response, task_id="") -> dict:
+def _ominilink_response_json(response, task_id="", model="") -> dict:
     response_text = str(getattr(response, "text", "") or "")
     status_code = int(getattr(response, "status_code", 200) or 200)
     try:
@@ -12848,6 +14009,18 @@ def _ominilink_response_json(response, task_id="") -> dict:
             raise HTTPException(
                 status_code=status_code,
                 detail=f"{detail}（HTTP {status_code}）",
+            ) from exc
+        if (
+            status_code == 400
+            and is_ominilink_seedance_model(model)
+            and looks_like_html_response(response_text)
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "橙域当前暂停 Seedance API 通道，无法提交视频任务。"
+                    "请等待橙域恢复服务，或改用其他视频模型。（上游 HTTP 400）"
+                ),
             ) from exc
         if looks_like_html_response(response_text):
             detail = f"OminiLink 视频接口返回网页而不是 JSON（HTTP {status_code}）"
@@ -12993,18 +14166,26 @@ def _ominilink_timeout_error(task_id, status=""):
     )
 
 async def wait_for_ominilink_video_task(client, provider, model, task_id) -> dict:
-    api_root = ominilink_video_api_root(provider)
+    model = selected_model(model, "gemini-omni-flash-preview")
+    task_id = str(task_id or "").strip()
+    seedance = is_ominilink_seedance_model(model)
+    if seedance:
+        api_root = ominilink_seedance_api_root(provider)
+        query_url = (
+            f"{api_root}/contents/generations/tasks/"
+            f"{urllib.parse.quote(task_id, safe='')}"
+        )
+    else:
+        api_root = ominilink_video_api_root(provider)
+        query_url = (
+            f"{api_root}/query/"
+            f"{urllib.parse.quote(model, safe='')}/{urllib.parse.quote(task_id, safe='')}"
+        )
     if not api_root:
         raise HTTPException(
             status_code=400,
             detail=f"{provider.get('name') or provider['id']} 未配置视频 Base URL",
         )
-    model = selected_model(model, "gemini-omni-flash-preview")
-    task_id = str(task_id or "").strip()
-    query_url = (
-        f"{api_root}/query/"
-        f"{urllib.parse.quote(model, safe='')}/{urllib.parse.quote(task_id, safe='')}"
-    )
     deadline = time.monotonic() + VIDEO_POLL_TIMEOUT
     delay = max(2.0, IMAGE_POLL_INTERVAL)
     last_status = ""
@@ -13029,7 +14210,7 @@ async def wait_for_ominilink_video_task(client, provider, model, task_id) -> dic
                     query_url,
                     headers=headers,
                 )
-                if model == "gemini-omni-flash-preview"
+                if seedance or model == "gemini-omni-flash-preview"
                 else client.post(
                     query_url,
                     headers=headers,
@@ -13059,7 +14240,7 @@ async def wait_for_ominilink_video_task(client, provider, model, task_id) -> dic
             ) from exc
         if time.monotonic() >= deadline:
             raise _ominilink_timeout_error(task_id, last_status)
-        raw = _ominilink_response_json(response, task_id)
+        raw = _ominilink_response_json(response, task_id, model)
         status = _ominilink_task_status(raw)
         last_status = status
         urls = _ominilink_result_urls(raw, model)
@@ -13092,21 +14273,32 @@ async def generate_ominilink_video(payload, provider, client=None) -> dict:
         )
     model = selected_model(payload.model, "gemini-omni-flash-preview")
     is_omni = model == "gemini-omni-flash-preview"
-    if not is_omni and (payload.images or payload.videos or payload.audios):
+    is_seedance = is_ominilink_seedance_model(model)
+    if not is_omni and not is_seedance and (payload.images or payload.videos or payload.audios):
         raise HTTPException(
             status_code=400,
             detail="OminiLink 非 Omni Flash 视频模型不支持参考素材。",
         )
-    body = (
-        await build_ominilink_omni_request(payload)
-        if is_omni
-        else {
+    if is_omni:
+        body = await build_ominilink_omni_request(payload)
+        submit_url = f"{api_root}/{urllib.parse.quote(model, safe='')}"
+    elif is_seedance:
+        seedance_root = ominilink_seedance_api_root(provider)
+        if not seedance_root:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{provider.get('name') or provider['id']} 未配置视频 Base URL",
+            )
+        body = await build_ominilink_seedance_request(payload)
+        body["model"] = model
+        submit_url = f"{seedance_root}/contents/generations/tasks"
+    else:
+        body = {
             "prompt": payload.prompt,
             "size": ominilink_video_size(payload.aspect_ratio, payload.resolution),
             "seconds": str(payload.duration),
         }
-    )
-    submit_url = f"{api_root}/{urllib.parse.quote(model, safe='')}"
+        submit_url = f"{api_root}/{urllib.parse.quote(model, safe='')}"
 
     async def execute(active_client):
         try:
@@ -13115,7 +14307,7 @@ async def generate_ominilink_video(payload, provider, client=None) -> dict:
                 headers=ominilink_video_headers(provider),
                 json=body,
             )
-            raw = _ominilink_response_json(response)
+            raw = _ominilink_response_json(response, model=model)
             task_id = _ominilink_task_id(raw)
             status = _ominilink_task_status(raw)
             urls = _ominilink_result_urls(raw, model)
@@ -13195,9 +14387,13 @@ async def wait_for_video_task(client, provider, task_id, submit_url=""):
         for task_url in task_urls:
             try:
                 response = await client.get(task_url, headers=api_headers(provider=provider))
+                aiide_video.raise_for_redirect(response)
                 response.raise_for_status()
                 raw = response.json()
                 break
+            except HTTPException:
+                # Redirects are not alternate API endpoints. Never forward the key.
+                raise
             except Exception as exc:
                 last_error = exc
                 continue
@@ -13508,6 +14704,7 @@ async def build_openrouter_video_request(payload: CanvasVideoRequest):
         "model": selected_model(payload.model, "google/veo-3.1-fast"),
         "duration": payload.duration,
     }
+    is_flux3_video = str(body["model"] or "").strip().lower() == "black-forest-labs/flux-3-video"
     if payload.aspect_ratio:
         body["aspect_ratio"] = payload.aspect_ratio
     if payload.size:
@@ -13536,6 +14733,16 @@ async def build_openrouter_video_request(payload: CanvasVideoRequest):
 
     raw_videos = [value for value in payload.videos[:3] if str(value or "").strip()]
     raw_audios = [value for value in payload.audios[:3] if str(value or "").strip()]
+    if is_flux3_video and len(image_items) > 2:
+        raise HTTPException(
+            status_code=400,
+            detail="OpenRouter 的 FLUX.3 Video 最多支持 2 张图片，分别作为首帧和尾帧。请移除多余图片后重试。",
+        )
+    if is_flux3_video and (image_items or frame_images) and (raw_videos or raw_audios):
+        raise HTTPException(
+            status_code=400,
+            detail="OpenRouter 的 FLUX.3 Video 不能在同一次请求中混用图片首尾帧与视频/音频参考。请只保留图片，或移除图片后重试。",
+        )
     if frame_images and (raw_videos or raw_audios):
         raise HTTPException(
             status_code=400,
@@ -13553,6 +14760,14 @@ async def build_openrouter_video_request(payload: CanvasVideoRequest):
 
     if frame_images:
         body["frame_images"] = frame_images[:2]
+    elif is_flux3_video and image_items and not (video_items or audio_items):
+        first_frame = dict(image_items[0])
+        first_frame["frame_type"] = "first_frame"
+        body["frame_images"] = [first_frame]
+        if len(image_items) > 1:
+            last_frame = dict(image_items[1])
+            last_frame["frame_type"] = "last_frame"
+            body["frame_images"].append(last_frame)
     elif video_items or audio_items or payload.multimodal:
         input_references = image_items + video_items + audio_items
         if input_references:
@@ -13569,9 +14784,38 @@ async def build_openrouter_video_request(payload: CanvasVideoRequest):
     }
     return body, counts
 
+def apply_wan_video_resolution(body: Dict[str, Any]) -> None:
+    """Keep an explicit Wan 3 resolution consistent across gateway formats."""
+    model = str(body.get("model") or "").strip().lower().rsplit("/", 1)[-1]
+    if model not in {"wan3.0-video", "wan3.0-video-prime"}:
+        return
+    resolution = str(body.get("resolution") or "").strip().upper()
+    if resolution in {"", "AUTO"}:
+        return
+    if resolution not in {"480P", "720P", "1080P"}:
+        raise HTTPException(400, "Wan 3.0 分辨率需选择 480p、720p 或 1080p；已停止提交，避免回退到其他计费档位。")
+    # New API's legacy Alibaba adapter ignores top-level resolution and defaults
+    # Wan 3 to 1080P when size is absent. It reads size, then metadata.parameters.
+    # Newer adapters also read resolution. Keep all three on the user's choice;
+    # an old pixel-size value must not override the explicit resolution dropdown.
+    body["resolution"] = resolution
+    body["size"] = resolution
+    metadata = dict(body.get("metadata") or {})
+    parameters = dict(metadata.get("parameters") or {})
+    parameters["resolution"] = resolution
+    metadata["parameters"] = parameters
+    body["metadata"] = metadata
+
+
 @app.post("/api/canvas-video")
 async def canvas_video(payload: CanvasVideoRequest):
     provider = get_api_provider(payload.provider_id)
+    if aiide_video.is_provider(provider):
+        return await generate_aiide_video(payload, provider)
+    if tencent_vod.is_provider(provider):
+        return await generate_tencent_vod_video(payload, provider)
+    if is_wand_provider(provider):
+        return await generate_wand_video(payload, provider)
     if is_ominilink_provider_config(provider):
         return await generate_ominilink_video(payload, provider)
     if is_jimeng_provider(provider):
@@ -13907,6 +15151,7 @@ async def canvas_video(payload: CanvasVideoRequest):
                         body["return_last_frame"] = True
                     if payload.generate_audio:
                         body["generate_audio"] = True
+                    apply_wan_video_resolution(body)
             # --- 发起视频生成请求 ---
             raw = None
             html_response = None
@@ -13917,6 +15162,7 @@ async def canvas_video(payload: CanvasVideoRequest):
                 submit_url = candidate_url
                 is_last = idx == total_candidates - 1
                 response = await client.post(submit_url, headers=api_headers(provider=provider), json=body)
+                aiide_video.raise_for_redirect(response)
                 last_response = response
                 if response.status_code >= 400:
                     # 404/405（或直接返回网页 HTML）通常表示该平台不支持这个端点路径——
@@ -14031,6 +15277,148 @@ async def canvas_video(payload: CanvasVideoRequest):
     except httpx.HTTPError as exc:
         log_net_error(f"视频 网络/TLS错误 provider={provider.get('id')} model={payload.model}", exc)
         raise HTTPException(status_code=502, detail=f"请求上游视频接口失败：{exc}") from exc
+
+def aiide_public_reference(ref):
+    # Never turn local references into data: URLs: Aiide's asset service rejects them.
+    local_media_path_for_cloud_upload(ref["url"], (ref["kind"] + "/",))
+    public = local_asset_public_url(ref["url"])
+    if public:
+        return aiide_video.media_url(public, ref["kind"])
+    raise HTTPException(400, "Aiide 无法读取本地素材。请刷新画布，在生成前确认上传到公网存储，或配置自己的 PUBLIC_MEDIA_BASE_URL；不会自动上传公司素材。")
+
+
+@app.post("/api/aiide/video-references/prepare")
+def prepare_aiide_video_references(payload: CanvasVideoRequest, request: Request):
+    """Read-only planning: validate everything before asking consent to upload."""
+    ensure_same_origin_request(request)
+    provider = get_api_provider(payload.provider_id)
+    if not aiide_video.is_provider(provider):
+        raise HTTPException(400, "此素材检查仅适用于 Aiide。")
+    aiide_video.endpoints(provider, payload.model)
+    pending = []
+    replacements = {}
+
+    def resolve(ref):
+        source = ref["url"]
+        kind = ref["kind"]
+        local_media_path_for_cloud_upload(source, (kind + "/",))
+        public = local_asset_public_url(source)
+        if public:
+            replacements[source] = aiide_video.media_url(public, kind)
+            return replacements[source]
+        if ref not in pending:
+            pending.append(dict(ref))
+        # Validation placeholder only. It is never returned or sent to a provider.
+        return "https://upload-pending.invalid/reference"
+
+    aiide_video.request_payload(payload, resolve)
+
+    def planned_url(url, kind):
+        if url in replacements:
+            return replacements[url]
+        if any(ref["url"] == url for ref in pending):
+            return url
+        return aiide_video.media_url(url, kind) if url else url
+
+    return {
+        "images": [{**ref.model_dump(), "url": planned_url(ref.url, "image")} for ref in payload.images],
+        "videos": [planned_url(url, "video") for url in payload.videos],
+        "audios": [planned_url(url, "audio") for url in payload.audios],
+        "upload_required": pending,
+    }
+
+
+async def generate_aiide_video(payload, provider, client=None):
+    """Submit exactly once using Aiide's native contract; only GET while waiting."""
+    submit_url, query_root = aiide_video.endpoints(provider, payload.model)
+    body = aiide_video.request_payload(payload, aiide_public_reference)
+    api_key = provider_env_key_value(provider["id"])
+    if not api_key:
+        raise HTTPException(400, "未配置 Aiide API Key，请在 API 平台管理中填写。")
+    headers = {"Authorization": bearer_auth_value(api_key), "Content-Type": "application/json", "Accept": "application/json"}
+
+    async def execute(active_client):
+        task_id = ""
+        submitted = False
+        try:
+            response = await active_client.post(submit_url, headers=headers, json=body, timeout=60, follow_redirects=False)
+            submitted = True
+            data = aiide_video.response_json(response, (api_key,))
+            task_id = aiide_video.extract_task_id(data)
+            _, urls = aiide_video.task_result(data, (api_key,))
+            if not urls and not task_id:
+                raise HTTPException(502, "Aiide 未返回任务 ID 或视频地址，请到上游确认是否已创建任务，避免重复提交。")
+            deadline = time.monotonic() + VIDEO_POLL_TIMEOUT
+            delay = max(2.0, IMAGE_POLL_INTERVAL)
+            while not urls:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise HTTPException(504, f"等待 Aiide 视频超时（任务 {task_id}），上游可能仍在处理，请先查询任务，避免重复提交。")
+                await asyncio.sleep(min(delay, remaining))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    continue
+                try:
+                    response = await asyncio.wait_for(active_client.get(
+                        aiide_video.task_url(query_root, task_id), headers=headers,
+                        timeout=min(60, remaining), follow_redirects=False,
+                    ), timeout=remaining)
+                except (httpx.TransportError, asyncio.TimeoutError):
+                    # Polling is safe to retry; never resubmit generation after a timeout.
+                    delay = min(delay * 1.6, 12)
+                    continue
+                if response.status_code == 429 or response.status_code >= 500:
+                    delay = min(delay * 1.6, 12)
+                    continue
+                data = aiide_video.response_json(response, (api_key,))
+                _, urls = aiide_video.task_result(data, (api_key,))
+                delay = min(delay * 1.6, 12)
+            try:
+                # Bounded downloader validates destinations and sends no provider credentials.
+                videos = [await save_ominilink_video_to_output(url, prefix="aiide_") for url in urls]
+            except HTTPException as exc:
+                raise HTTPException(exc.status_code, f"Aiide 视频已生成，但保存失败（任务 {task_id}），请勿重复生成："
+                                    + str(exc.detail).replace("OminiLink", "Aiide")) from exc
+            return {"videos": videos, "task_id": task_id, "model": payload.model,
+                    "provider_id": provider["id"], "status": "succeeded"}
+        except HTTPException as exc:
+            if task_id:
+                exc.upstream_task_id = task_id
+                if task_id not in str(exc.detail):
+                    exc.detail = f"{exc.detail}（任务 {task_id}）"
+            raise
+        except httpx.HTTPError as exc:
+            error = HTTPException(502, "Aiide 视频接口连接中断，无法确认提交结果；请先检查上游任务记录，避免重复扣费。"
+                                  if not submitted else f"Aiide 视频接口连接中断（任务 {task_id}），请先查询上游任务。")
+            error.upstream_task_id = task_id
+            raise error from exc
+
+    if client is not None:
+        return await execute(client)
+    async with httpx.AsyncClient(follow_redirects=False) as owned_client:
+        return await execute(owned_client)
+
+
+async def generate_tencent_vod_video(payload, provider):
+    def resolve_reference(ref):
+        path = output_file_from_url(ref.get("url", ""))
+        if not path or not os.path.isfile(path):
+            raise HTTPException(400, "腾讯云 VOD 本地参考素材不存在，请重新上传。")
+        if os.path.getsize(path) > 7 * 1024 * 1024:
+            raise HTTPException(400, "腾讯云 VOD 内联素材总量受 10 MB 请求体限制；当前文件超过 7 MB，请压缩或使用自己的公网直链。")
+        return reference_to_data_url(ref)
+
+    body = tencent_vod.video_request(payload, provider.get("tencent_sub_app_id"), resolve_reference)
+    _, result = await tencent_vod.generate(tencent_vod_config(provider), body, kind="video", timeout=VIDEO_POLL_TIMEOUT)
+    try:
+        # Reuse the existing bounded, SSRF-safe media downloader (no provider credentials sent).
+        videos = [await save_ominilink_video_to_output(item["url"], prefix="tencent_vod_") for item in result["data"]]
+    except HTTPException as exc:
+        raise HTTPException(exc.status_code, f"腾讯云任务已成功，但结果保存失败（任务 {result['task_id']}）："
+                            + str(exc.detail).replace("OminiLink", "腾讯云 VOD")) from exc
+    return {"videos": videos, "task_id": result["task_id"], "model": payload.model,
+            "provider_id": provider["id"], "status": "succeeded"}
+
 
 async def run_canvas_video_task(task_id: str, payload: CanvasVideoRequest):
     """Run a long video request independently from the browser polling connection."""

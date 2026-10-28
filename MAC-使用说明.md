@@ -1,82 +1,27 @@
-# ComfyUI-API-Modelscope macOS 一键启动
+# macOS 安装说明
 
-## 快速开始
+完整安装与隐私说明见 [README.md](README.md)。基础 API 功能不需要 NVIDIA 显卡；动作提取的 Windows/CUDA 安装脚本不适用于 macOS。
 
-### 方法一：双击运行（推荐）
-
-1. **首次使用**：右键点击 `启动服务.command` → 选择 "打开" → 点击 "打开"（绕过安全警告）
-2. **之后使用**：直接双击 `启动服务.command` 即可
-
-### 方法二：终端运行
+先安装 Python 3.11，解压项目并在项目目录打开终端：
 
 ```bash
-cd 项目文件夹
-python3 启动服务.py
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python main.py
 ```
 
-## 功能特点
+打开 `http://127.0.0.1:3000/`，在 API 设置里填写自己的 Key。保持终端窗口打开，按 `Ctrl+C` 停止。
 
-- **自动检测依赖**：首次运行会自动检查并安装所需依赖
-- **自动打开浏览器**：服务启动后 3 秒自动打开网页
-- **显示访问地址**：同时显示本地地址和局域网地址
+也可以使用 `mac-启动服务.command`，首次运行会创建虚拟环境并安装基础依赖。如果提示权限不足，先执行：
 
-## 系统要求
-
-- macOS 10.14 或更高版本
-- Python 3.10+（如果没有安装，程序会提示下载链接）
-
-## 安装 Python
-
-如果系统没有 Python，请访问 https://www.python.org/downloads/ 下载安装。
-
-## 文件说明
-
-| 文件 | 说明 |
-|------|------|
-| `启动服务.command` | 双击运行的启动器 |
-| `启动服务.py` | 主程序，包含自动安装依赖逻辑 |
-| `main.py` | 服务主程序 |
-
-## 常见问题
-
-### 1. 提示 "无法打开，因为无法验证开发者"
-
-**解决方法**：
-- 右键点击 `启动服务.command`
-- 选择 "打开"
-- 在弹出的对话框中点击 "打开"
-
-或者到 系统设置 → 隐私与安全性 → 安全性 → 点击 "仍要打开"
-
-### 2. 提示 "Python 3 not found"
-
-请安装 Python 3.10 或更高版本：
-https://www.python.org/downloads/
-
-### 3. 依赖安装失败
-
-尝试手动安装依赖：
 ```bash
-pip3 install fastapi uvicorn httpx pillow requests pydantic python-dotenv websockets watchfiles
+chmod +x mac-启动服务.command
 ```
 
-## 手动控制
+如系统阻止下载的脚本，请先检查代码来源，再按 macOS 的“隐私与安全性”提示决定是否允许打开。不要全局关闭系统安全检查。
 
-### 安装依赖
-```bash
-./mac-安装依赖.sh
-```
+更新代码后重新执行 `.venv/bin/python -m pip install -r requirements.txt`。若 `.venv` 来自其他电脑，请保留必要的备份后重新创建本机虚拟环境，不要直接使用复制来的环境。
 
-### 启动服务
-```bash
-./mac-启动服务.sh
-```
-
-## 访问服务
-
-- 本机访问：http://127.0.0.1:3000/
-- 局域网访问：http://你的IP:3000/（启动时会显示）
-
-## 停止服务
-
-在终端窗口中按 `Ctrl+C` 即可停止服务。
+本次发布验证使用 Windows/Python 3.11，macOS 启动脚本未在实机验证。

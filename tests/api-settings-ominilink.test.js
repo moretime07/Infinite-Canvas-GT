@@ -224,15 +224,16 @@ async function createState(providerRows){
     const verificationRequest = state.calls.find(call => call.url === '/api/providers/test-connection');
     assert.equal(JSON.parse(verificationRequest.options.body).video_base_url, 'https://vg-api.aig-ai.com/v1');
     const verification = state.elements.get('verifyResult').innerHTML;
-    assert.match(verification, /官方目录兜底/);
+    assert.match(verification, /文档目录，不是拉取结果/);
+    assert.match(verification, /Key 没有被接受/);
     assert.doesNotMatch(verification, /地址验证通过|API Key 验证通过|✓/);
 
     await state.api.fetchModels();
     const fetchRequest = state.calls.find(call => call.url === '/api/providers/fetch-models');
     assert.equal(JSON.parse(fetchRequest.options.body).video_base_url, 'https://vg-api.aig-ai.com/v1');
     const fetchStatus = state.elements.get('status').textContent;
-    assert.match(fetchStatus, /官方目录兜底/);
-    assert.match(fetchStatus, /未验证当前账号权限/);
+    assert.match(fetchStatus, /没有从账号拉取.*文档目录/);
+    assert.match(fetchStatus, /Key 没有被接受/);
     assert.doesNotMatch(fetchStatus, /地址验证通过|API Key 验证通过/);
     // This fails if the picker reduces a backend-reported chat+video model to one category.
     state.api.togglePickerRow('gemini-omni-flash-preview');

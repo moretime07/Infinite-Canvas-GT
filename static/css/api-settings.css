@@ -302,6 +302,9 @@ body.show-runninghub .api-key-label,
 body.show-runninghub #keyHint { display:none !important; }
 body.show-jimeng .api-base-url-field,
 body.show-jimeng .api-key-field { display:none !important; }
+body.show-tencent-vod .api-key-field,
+body.show-tencent-vod .api-video-base-url-field,
+body.show-tencent-vod .image-request-mode-wrap { display:none !important; }
 .jimeng-cli-panel { grid-column:1/-1; display:none; flex-direction:column; gap:12px; margin-top:2px; padding:14px; border:1px solid var(--line); border-radius:14px; background:var(--soft); }
 body.show-jimeng .jimeng-cli-panel:not([hidden]) { display:flex; }
 .jimeng-cli-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
@@ -5844,3 +5847,6 @@ html.studio-theme-dark body .recommend-tag.recommend-free-tag svg {
         width:100% !important;
     }
 }
+.vod-model-status{display:inline-block;font-size:10px;color:var(--muted,#9ca3af);margin-left:8px;white-space:nowrap;vertical-align:middle}
+.vod-model-status.verified{color:#16a34a}
+.model-row.has-vod-status{grid-template-columns:minmax(0,1fr) auto 36px}

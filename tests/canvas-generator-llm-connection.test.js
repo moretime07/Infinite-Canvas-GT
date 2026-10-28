@@ -52,6 +52,8 @@ const context = {
     mediaKindForNode:node => node?.kind || (String(node?.url || '').endsWith('.mp4') ? 'video' : 'image'),
     isVideoUrl:url => String(url || '').endsWith('.mp4'),
     isAudioUrl:url => String(url || '').endsWith('.mp3'),
+    loopContext:null,
+    loopInputImageRefs:() => [],
     motionOutputVideoRefs:(node, portName) => {
         if(portName === 'depth' && node.depthUrl) return [{url:node.depthUrl, kind:'video'}];
         if(portName === 'pose' && node.poseUrl) return [{url:node.poseUrl, kind:'video'}];

@@ -93,6 +93,8 @@ vm.runInContext([
     productionFunction('omniFlashCanonicalMediaRef'),
     productionFunction('omniFlashVideoValidationError'),
     productionFunction('createCanvasVideoTask'),
+    productionFunction('isAiideVideoProvider'),
+    productionFunction('prepareAiideVideoReferences'),
     productionFunction('runVideoNode'),
     'this.controls = {isOminiLinkProvider, omniFlashSafePublicHttpsUri, omniFlashCanonicalMediaRef, omniFlashVideoValidationError, videoProviderOptions, videoModelOptions, runVideoNode};'
 ].join('\n'), sandbox);

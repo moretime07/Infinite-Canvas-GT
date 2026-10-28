@@ -20,7 +20,7 @@
     <script src="/static/js/theme.js?v=2026.06.23.1782155110"></script>
     <script src="/static/js/i18n.js?v=2026.06.23.1784521788"></script>
     <link rel="stylesheet" href="/static/css/theme.css?v=2026.06.23.1782155110">
-    <link rel="stylesheet" href="/static/css/api-settings.css?v=2026.06.23.1784510995">
+    <link rel="stylesheet" href="/static/css/api-settings.css?v=2026.06.23.1793069597">
 </head>
 <body>
     <div class="page">
@@ -87,7 +87,7 @@
                             <label class="field full api-video-base-url-field">
                                 <span class="label">视频 API 地址（可选）</span>
                                 <div class="field-frame"><input id="videoBaseInput" type="text" placeholder="https://vg-api.aig-ai.com/v1"></div>
-                                <span class="hint">OminiLink 的聊天与视频使用不同入口；留空时会按已知 API 主机自动补全。</span>
+                                <span class="hint">可填写视频专用入口或完整生成端点；Aiide Seedance 使用 /v1/video/generations。留空时按已知平台及模型自动选择，OminiLink 的聊天与视频入口不同。</span>
                             </label>
                             <label class="field full api-key-field">
                                 <span class="label api-key-label">API Key</span>
@@ -200,6 +200,20 @@
                                 <div class="runninghub-hint">
                                 </div>
                             </label>
+                            <div id="tencentVodPanel" class="field full" hidden style="display:none">
+                                <span class="label">腾讯云 VOD · 云点播签名配置</span>
+                                <span class="hint">使用 SecretId / SecretKey；模型来自接入文档，连接验证会查询当前点播应用。</span>
+                                <label class="field"><span class="label">SecretId</span><div class="field-frame"><input id="tencentSecretIdInput" type="password" autocomplete="off" placeholder="SecretId"></div></label>
+                                <label class="field"><span class="label">SecretKey</span><div class="field-frame"><input id="tencentSecretKeyInput" type="password" autocomplete="new-password" placeholder="SecretKey"></div></label>
+                                <label class="field"><span class="label">临时凭证 Token（可选）</span><div class="field-frame"><input id="tencentTokenInput" type="password" autocomplete="off"></div></label>
+                                <label class="field"><span class="label">点播应用 SubAppId</span><div class="field-frame"><input id="tencentSubAppInput" type="text" inputmode="numeric" placeholder="留空后点击验证，自动检测应用"></div></label>
+                                <label class="field"><span class="label">地域</span><div class="field-frame"><input id="tencentRegionInput" type="text" value="ap-guangzhou"></div></label>
+                                <span id="tencentVodHint" class="hint"></span>
+                                <div class="verify-action-row">
+                                    <button class="action-btn primary-btn" type="button" onclick="saveProviders()">保存腾讯云配置</button>
+                                    <button class="action-btn" type="button" onclick="clearTencentCredentials()">清除腾讯云凭证</button>
+                                </div>
+                            </div>
                             <div id="jimengCliPanel" class="jimeng-cli-panel" hidden>
                                 <div class="jimeng-cli-head">
                                     <div>
@@ -233,6 +247,8 @@
                                         <option value="volcengine">方舟/Ark 任务协议</option>
                                         <option value="runninghub">RunningHub OpenAPI</option>
                                         <option value="jimeng">即梦 CLI</option>
+                                        <option value="wand">WAND TokenHub</option>
+                                        <option value="tencent-vod">腾讯云 VOD（SecretId / SecretKey）</option>
                                     </select>
                                 </div>
                                 <div class="field-frame image-request-mode-wrap">
@@ -278,7 +294,7 @@
                     <div id="modelsHead" class="block models-toolbar">
                         <div>
                             <div class="block-title" data-i18n="api.modelsTitle">模型列表</div>
-                            <div class="block-desc" data-i18n="api.modelsDesc">从上游 API 自动拉取所有可用模型并按类型分类（image / chat / video）</div>
+                            <div id="modelSourceDescription" class="block-desc">从上游 API 拉取模型，或载入该协议支持的文档目录。</div>
                         </div>
                         <div class="models-toolbar-actions">
                             <button id="fetchModelsBtn" class="action-btn primary-btn" type="button" onclick="fetchModels()">
@@ -374,7 +390,7 @@
         <div class="picker-modal">
             <div class="picker-head">
                 <div>
-                    <div class="picker-title">从上游拉取的模型清单</div>
+                    <div id="modelPickerTitle" class="picker-title">从上游拉取的模型清单</div>
                     <div id="pickerCount" class="picker-count">—</div>
                 </div>
                 <div class="picker-close" onclick="closeModelPicker()"><i data-lucide="x" class="w-4 h-4"></i></div>
@@ -476,6 +492,6 @@
         </div>
     </div>
 
-    <script src="/static/js/api-settings.js?v=2026.06.23.1785166327"></script>
+    <script src="/static/js/api-settings.js?v=2026.06.23.1793069597"></script>
 </body>
 </html>

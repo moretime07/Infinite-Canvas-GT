@@ -715,6 +715,7 @@ function syncEditor(){
     if(videoBaseInput && !enteredVideoBaseUrl && item.video_base_url) videoBaseInput.value = item.video_base_url;
     // 固定平台不从协议下拉读取
     item.protocol = selectedProtocol;
+    if(selectedProtocol === 'tencent-vod') Object.assign(item, tencentVodForm(item));
     item.image_request_mode = normalizeImageRequestMode(
         item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || item.id === 'jimeng'
             ? 'openai'
@@ -750,7 +751,11 @@ function updateProtocolFromInput(){
     const item = provider();
     if(!item || !protocolInput || item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || item.id === 'jimeng') return;
     const value = String(protocolInput.value || 'openai').toLowerCase();
-    item.protocol = ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng'].includes(value) ? value : 'openai';
+    item.protocol = ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng', 'wand', 'tencent-vod'].includes(value) ? value : 'openai';
+    if(item.protocol === 'tencent-vod'){
+        if(!/^https:\/\/vod\.(intl\.)?tencentcloudapi\.com\/?$/.test(item.base_url || '')) item.base_url = 'https://vod.tencentcloudapi.com';
+        item.video_base_url = '';
+    }
     if(item.protocol === 'jimeng') item.base_url = '';
     document.body.classList.toggle('show-jimeng', item.protocol === 'jimeng');
     clearVerifyResult();
@@ -2389,6 +2394,7 @@ function renderEditor(){
     const isVolcengine = !isOminiLink && (item.id === 'volcengine' || String(protocolInput?.value || item.protocol || '').toLowerCase() === 'volcengine');
     const isStandaloneVolcengine = item.id === 'volcengine' && !isOminiLink;
     const isJimeng = item.id === 'jimeng' || String(protocolInput?.value || item.protocol || '').toLowerCase() === 'jimeng';
+    renderTencentVodPanel(item);
     if(isRunningHub){
         ensureRunningHubLists(item);
         if(rhFreeKeyInput){
@@ -2657,7 +2663,8 @@ function effectiveProviderProtocol(item, baseUrl=item?.base_url, requestedProtoc
     if(item?.id === 'volcengine') return 'volcengine';
     if(item?.id === 'jimeng') return 'jimeng';
     const normalized = String(requestedProtocol || '').trim().toLowerCase();
-    return ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng'].includes(normalized) ? normalized : 'openai';
+    if(/^https:\/\/vod\.(intl\.)?tencentcloudapi\.com\/?$/.test(baseUrl || '')) return 'tencent-vod';
+    return ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng', 'wand', 'tencent-vod'].includes(normalized) ? normalized : 'openai';
 }
 function defaultOminiLinkVideoBaseUrl(value){
     if(!isOminiLinkApiUrl(value)) return '';
@@ -2680,7 +2687,7 @@ function applyDetectedImageRequestMode(mode){
 function applyDetectedProtocol(protocol){
     const item = provider();
     const detected = String(protocol || '').toLowerCase();
-    if(!item || !protocolInput || !['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng'].includes(detected)) return false;
+    if(!item || !protocolInput || !['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng', 'wand', 'tencent-vod'].includes(detected)) return false;
     if(String(protocolInput.value || '').toLowerCase() === detected && String(item.protocol || '').toLowerCase() === detected) return false;
     protocolInput.value = detected;
     item.protocol = detected;
@@ -2726,6 +2733,7 @@ function runninghubModelSourceNote(data){
 async function probeAsync(){
     const item = provider();
     if(!item) return;
+    if(effectiveProviderProtocol(item, baseInput.value, protocolInput?.value) === 'tencent-vod') return probeTencentVod(false);
     const btn = document.getElementById('probeAsyncBtn');
     const baseUrl = baseInput.value.trim();
     const videoBaseUrl = videoBaseInput?.value.trim() || defaultOminiLinkVideoBaseUrl(baseUrl);
@@ -2781,8 +2789,11 @@ async function probeAsync(){
         const detectedProtocol = String(data.protocol || '').toLowerCase();
         const isAsync = data.ok === true && detectedProtocol === 'apimart';
         const isOpenAiCompat = data.ok === true && detectedProtocol === 'openai';
-        const keepManualProtocol = ['gemini', 'volcengine', 'jimeng'].includes(currentProtocol);
-        if(protocolInput && !keepManualProtocol){
+        const isWand = detectedProtocol === 'wand' || currentProtocol === 'wand';
+        const keepManualProtocol = ['gemini', 'volcengine', 'jimeng', 'wand'].includes(currentProtocol);
+        if(protocolInput && detectedProtocol === 'wand'){
+            applyDetectedProtocol('wand');
+        } else if(protocolInput && !keepManualProtocol){
             applyDetectedProtocol(detectedProtocol || (isAsync ? 'apimart' : 'openai'));
         }
         if(data.image_request_mode) applyDetectedImageRequestMode(data.image_request_mode);
@@ -2791,14 +2802,16 @@ async function probeAsync(){
         const hideTasksEndpointTip = probeMessage.includes('/v1/tasks/');
         const color = (isAsync || isOpenAiCompat || data.ok === true) ? '#15803d' : data.ok === null ? '#b45309' : '#64748b';
         const icon = (isAsync || isOpenAiCompat || data.ok === true) ? '✓' : '⚠';
-        const proto = detectedProtocol === 'volcengine'
+        const proto = detectedProtocol === 'wand' || (isWand && !detectedProtocol)
+            ? 'WAND TokenHub'
+            : detectedProtocol === 'volcengine'
             ? '方舟/Ark 任务协议'
             : isAsync
                 ? 'APIMart 异步'
                 : detectedProtocol === 'openai'
                     ? 'OpenAI 兼容'
                     : keepManualProtocol
-                    ? (currentProtocol === 'gemini' ? 'Gemini' : currentProtocol.toUpperCase())
+                    ? (currentProtocol === 'gemini' ? 'Gemini' : currentProtocol === 'wand' ? 'WAND TokenHub' : currentProtocol.toUpperCase())
                     : 'OpenAI 兼容';
         showVerifyResult(`
             ${hideTasksEndpointTip ? '' : `<div style="font-size:11px;font-weight:800;color:${color}">${icon} ${escapeHtml(probeMessage)}</div>`}
@@ -2808,7 +2821,7 @@ async function probeAsync(){
                 <pre style="margin-top:6px;padding:10px 12px;border-radius:10px;background:var(--soft);border:1px solid var(--line-2);font-size:10.5px;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-all;color:var(--text);max-height:200px;overflow:auto">${escapeHtml(rawJson)}</pre>
             </details>`);
     } catch(e){
-        const keepManualProtocol = ['gemini', 'volcengine', 'jimeng'].includes(String(protocolInput?.value || item.protocol || '').toLowerCase());
+        const keepManualProtocol = ['gemini', 'volcengine', 'jimeng', 'wand'].includes(String(protocolInput?.value || item.protocol || '').toLowerCase());
         if(protocolInput && !keepManualProtocol){ protocolInput.value = 'openai'; protocolInput.dispatchEvent(new Event('change')); }
         const suffix = keepManualProtocol ? '，已保留当前手动选择的协议' : '，协议已设为 OpenAI 兼容';
         showVerifyResult(`<div style="font-size:11px;font-weight:800;color:#b45309">⚠ ${escapeHtml(e.message || String(e))}${suffix}</div>`);
@@ -2820,6 +2833,7 @@ async function probeAsync(){
 async function testConnection(){
     const item = provider();
     if(!item) return;
+    if(effectiveProviderProtocol(item, baseInput.value, protocolInput?.value) === 'tencent-vod') return probeTencentVod(false);
     const btn = document.getElementById('testUrlBtn');
     const baseUrl = baseInput.value.trim();
     const videoBaseUrl = videoBaseInput?.value.trim() || defaultOminiLinkVideoBaseUrl(baseUrl);
@@ -2875,10 +2889,17 @@ async function testConnection(){
                 : data.connection_verified === false
                     ? ' · 未验证当前账号权限'
                     : '';
+            const keyNote = data.connection_verified === false && data.message
+                ? `<div style="margin-top:4px;color:#92400e;font-size:11px;font-weight:700">${escapeHtml(String(data.message).slice(0, 240))}</div>`
+                : '';
             if(data.catalog_fallback){
-                showVerifyResult(`<span style="color:#92400e;font-size:11px;font-weight:800">已加载官方目录兜底（未验证当前账号权限） · 找到 ${data.model_count || data.total || 0} 个模型</span>`);
+                const count = data.model_count || data.total || 0;
+                const keyLine = data.connection_verified
+                    ? 'Key 已被国际站接受。'
+                    : 'Key 没有被接受，下面的数量不是账号返回的。';
+                showVerifyResult(`<span style="color:#92400e;font-size:11px;font-weight:800">地址能连上。${keyLine} 这 ${count} 个模型是文档目录，不是拉取结果。</span>${keyNote}`);
             } else {
-                showVerifyResult(`<span style="color:#15803d;font-size:11px;font-weight:800">✓ 地址验证通过 · 找到 ${data.model_count} 个模型${runninghubNote}${sourceNote}</span>${volcengineNote}${jimengNote}`);
+                showVerifyResult(`<span style="color:#15803d;font-size:11px;font-weight:800">✓ 地址验证通过 · 找到 ${data.model_count} 个模型${runninghubNote}${sourceNote}</span>${keyNote}${volcengineNote}${jimengNote}`);
             }
         } else {
             showVerifyResult(`
@@ -2897,6 +2918,7 @@ let lastFetchedSuggestion = null; // 后端自动分类建议
 async function fetchModels(){
     const item = provider();
     if(!item) return;
+    if(effectiveProviderProtocol(item, baseInput.value, protocolInput?.value) === 'tencent-vod') return probeTencentVod(true);
     syncEditor();
     const btn = document.getElementById('fetchModelsBtn');
     const baseUrl = baseInput.value.trim();
@@ -2942,11 +2964,16 @@ async function fetchModels(){
             : (detectedProtocol === 'volcengine' || isVolcengineProvider(item)) ? ' · 已识别方舟协议，火山聊天建议改填 ep-... 接入点' : '';
         const imageModeExtra = normalizeImageRequestMode(imageRequestModeInput?.value || item.image_request_mode) === 'openai-json' ? ' · 图片接口已设为 OpenAI JSON' : '';
         const sourceNote = data.catalog_fallback
-            ? ' · 官方目录兜底（未验证当前账号权限）'
+            ? ''
             : data.connection_verified === false
                 ? ' · 未验证当前账号权限'
                 : '';
-        setStatus(`已拉取 ${data.total} 个模型 · 点「选择模型」勾选要导入的${extra}${imageModeExtra}${sourceNote}`);
+        if(data.catalog_fallback){
+            const keyLine = data.connection_verified ? 'Key 已被国际站接受。' : 'Key 没有被接受。';
+            setStatus(`没有从账号拉取。已载入文档目录 ${data.total} 个，可以勾选。${keyLine}`);
+        } else {
+            setStatus(`已拉取 ${data.total} 个模型 · 点「选择模型」勾选要导入的${extra}${imageModeExtra}${sourceNote}`);
+        }
         openModelPicker();
     } catch(e){
         alert('拉取失败：' + (e.message || e));
@@ -2963,6 +2990,8 @@ let pickerVisibleIds = [];
 function openModelPicker(){
     const item = provider();
     if(!item || !lastFetchedAll.length){ alert('没有拉取到模型'); return; }
+    const title = document.getElementById('modelPickerTitle');
+    if(title) title.textContent = effectiveProviderProtocol(item) === 'tencent-vod' ? '腾讯云 VOD 官方文档目录（非账号授权清单）' : '从上游拉取的模型清单';
     const existing = { image: new Set(item.image_models||[]), chat: new Set(item.chat_models||[]), video: new Set(item.video_models||[]) };
     const allIds = new Set([...lastFetchedAll, ...(item.image_models||[]), ...(item.chat_models||[]), ...(item.video_models||[])]);
     pickerState = { category: {}, capabilities: {}, selected: {} };
@@ -3023,7 +3052,7 @@ function renderModelPicker(){
                 <div class="picker-checkbox ${checked?'checked':''}">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
                 </div>
-                <div class="picker-model-name" title="${escapeAttr(id)}">${escapeHtml(id)}</div>
+                <div class="picker-model-name" title="${escapeAttr(id)}">${escapeHtml(id)}${vodModelStatusHtml(provider(), id)}</div>
             </div>
         `;
     }).join('');
@@ -3089,7 +3118,7 @@ async function clearKeyOnly(){
 }
 const FIXED_PROTOCOL_PROVIDER_IDS = new Set(['modelscope', 'volcengine', 'jimeng', 'runninghub']);
 function providerSupportsModelProtocol(item){
-    return Boolean(item) && !FIXED_PROTOCOL_PROVIDER_IDS.has(item.id);
+    return Boolean(item) && !FIXED_PROTOCOL_PROVIDER_IDS.has(item.id) && effectiveProviderProtocol(item) !== 'tencent-vod';
 }
 function modelProtocolSelectHtml(kind, index, model, item){
     if(kind === 'video' || !providerSupportsModelProtocol(item)) return '';
@@ -3113,8 +3142,9 @@ function renderModels(kind){
     }
     const showProtocol = kind !== 'video' && providerSupportsModelProtocol(item);
     list.innerHTML = models.map((model, index) => `
-        <div class="model-row${showProtocol ? ' has-protocol' : ''}">
+        <div class="model-row${showProtocol ? ' has-protocol' : ''}${effectiveProviderProtocol(item) === 'tencent-vod' ? ' has-vod-status' : ''}">
             <input value="${escapeAttr(model)}" oninput="updateModel('${kind}', ${index}, this.value)">
+            ${vodModelStatusHtml(item, model)}
             ${modelProtocolSelectHtml(kind, index, model, item)}
             <button class="icon-btn" type="button" onclick="removeModel('${kind}', ${index})" title="删除"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
         </div>
@@ -3373,7 +3403,7 @@ async function loadProviders(){
     }
 }
 async function saveProviders(){
-    syncEditor();
+    try { syncEditor(); } catch(error) { setStatus(error.message || '请检查配置'); return false; }
     providers.forEach(item => {
         item.id = normalizeId(item.id);
         item.protocol = effectiveProviderProtocol(item);
@@ -3438,6 +3468,12 @@ async function saveProviders(){
                 volcengine_region:item.id === 'volcengine' ? (item.volcengine_region || VOLCENGINE_DEFAULT_REGION) : '',
                 volcengine_access_key_id:item.volcengine_access_key_id || undefined,
                 volcengine_secret_access_key:item.volcengine_secret_access_key || undefined,
+                tencent_sub_app_id:item.tencent_sub_app_id || 0,
+                tencent_region:item.tencent_region || 'ap-guangzhou',
+                tencent_secret_id:item.tencent_secret_id || undefined,
+                tencent_secret_key:item.tencent_secret_key || undefined,
+                tencent_token:item.tencent_token,
+                clear_tencent_credentials:item._clearTencentCredentials === true,
                 api_key:item.api_key || undefined,
                 wallet_api_key:item.wallet_api_key || undefined,
                 clear_key:item._clearKey === true,
@@ -3454,6 +3490,10 @@ async function saveProviders(){
             delete item.wallet_api_key;
             delete item.volcengine_access_key_id;
             delete item.volcengine_secret_access_key;
+            delete item.tencent_secret_id;
+            delete item.tencent_secret_key;
+            delete item.tencent_token;
+            delete item._clearTencentCredentials;
             delete item._clearKey;
             delete item._clearWalletKey;
             delete item._clearVolcengineAccessKey;
@@ -3474,6 +3514,93 @@ function escapeHtml(str){
     return String(str || '').replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
 }
 function escapeAttr(str){ return escapeHtml(str).replace(/`/g, '&#96;'); }
+
+function tencentVodForm(item){
+    const read = id => document.getElementById(id)?.value.trim() || '';
+    const subApp = read('tencentSubAppInput');
+    if(subApp && (!/^\d+$/.test(subApp) || !Number.isSafeInteger(Number(subApp)))) throw new Error('SubAppId 必须是有效的数字应用 ID');
+    return {
+        tencent_sub_app_id:Number(subApp || 0),
+        tencent_region:read('tencentRegionInput') || 'ap-guangzhou',
+        tencent_secret_id:read('tencentSecretIdInput') || item.tencent_secret_id || undefined,
+        tencent_secret_key:read('tencentSecretKeyInput') || item.tencent_secret_key || undefined,
+        tencent_token:read('tencentTokenInput') || item.tencent_token || undefined
+    };
+}
+function renderTencentVodPanel(item){
+    const active = effectiveProviderProtocol(item) === 'tencent-vod';
+    const panel = document.getElementById('tencentVodPanel');
+    if(panel){ panel.hidden = !active; panel.style.display = active ? 'grid' : 'none'; }
+    document.body.classList.toggle('show-tencent-vod', active);
+    const description = document.getElementById('modelSourceDescription');
+    if(description) description.textContent = active
+        ? '验证腾讯云签名和应用后载入官方生图、视频目录。目录不代表账号授权，实际生成成功后才标记为已验证。'
+        : '从上游 API 拉取模型，或载入该协议支持的文档目录。';
+    if(!active) return;
+    for(const [id, field] of [['tencentSecretIdInput','secret_id'],['tencentSecretKeyInput','secret_key'],['tencentTokenInput','token']]){
+        const input = document.getElementById(id);
+        if(input){ input.value = item[`tencent_${field}`] || ''; input.placeholder = item[`has_tencent_${field}`] ? '已保存，留空保持当前凭证' : field === 'token' ? '长期密钥无需填写' : field === 'secret_id' ? 'SecretId' : 'SecretKey'; }
+    }
+    const appInput = document.getElementById('tencentSubAppInput');
+    if(appInput) appInput.value = item.tencent_sub_app_id || '';
+    const region = document.getElementById('tencentRegionInput');
+    if(region) region.value = item.tencent_region || 'ap-guangzhou';
+    const hint = document.getElementById('tencentVodHint');
+    if(hint) hint.textContent = item.has_key ? '腾讯云凭证已保存到本机私密配置。' : '保存 SecretId / SecretKey 后可检测应用和载入模型。';
+}
+async function clearTencentCredentials(){
+    const item = provider();
+    if(!item) return;
+    for(const field of ['secret_id','secret_key','token']) delete item[`tencent_${field}`];
+    for(const id of ['tencentSecretIdInput','tencentSecretKeyInput','tencentTokenInput']){
+        const input = document.getElementById(id); if(input) input.value = '';
+    }
+    item._clearTencentCredentials = true;
+    await saveProviders();
+}
+async function probeTencentVod(pickModels){
+    const item = provider();
+    if(!item) return;
+    const buttons = ['fetchModelsBtn','testUrlBtn','probeAsyncBtn'].map(id => document.getElementById(id)).filter(Boolean);
+    buttons.forEach(button => button.disabled = true);
+    showVerifyResult('<span>正在验证腾讯云签名和点播应用…</span>');
+    try {
+        syncEditor();
+        const response = await fetch('/api/providers/fetch-models', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({provider_id:item.id, base_url:item.base_url, protocol:'tencent-vod', ...tencentVodForm(item)})
+        });
+        const data = await response.json();
+        if(!response.ok) throw new Error(data.detail || '腾讯云连接失败');
+        if(data.tencent_sub_app_id){
+            item.tencent_sub_app_id = data.tencent_sub_app_id;
+            const input = document.getElementById('tencentSubAppInput');
+            if(input) input.value = data.tencent_sub_app_id;
+        }
+        if(!data.ok){
+            const apps = (data.apps || []).map(app => `${app.name}（${app.id}）`).join('、');
+            throw new Error(`${data.message || '请选择点播应用'}${apps ? ' 可用应用：' + apps : ''}`);
+        }
+        lastFetchedAll = data.all || [];
+        lastFetchedSuggestion = {image:new Set(data.image_models || []), chat:new Set(data.chat_models || []), video:new Set(data.video_models || [])};
+        item.model_metadata = data.model_metadata || {};
+        const openBtn = document.getElementById('openPickerBtn');
+        if(openBtn){ openBtn.disabled = false; openBtn.style.opacity = '1'; }
+        showVerifyResult(`<span style="color:#15803d">✓ ${escapeHtml(data.message)}</span>`);
+        setStatus(`腾讯云连接已验证 · 文档目录：${data.image_models?.length || 0} 个生图 / ${data.video_models?.length || 0} 个视频模型`);
+        if(pickModels) openModelPicker();
+    } catch(error){
+        showVerifyResult(`<span style="color:#b45309">${escapeHtml(error.message || String(error))}</span>`);
+        setStatus('腾讯云验证未通过');
+    } finally { buttons.forEach(button => button.disabled = false); }
+}
+function vodModelStatusHtml(item, model){
+    if(effectiveProviderProtocol(item) !== 'tencent-vod') return '';
+    const metadata = item?.model_metadata?.[model];
+    const verified = metadata?.verification === 'verified';
+    const label = !metadata ? '未适配' : verified ? '生成已验证' : '权限未验证';
+    return `<small class="vod-model-status ${verified ? 'verified' : ''}" title="${verified ? '此凭证和应用曾成功生成；不保证之后的余额或权限' : '来自官方文档，不代表账号已开通；选择不会自动发起付费测试'}">${label}</small>`;
+}
 window.addEventListener('message', event => {
     if(event.data?.type === 'studio-theme' && window.StudioTheme) window.StudioTheme.set(event.data.theme);
     if(event.data?.type === 'studio-lang' && window.StudioI18n) {

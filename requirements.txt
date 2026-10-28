@@ -4,3 +4,4 @@ requests
 httpx
 pillow
 python-multipart
+numpy>=1.26,<3

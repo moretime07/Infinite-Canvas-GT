@@ -3,14 +3,23 @@ cd /d "%~dp0"
 
 set "PYEXE=%~dp0.venv\Scripts\python.exe"
 if not exist "%PYEXE%" set "PYEXE=%~dp0python\python.exe"
-if not exist "%PYEXE%" set "PYEXE=python"
+if not exist "%PYEXE%" (
+    echo First run: installing the project environment...
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\install_windows.ps1"
+    if errorlevel 1 (
+        echo Installation failed. See README.md for setup instructions.
+        pause
+        exit /b 1
+    )
+    set "PYEXE=%~dp0.venv\Scripts\python.exe"
+)
 
 set "LAN_IP=127.0.0.1"
 for /f "usebackq delims=" %%I in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$ip=(Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -and $_.IPv4Address } | Select-Object -First 1 -ExpandProperty IPv4Address).IPAddress; if(-not $ip){$ip=(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | Sort-Object InterfaceMetric | Select-Object -First 1 -ExpandProperty IPAddress)}; if($ip){$ip}else{'127.0.0.1'}"`) do set "LAN_IP=%%I"
 set "LOCAL_URL=http://127.0.0.1:3000/"
 set "APP_URL=http://%LAN_IP%:3000/"
 
-echo Starting ComfyUI-API-Modelscope...
+echo Starting Infinite-Canvas-GT...
 echo Local: %LOCAL_URL%
 echo LAN:   %APP_URL%
 echo Press Ctrl+C to stop.

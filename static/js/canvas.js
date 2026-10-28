@@ -824,6 +824,35 @@ function videoModelOptions(selectedModel, providerId){
     const selected = selectedModel || models[0];
     return uniqueModels([selected, ...models]).filter(Boolean).map(model => `<option value="${escapeHtml(model)}" ${model === selected ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
 }
+function tencentVodVideoSpec(node){
+    const provider = apiProviders.find(item => item.id === node.apiProvider);
+    return provider?.protocol === 'tencent-vod' ? provider.model_metadata?.[node.model] : null;
+}
+function tencentVodVideoControls(wrap, node){
+    const spec = tencentVodVideoSpec(node);
+    if(!spec) return;
+    const populate = (selector, values, current, auto = false) => {
+        const select = wrap.querySelector(selector);
+        if(!select || !values?.length) return;
+        const entries = auto ? ['', ...values] : [...values];
+        // Preserve old/user values visibly rather than silently changing a saved workflow.
+        if(current && !entries.some(value => value.toLowerCase() === String(current).toLowerCase())) entries.push(String(current));
+        select.innerHTML = entries.map(value => `<option value="${escapeHtml(value)}">${escapeHtml(value || 'Auto')}</option>`).join('');
+        select.value = entries.find(value => value.toLowerCase() === String(current || '').toLowerCase()) || '';
+    };
+    populate('.video-resolution', spec.resolutions, node.resolution, true);
+    populate('.video-aspect', spec.aspect_ratios, node.aspectRatio || '16:9');
+    const duration = wrap.querySelector('.video-duration');
+    if(duration && spec.durations?.length){
+        duration.min = Math.min(...spec.durations);
+        duration.max = Math.max(...spec.durations);
+        duration.title = `可用时长：${spec.durations.join('、')} 秒`;
+    }
+    const hint = document.createElement('div');
+    hint.className = 'text-[10px] text-gray-400';
+    hint.textContent = `${spec.verification === 'verified' ? '此应用生成已验证' : '官方目录 · 账号权限未验证'}${spec.durations?.length ? ' · 时长 ' + spec.durations.join('/') + ' 秒' : ''} · 参考能力依具体模型版本而定`;
+    wrap.querySelector('.gen-settings')?.appendChild(hint);
+}
 function allImageModels(providerId){
     const providerModels = providerImageModels(providerId || managedProviderId);
     return uniqueModels(providerModels);
@@ -4377,7 +4406,7 @@ function isRemoteVideoReferenceUrl(url){
     return /^https?:\/\//i.test(String(url || '')) || /^asset:\/\//i.test(String(url || ''));
 }
 function tempShUploadedUrlForNode(node, url){
-    const match = (node?.tempShLinks || []).find(item => item?.source === url && item?.url);
+    const match = (node?.tempShLinks || []).find(item => item?.source === url && item?.url && (!item.expiresAt || item.expiresAt > Date.now()));
     return match?.url || url;
 }
 function applyUploadedUrlToRefs(refs, node){
@@ -4436,14 +4465,20 @@ function applyTempShUrlToCanvasRef(ref, uploadedUrl){
     }
     return false;
 }
-async function uploadCanvasMediaRefToCloud(node, ref){
+function cloudMediaLinkExpiresAt(expires){
+    const match = String(expires || '').trim().match(/^(\d+(?:\.\d+)?)\s*(h|hours?|d|days?)$/i);
+    if(!match) return Date.now(); // Unknown lifetime: do not reuse on a later run.
+    const hours = Number(match[1]) * (/^d/i.test(match[2]) ? 24 : 1);
+    return Date.now() + Math.max(0, hours * 3600000 - 60000);
+}
+async function uploadCanvasMediaRefToCloud(node, ref, options={}){
     const kind = mediaKindForRef(ref);
     if(!ref?.url) throw new Error('没有可上传的媒体');
     if(/^https?:\/\//i.test(ref.url)) return ref.url;
     const response = await fetch('/api/cloud-video/upload', {
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({url:ref.url, service:'auto'})
+        body:JSON.stringify({url:ref.url, service:options.service || 'auto'})
     });
     if(!response.ok) throw new Error(await responseErrorMessage(response, '云端上传失败'));
     const data = await response.json();
@@ -4451,10 +4486,54 @@ async function uploadCanvasMediaRefToCloud(node, ref){
     if(!uploadedUrl) throw new Error('云端没有返回链接');
     node.tempShLinks = [
         ...(node.tempShLinks || []).filter(item => item?.source !== ref.url),
-        {source:ref.url, url:uploadedUrl, expires:data.expires || '3 days', kind}
+        {source:ref.url, url:uploadedUrl, expires:data.expires || '', expiresAt:cloudMediaLinkExpiresAt(data.expires), kind}
     ];
-    applyTempShUrlToCanvasRef(ref, uploadedUrl);
+    if(!options.preserveSource) applyTempShUrlToCanvasRef(ref, uploadedUrl);
     return uploadedUrl;
+}
+function isAiideVideoProvider(provider){
+    try { return ['aiide.com', 'www.aiide.com'].includes(new URL(provider?.base_url || '').hostname); }
+    catch { return false; }
+}
+async function prepareAiideVideoReferences(node, payload, provider, options={}){
+    if(!isAiideVideoProvider(provider)) return;
+    const check = async () => {
+        const response = await cascadeFetch('/api/aiide/video-references/prepare', {
+            method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)
+        }, options);
+        if(!response.ok) throw new Error(await responseErrorMessage(response, 'Aiide 素材检查失败'));
+        return response.json();
+    };
+    let plan = await check();
+    const pending = plan.upload_required || [];
+    if(pending.length){
+        const consent = confirm(`Aiide 需要公网素材链接。当前有 ${pending.length} 个本地素材需要上传。\n\n确认后将把这些图片、视频或音频上传到 Litterbox 第三方临时存储，获得公开直链（知道链接的人可访问，默认约 72 小时）。不会上传 API 密钥，也不会更换原始素材。\n\n公司机密或不宜公开的素材请取消，改用自己的公网存储或 Aiide 的 asset:// 素材。是否继续上传并生成？`);
+        if(!consent) throw new Error('已取消上传，未提交 Aiide 视频生成。可改用自己的公网素材链接或 asset:// 素材。');
+        const replacements = new Map();
+        node.tempShUploading = true;
+        try {
+            refreshNodes([node.id]);
+            for(const ref of pending){
+                // Consent names one service. Do not fall back to an undisclosed host.
+                const url = await uploadCanvasMediaRefToCloud(node, ref, {service:'litterbox', preserveSource:true});
+                replacements.set(ref.url, url);
+                scheduleSave();
+            }
+        } finally {
+            node.tempShUploading = false;
+            refreshNodes([node.id]);
+        }
+        const replace = url => replacements.get(url) || url;
+        payload.images = (plan.images || []).map(ref => ({...ref, url:replace(ref.url)}));
+        payload.videos = (plan.videos || []).map(replace);
+        payload.audios = (plan.audios || []).map(replace);
+        // Reject malformed/private upload results before creating a paid video task.
+        plan = await check();
+        if(plan.upload_required?.length) throw new Error('素材上传后仍缺少公网链接，未提交视频生成。');
+    }
+    payload.images = plan.images || [];
+    payload.videos = plan.videos || [];
+    payload.audios = plan.audios || [];
 }
 async function uploadCanvasVideosToCloud(nodeId){
     const node = nodes.find(n => n.id === nodeId);
@@ -8795,6 +8874,7 @@ function llmInputText(node){
 }
 function llmInputImages(node){
     const urls = [];
+    const activeLoopContext = node?._activeLoopCtx || loopContext || null;
     connections.filter(c => c.to === node.id).forEach(connection => {
         const n = nodes.find(candidate => candidate.id === connection.from);
         if(!n) return;
@@ -8805,6 +8885,11 @@ function llmInputImages(node){
             return;
         }
         if(n.type === 'image' && n.url && mediaKindForNode(n) === 'image') urls.push(n.url);
+        if(n.type === 'loop'){
+            loopInputImageRefs(n, activeLoopContext).forEach(ref => {
+                if(ref?.url) urls.push(ref.url);
+            });
+        }
         if(n.type === 'output' && (n.images||[]).length){
             const last = [...n.images].reverse().map(outputUrlValue).find(url => url && !isVideoUrl(url) && !isAudioUrl(url));
             if(last) urls.push(last);
@@ -9308,7 +9393,7 @@ function renderVideoBody(node){
                 <div class="text-[10px] font-bold text-gray-400 uppercase tracking-widest">视频参考</div>
                 <div class="video-input-actions">
                     <button type="button" class="tool-btn" data-video-manual-url title="手动输入视频 URL"><i data-lucide="link" class="w-4 h-4"></i><span>输入网址</span></button>
-                    <button type="button" class="tool-btn" data-video-temp-sh ${node.tempShUploading ? 'disabled' : ''} title="上传当前输入视频到云端直链"><i data-lucide="upload-cloud" class="w-4 h-4"></i><span>${node.tempShUploading ? '上传中...' : '上传云端'}</span></button>
+                    <button type="button" class="tool-btn" data-video-temp-sh ${node.tempShUploading ? 'disabled' : ''} title="上传当前输入的图片或视频到云端直链"><i data-lucide="upload-cloud" class="w-4 h-4"></i><span>${node.tempShUploading ? '上传中...' : '上传云端'}</span></button>
                 </div>
             </div>
             <div class="input-list video-img-list video-reference-list"></div>
@@ -9381,6 +9466,7 @@ function renderVideoBody(node){
     durationSelect.value = String(node.duration || 5);
     aspectSelect.value = node.aspectRatio || '16:9';
     resolutionSelect.value = node.resolution || '';
+    tencentVodVideoControls(wrap, node);
     [providerSelect, modelSelect, durationSelect, aspectSelect, resolutionSelect].forEach(input => {
         input.onmousedown = e => e.stopPropagation();
         input.onclick = e => e.stopPropagation();
@@ -9391,7 +9477,7 @@ function renderVideoBody(node){
         scheduleSave();
         render();
     };
-    modelSelect.onchange = e => { e.stopPropagation(); node.model = e.target.value; scheduleSave(); };
+    modelSelect.onchange = e => { e.stopPropagation(); node.model = e.target.value; scheduleSave(); if(tencentVodVideoSpec(node)) render(); };
     durationSelect.oninput = e => { e.stopPropagation(); node.duration = Math.max(1, Math.min(60, Number(e.target.value || 5))); scheduleSave(); };
     durationSelect.onblur = e => { e.target.value = String(Math.max(1, Math.min(60, Number(node.duration || 5)))); };
     aspectSelect.onchange = e => { e.stopPropagation(); node.aspectRatio = e.target.value; scheduleSave(); };
@@ -11332,6 +11418,7 @@ async function runVideoNode(nodeId, opts={}){
     if(!opts.cascade){ node.running = true; refreshRunNodes(node, out); }
     else refreshRunNodes(node, out);
     try {
+        await prepareAiideVideoReferences(node, requestPayload, resolvedProvider, {cascadeTargetId});
         const task = await createCanvasVideoTask(requestPayload, {cascadeTargetId});
         pending.canvasTaskId = task.task_id;
         pending.canvasTaskType = 'video';

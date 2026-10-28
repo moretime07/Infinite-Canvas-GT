@@ -2,6 +2,7 @@
 .env
 .env.*
 API/.env
+API/
 *.key
 *.pem
 *.p12
@@ -12,13 +13,13 @@ data/
 data/motion_models/
 data/motion_tasks/
 history.json
+global_config.json
 _self_restart.log
+_self_restart.bat
 *.log
 
 # Generated and uploaded media
-assets/input/
-assets/output/
-assets/output/motion/
+assets/
 output/
 
 # Bundled/local Python runtime and caches
@@ -44,3 +45,13 @@ desktop.ini
 .vscode/
 .worktrees/
 .superpowers/
+.codex/
+*.lnk
+*.bak
+*.zip
+*.7z
+*.rar
+*.sqlite
+*.sqlite3
+final-fix-*.md
+final-fix-*/

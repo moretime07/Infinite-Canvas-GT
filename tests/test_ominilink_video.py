@@ -1162,7 +1162,7 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-trace", raised.exception.detail)
         self.assertEqual(len(client.calls), 1)
 
-    async def test_non_omni_model_uses_basic_body_and_post_query(self):
+    async def test_seedance_text_uses_bytedance_task_api(self):
         submitted = FakeResponse(
             200, {"id": "job-2", "status": "queued"}, '{"id":"job-2"}',
         )
@@ -1170,12 +1170,12 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
             200,
             {
                 "id": "job-2",
-                "status": "completed",
-                "output_url": "https://cdn.example.test/basic.mp4",
+                "status": "succeeded",
+                "content": {"video_url": "https://cdn.example.test/basic.mp4"},
             },
-            '{"status":"completed"}',
+            '{"status":"succeeded"}',
         )
-        client = RecordingClient([submitted, completed])
+        client = RecordingClient([submitted], [completed])
         save = AsyncMock(return_value="/assets/output/basic.mp4")
 
         with patch.object(main.asyncio, "sleep", new=AsyncMock()), \
@@ -1190,7 +1190,7 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client.calls[0], (
             "POST",
-            "https://vg-api.aig-ai.com/v1/seedance-2.0",
+            "https://vg-api.aig-ai.com/v3/bytedance/api/v3/contents/generations/tasks",
             {
                 "headers": {
                     "Accept": "application/json",
@@ -1198,24 +1198,20 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
                     "Content-Type": "application/json",
                 },
                 "json": {
-                    "prompt": "go",
-                    "size": "1280x720",
-                    "seconds": "6",
+                    "model": "seedance-2.0",
+                    "content": [{"type": "text", "text": "go"}],
+                    "duration": 6,
+                    "ratio": "16:9",
+                    "generate_audio": False,
+                    "watermark": False,
                 },
             },
         ))
-        self.assertEqual(client.calls[1], (
-            "POST",
-            "https://vg-api.aig-ai.com/v1/query/seedance-2.0/job-2",
-            {
-                "headers": {
-                    "Accept": "application/json",
-                    "Authorization": "Bearer test-key",
-                    "Content-Type": "application/json",
-                },
-                "json": {},
-            },
-        ))
+        self.assertEqual(client.calls[1][0], "GET")
+        self.assertEqual(
+            client.calls[1][1],
+            "https://vg-api.aig-ai.com/v3/bytedance/api/v3/contents/generations/tasks/job-2",
+        )
         save.assert_awaited_once_with("https://cdn.example.test/basic.mp4")
         self.assertEqual(result["videos"], ["/assets/output/basic.mp4"])
         self.assertEqual(result["task_id"], "job-2")
@@ -1265,35 +1261,262 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["task_id"], "job/one ?")
 
-    async def test_non_omni_models_reject_all_reference_media_before_submit(self):
-        payloads = [
-            main.CanvasVideoRequest(
-                prompt="go",
-                model="seedance-2.0",
-                images=[main.AIReference(url="data:image/png;base64,YQ==")],
-            ),
-            main.CanvasVideoRequest(
-                prompt="go",
-                model="seedance-2.0",
-                videos=["data:video/mp4;base64,YQ=="],
-            ),
-            main.CanvasVideoRequest(
-                prompt="go",
-                model="seedance-2.0",
-                audios=["data:audio/mpeg;base64,YQ=="],
-            ),
-        ]
+    async def test_seedance_model_submits_multimodal_reference_payload(self):
+        submitted = FakeResponse(
+            200, {"id": "job-seedance", "status": "queued"}, "",
+        )
+        completed = FakeResponse(
+            200,
+            {
+                "id": "job-seedance",
+                "status": "completed",
+                "output_url": "https://cdn.example.test/seedance.mp4",
+            },
+            "",
+        )
+        client = RecordingClient([submitted], [completed])
+        save = AsyncMock(return_value="/assets/output/seedance.mp4")
 
-        for payload in payloads:
-            with self.subTest(payload=payload):
-                client = RecordingClient([])
-                with self.assertRaises(main.HTTPException) as raised:
-                    await main.generate_ominilink_video(
-                        payload, self.provider, client=client,
-                    )
-                self.assertEqual(raised.exception.status_code, 400)
-                self.assertIn("参考素材", raised.exception.detail)
-                self.assertEqual(client.calls, [])
+        with patch.object(main.asyncio, "sleep", new=AsyncMock()), \
+                patch.object(main, "save_ominilink_video_to_output", new=save):
+            result = await main.generate_ominilink_video(
+                main.CanvasVideoRequest(
+                    prompt="make the references move",
+                    model="seedance-2.0",
+                    duration=6,
+                    aspect_ratio="9:16",
+                    resolution="720p",
+                    images=[
+                        main.AIReference(
+                            url="https://media.example.test/character.png",
+                            role="reference_image",
+                        ),
+                    ],
+                    videos=["https://media.example.test/motion.mp4"],
+                    audios=["https://media.example.test/music.mp3"],
+                ),
+                self.provider,
+                client=client,
+            )
+
+        self.assertEqual(client.calls[0][0], "POST")
+        self.assertEqual(
+            client.calls[0][1],
+            "https://vg-api.aig-ai.com/v3/bytedance/api/v3/contents/generations/tasks",
+        )
+        self.assertEqual(
+            client.calls[0][2]["json"],
+            {
+                "model": "seedance-2.0",
+                "content": [
+                    {"type": "text", "text": "make the references move"},
+                    {
+                        "type": "image_url",
+                        "role": "reference_image",
+                        "image_url": {
+                            "url": "https://media.example.test/character.png",
+                        },
+                    },
+                    {
+                        "type": "video_url",
+                        "role": "reference_video",
+                        "video_url": {
+                            "url": "https://media.example.test/motion.mp4",
+                        },
+                    },
+                    {
+                        "type": "audio_url",
+                        "role": "reference_audio",
+                        "audio_url": {
+                            "url": "https://media.example.test/music.mp3",
+                        },
+                    },
+                ],
+                "duration": 6,
+                "ratio": "9:16",
+                "resolution": "720p",
+                "generate_audio": False,
+                "watermark": False,
+            },
+        )
+        self.assertEqual(client.calls[1][0], "GET")
+        self.assertEqual(result["videos"], ["/assets/output/seedance.mp4"])
+
+    def test_dreamina_seedance_checkpoint_is_recognized(self):
+        recognized = (
+            "seedance-2.0",
+            "seedance-2.0-fast",
+            "seedance-2.5",
+            "dreamina-seedance-2-0-260128",
+            "dreamina-seedance-2-0-fast-260128",
+            "dreamina-seedance-2-0-mini-260615",
+            "dreamina-seedance-2-5-260628",
+            "doubao-seedance-2-0-260128",
+            "doubao-seedance-2-0-fast-260128",
+            "bytedance/seedance-2.0",
+        )
+        rejected = (
+            "",
+            "sora-2",
+            "veo-3.1-generate-001",
+            "gemini-omni-flash-preview",
+            "kling-v3-omni",
+            "seedance-1-0-pro-250528",
+            "seedance/model 2",
+        )
+        for model in recognized:
+            with self.subTest(model=model):
+                self.assertTrue(main.is_ominilink_seedance_model(model))
+        for model in rejected:
+            with self.subTest(model=model):
+                self.assertFalse(main.is_ominilink_seedance_model(model))
+
+    async def test_dreamina_seedance_checkpoint_keeps_reference_images(self):
+        submitted = FakeResponse(
+            200, {"id": "job-dreamina", "status": "queued"}, "",
+        )
+        completed = FakeResponse(
+            200,
+            {
+                "id": "job-dreamina",
+                "status": "completed",
+                "output_url": "https://cdn.example.test/dreamina.mp4",
+            },
+            "",
+        )
+        client = RecordingClient([submitted], [completed])
+        save = AsyncMock(return_value="/assets/output/dreamina.mp4")
+
+        with patch.object(main.asyncio, "sleep", new=AsyncMock()), \
+                patch.object(main, "save_ominilink_video_to_output", new=save):
+            result = await main.generate_ominilink_video(
+                main.CanvasVideoRequest(
+                    prompt="move both references",
+                    model="dreamina-seedance-2-0-260128",
+                    duration=10,
+                    aspect_ratio="9:16",
+                    images=[
+                        main.AIReference(url="https://media.example.test/one.png"),
+                        main.AIReference(url="https://media.example.test/two.png"),
+                    ],
+                ),
+                self.provider,
+                client=client,
+            )
+
+        self.assertEqual(
+            client.calls[0][1],
+            "https://vg-api.aig-ai.com/v3/bytedance/api/v3/contents/generations/tasks",
+        )
+        self.assertEqual(
+            client.calls[0][2]["json"],
+            {
+                "model": "dreamina-seedance-2-0-260128",
+                "content": [
+                    {"type": "text", "text": "move both references"},
+                    {
+                        "type": "image_url",
+                        "role": "reference_image",
+                        "image_url": {"url": "https://media.example.test/one.png"},
+                    },
+                    {
+                        "type": "image_url",
+                        "role": "reference_image",
+                        "image_url": {"url": "https://media.example.test/two.png"},
+                    },
+                ],
+                "duration": 10,
+                "ratio": "9:16",
+                "generate_audio": False,
+                "watermark": False,
+            },
+        )
+        self.assertEqual(result["videos"], ["/assets/output/dreamina.mp4"])
+        self.assertEqual(result["model"], "dreamina-seedance-2-0-260128")
+
+    async def test_non_seedance_model_still_rejects_reference_media(self):
+        client = RecordingClient([])
+
+        with self.assertRaises(main.HTTPException) as raised:
+            await main.generate_ominilink_video(
+                main.CanvasVideoRequest(
+                    prompt="go",
+                    model="sora-2",
+                    duration=6,
+                    images=[main.AIReference(url="https://media.example.test/one.png")],
+                ),
+                self.provider,
+                client=client,
+            )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(
+            raised.exception.detail,
+            "OminiLink 非 Omni Flash 视频模型不支持参考素材。",
+        )
+        self.assertEqual(client.calls, [])
+
+    async def test_seedance_local_image_is_inlined_and_other_media_is_uploaded(self):
+        public_urls = {
+            "/assets/input/motion.mp4": "https://uploads.example.test/motion.mp4",
+            "/assets/input/music.mp3": "https://uploads.example.test/music.mp3",
+        }
+
+        async def upload_local(value, service, allowed_prefixes):
+            self.assertEqual(service, "auto")
+            self.assertIn(allowed_prefixes, [("video/",), ("audio/",)])
+            return {"url": public_urls[value]}
+
+        def image_data_url(ref, max_size=None):
+            self.assertEqual(ref.get("url"), "/assets/input/character.png")
+            self.assertEqual(max_size, main.OMINILINK_SEEDANCE_IMAGE_MAX_EDGE)
+            return "data:image/jpeg;base64,QUJD"
+
+        with patch.object(
+            main,
+            "upload_local_video_to_cloud",
+            new=AsyncMock(side_effect=upload_local),
+        ), patch.object(main, "reference_to_data_url", side_effect=image_data_url):
+            body = await main.build_ominilink_seedance_request(
+                main.CanvasVideoRequest(
+                    prompt="go",
+                    model="seedance-2.0",
+                    images=[
+                        main.AIReference(url="/assets/input/character.png"),
+                    ],
+                    videos=["/assets/input/motion.mp4"],
+                    audios=["/assets/input/music.mp3"],
+                ),
+            )
+
+        content = body["content"]
+        self.assertEqual(content[0], {"type": "text", "text": "go"})
+        self.assertEqual(
+            [
+                item[f"{item['type'][:-4]}_url"]["url"]
+                for item in content[1:]
+            ],
+            [
+                "data:image/jpeg;base64,QUJD",
+                "https://uploads.example.test/motion.mp4",
+                "https://uploads.example.test/music.mp3",
+            ],
+        )
+
+    async def test_seedance_missing_local_image_does_not_call_cloud_upload(self):
+        upload = AsyncMock()
+        with patch.object(main, "upload_local_video_to_cloud", new=upload):
+            with self.assertRaises(main.HTTPException) as raised:
+                await main.build_ominilink_seedance_request(
+                    main.CanvasVideoRequest(
+                        prompt="go",
+                        model="dreamina-seedance-2-0-260128",
+                        images=[main.AIReference(url="/assets/input/missing-reference.png")],
+                    ),
+                )
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("参考图片无法读取", raised.exception.detail)
+        upload.assert_not_awaited()
 
     async def test_arbitrary_failure_reason_is_not_echoed(self):
         submitted = FakeResponse(
@@ -1758,6 +1981,34 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
             "OminiLink 视频接口返回网页而不是 JSON（HTTP 200）",
         )
         self.assertNotIn("Portal", raised.exception.detail)
+        self.assertEqual(len(client.calls), 1)
+
+    async def test_seedance_html_400_reports_paused_upstream_channel(self):
+        html = FakeResponse(
+            400,
+            None,
+            "<!doctype html><html><head><title>400 Bad Request</title></head></html>",
+        )
+        client = RecordingClient([html])
+
+        with self.assertRaises(main.HTTPException) as raised:
+            await main.generate_ominilink_video(
+                main.CanvasVideoRequest(
+                    prompt="go",
+                    model="seedance-2.0",
+                    duration=6,
+                ),
+                self.provider,
+                client=client,
+            )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(
+            raised.exception.detail,
+            "橙域当前暂停 Seedance API 通道，无法提交视频任务。"
+            "请等待橙域恢复服务，或改用其他视频模型。（上游 HTTP 400）",
+        )
+        self.assertNotIn("Bad Request", raised.exception.detail)
         self.assertEqual(len(client.calls), 1)
 
     async def test_owned_client_is_closed_after_request(self):

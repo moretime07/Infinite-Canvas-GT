@@ -78,6 +78,77 @@ class OpenRouterVideoReferenceTests(unittest.TestCase):
         self.assertNotIn("input_references", body)
         self.assertEqual(counts, {"image": 1, "video": 0, "audio": 0})
 
+    def test_flux3_multimodal_image_uses_first_frame(self):
+        body, counts = self.build(
+            model="black-forest-labs/flux-3-video",
+            images=[main.AIReference(url="data:image/png;base64,AAA")],
+            multimodal=True,
+        )
+
+        self.assertIn("frame_images", body)
+        self.assertEqual(body["frame_images"], [{
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,AAA"},
+            "frame_type": "first_frame",
+        }])
+        self.assertNotIn("input_references", body)
+        self.assertEqual(counts, {"image": 1, "video": 0, "audio": 0})
+
+    def test_flux3_two_multimodal_images_use_first_and_last_frames(self):
+        body, counts = self.build(
+            model="black-forest-labs/flux-3-video",
+            images=[
+                main.AIReference(url="data:image/png;base64,FIRST"),
+                main.AIReference(url="data:image/png;base64,LAST"),
+            ],
+            multimodal=True,
+        )
+
+        self.assertEqual(body["frame_images"], [
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,FIRST"},
+                "frame_type": "first_frame",
+            },
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,LAST"},
+                "frame_type": "last_frame",
+            },
+        ])
+        self.assertNotIn("input_references", body)
+        self.assertEqual(counts, {"image": 2, "video": 0, "audio": 0})
+
+    def test_flux3_rejects_more_than_two_images_instead_of_dropping_them(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self.build(
+                model="black-forest-labs/flux-3-video",
+                images=[
+                    main.AIReference(url="data:image/png;base64,ONE"),
+                    main.AIReference(url="data:image/png;base64,TWO"),
+                    main.AIReference(url="data:image/png;base64,THREE"),
+                ],
+                multimodal=True,
+            )
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("FLUX.3", str(ctx.exception.detail))
+        self.assertIn("2", str(ctx.exception.detail))
+
+    def test_flux3_rejects_mixing_frame_images_with_video_references(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self.build(
+                model="black-forest-labs/flux-3-video",
+                images=[main.AIReference(url="data:image/png;base64,AAA")],
+                videos=["https://cdn.example.com/reference.mp4"],
+                multimodal=True,
+            )
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("FLUX.3", str(ctx.exception.detail))
+        self.assertIn("图片", str(ctx.exception.detail))
+        self.assertIn("视频", str(ctx.exception.detail))
+
     def test_local_video_is_uploaded_and_uses_https_url(self):
         handle = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         try:
