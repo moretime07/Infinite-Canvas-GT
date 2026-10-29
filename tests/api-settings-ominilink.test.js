@@ -273,6 +273,29 @@ async function createState(providerRows){
     state.calls.filter(call => call.url === '/api/providers' && call.options.method === 'PUT').forEach(call => {
         JSON.parse(call.options.body).forEach(row => assert.ok(!Object.hasOwn(row, 'api_key')));
     });
+    for(const suffix of ['/v3/bytedance', '/v3/bytedance/api/v3', '/v3/bytedance/api/v3/contents/generations/tasks']){
+        const endpointState = await createState([{
+            id:'orange', name:'Orange', protocol:'openai', enabled:true, has_key:true,
+            base_url:'https://api.aig-ai.com/v1', video_base_url:'https://vg-api.aig-ai.com/v1',
+            image_models:[], chat_models:[], video_models:['seedance-2.0', 'gemini-omni-flash-preview']
+        }]);
+        for(const action of ['syncEditor', 'testConnection', 'probeAsync', 'fetchModels', 'saveProviders']){
+            endpointState.elements.get('baseInput').value = 'https://vg-api.aig-ai.com' + suffix;
+            endpointState.elements.get('videoBaseInput').value = 'https://vg-api.aig-ai.com' + suffix;
+            await endpointState.api[action]();
+            assert.equal(endpointState.elements.get('baseInput').value, 'https://api.aig-ai.com/v1', action);
+            assert.equal(endpointState.elements.get('videoBaseInput').value, 'https://vg-api.aig-ai.com' + suffix, action);
+        }
+        for(const entry of endpointState.calls.filter(call => call.options?.body)){
+            const body = JSON.parse(entry.options.body);
+            for(const row of Array.isArray(body) ? body : [body]){
+                assert.equal(row.base_url, 'https://api.aig-ai.com/v1');
+                assert.equal(row.protocol, 'openai');
+                assert.ok(!row.api_key, 'normalizing endpoint inputs must not replace the saved key');
+            }
+        }
+        assert.equal(endpointState.api.defaultOminiLinkVideoBaseUrl('https://vg-api.aig-ai.com' + suffix), 'https://vg-api.aig-ai.com/v1');
+    }
     console.log('api-settings-ominilink tests passed');
 })().catch(error => {
     console.error(error);

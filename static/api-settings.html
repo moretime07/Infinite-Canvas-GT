@@ -87,7 +87,7 @@
                             <label class="field full api-video-base-url-field">
                                 <span class="label">视频 API 地址（可选）</span>
                                 <div class="field-frame"><input id="videoBaseInput" type="text" placeholder="https://vg-api.aig-ai.com/v1"></div>
-                                <span class="hint">可填写视频专用入口或完整生成端点；Aiide Seedance 使用 /v1/video/generations。留空时按已知平台及模型自动选择，OminiLink 的聊天与视频入口不同。</span>
+                                <span class="hint">橙域：请求地址填 https://api.aig-ai.com/v1，视频地址填 https://vg-api.aig-ai.com/v1。Seedance 自动使用 /v3/bytedance/api/v3/contents/generations/tasks；也兼容在此粘贴完整任务地址，不影响 Omni Flash。其他平台可填视频入口或完整端点；Aiide 使用 /v1/video/generations。</span>
                             </label>
                             <label class="field full api-key-field">
                                 <span class="label api-key-label">API Key</span>
@@ -492,6 +492,6 @@
         </div>
     </div>
 
-    <script src="/static/js/api-settings.js?v=2026.06.23.1793069597"></script>
+    <script src="/static/js/api-settings.js?v=2026.06.23.1793242232"></script>
 </body>
 </html>

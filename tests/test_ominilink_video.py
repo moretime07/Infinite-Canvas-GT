@@ -1983,7 +1983,7 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Portal", raised.exception.detail)
         self.assertEqual(len(client.calls), 1)
 
-    async def test_seedance_html_400_reports_paused_upstream_channel(self):
+    async def test_seedance_html_400_reports_upstream_channel_without_assuming_cause(self):
         html = FakeResponse(
             400,
             None,
@@ -2005,8 +2005,9 @@ class OminiLinkVideoAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(
             raised.exception.detail,
-            "橙域当前暂停 Seedance API 通道，无法提交视频任务。"
-            "请等待橙域恢复服务，或改用其他视频模型。（上游 HTTP 400）",
+            "橙域 Seedance 任务接口返回网页而不是 JSON（上游 HTTP 400）。"
+            "请向橙域确认海外 Seedance 通道是否开放，以及当前账号的任务接口地址；"
+            "模型列表可访问不代表视频通道可用。",
         )
         self.assertNotIn("Bad Request", raised.exception.detail)
         self.assertEqual(len(client.calls), 1)

@@ -1374,6 +1374,12 @@ def is_ominilink_provider_config(provider) -> bool:
     )
 
 
+def is_ominilink_seedance_api_url(value: str) -> bool:
+    return is_ominilink_api_url(value) and bool(re.match(
+        r"^/v3/bytedance(?:/|$)", urllib.parse.urlsplit(value).path,
+    ))
+
+
 def normalize_ominilink_urls(base_url: str, video_base_url: str = "") -> tuple[str, str]:
     base = str(base_url or "").strip().rstrip("/")
     video = str(video_base_url or "").strip().rstrip("/")
@@ -1382,6 +1388,9 @@ def normalize_ominilink_urls(base_url: str, video_base_url: str = "") -> tuple[s
     if host not in OMINILINK_API_HOSTS:
         return base, video
     suffix = parsed.path.rstrip("/") or "/v1"
+    # A pasted ByteDance task endpoint is not the chat/models API base.
+    if is_ominilink_seedance_api_url(base):
+        suffix = "/v1"
     root_host = host.removeprefix("vg-")
     chat = urllib.parse.urlunsplit((parsed.scheme, root_host, suffix, "", ""))
     derived_video = urllib.parse.urlunsplit((parsed.scheme, f"vg-{root_host}", suffix, "", ""))
@@ -13460,6 +13469,10 @@ def video_api_root(provider):
     return base_url
 
 def ominilink_video_api_root(provider: dict) -> str:
+    configured = _provider_config_url(provider, "video_base_url") or _provider_config_url(provider, "base_url")
+    if is_ominilink_api_url(configured):
+        # Seedance and Omni Flash share credentials, not their endpoint paths.
+        return normalize_ominilink_urls(configured)[1]
     return str(provider.get("video_base_url") or video_api_root(provider) or "").rstrip("/")
 
 
@@ -13778,16 +13791,14 @@ async def ominilink_seedance_reference_url(value: str, allowed_prefix: str) -> s
     return url
 
 def ominilink_seedance_api_root(provider: dict) -> str:
-    """ByteDance Seedance root. The JSON route is the overseas prefix.
-
-    https://vg-api.aig-ai.com/v3/bytedance-cn still returns the gateway HTML
-    page. https://vg-api.aig-ai.com/v3/bytedance/api/v3 answers JSON.
-    """
+    """Use the documented overseas task route; availability is upstream-owned."""
     configured = str(
         (provider or {}).get("video_base_url")
         or (provider or {}).get("base_url")
         or ""
     ).strip().rstrip("/")
+    if is_ominilink_api_url(configured):
+        configured = normalize_ominilink_urls(configured)[1]
     marker = "/v3/bytedance/api/v3"
     if marker in configured:
         return configured.split(marker, 1)[0] + marker
@@ -13998,6 +14009,19 @@ def _ominilink_response_json(response, task_id="", model="") -> dict:
     try:
         raw = response.json()
     except Exception as exc:
+        if (
+            status_code in {400, 404}
+            and is_ominilink_seedance_model(model)
+            and looks_like_html_response(response_text)
+        ):
+            raise HTTPException(
+                status_code=503 if status_code == 400 else 404,
+                detail=(
+                    f"橙域 Seedance 任务接口返回网页而不是 JSON（上游 HTTP {status_code}）。"
+                    "请向橙域确认海外 Seedance 通道是否开放，以及当前账号的任务接口地址；"
+                    "模型列表可访问不代表视频通道可用。"
+                ),
+            ) from exc
         if status_code in {401, 403, 404, 405, 429}:
             detail = {
                 401: "OminiLink 视频接口认证失败",
@@ -14009,18 +14033,6 @@ def _ominilink_response_json(response, task_id="", model="") -> dict:
             raise HTTPException(
                 status_code=status_code,
                 detail=f"{detail}（HTTP {status_code}）",
-            ) from exc
-        if (
-            status_code == 400
-            and is_ominilink_seedance_model(model)
-            and looks_like_html_response(response_text)
-        ):
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "橙域当前暂停 Seedance API 通道，无法提交视频任务。"
-                    "请等待橙域恢复服务，或改用其他视频模型。（上游 HTTP 400）"
-                ),
             ) from exc
         if looks_like_html_response(response_text):
             detail = f"OminiLink 视频接口返回网页而不是 JSON（HTTP {status_code}）"
@@ -14785,26 +14797,41 @@ async def build_openrouter_video_request(payload: CanvasVideoRequest):
     return body, counts
 
 def apply_wan_video_resolution(body: Dict[str, Any]) -> None:
-    """Keep an explicit Wan 3 resolution consistent across gateway formats."""
+    """Send the selected Wan 3 ratio/resolution to the native upstream fields."""
     model = str(body.get("model") or "").strip().lower().rsplit("/", 1)[-1]
     if model not in {"wan3.0-video", "wan3.0-video-prime"}:
         return
     resolution = str(body.get("resolution") or "").strip().upper()
-    if resolution in {"", "AUTO"}:
-        return
-    if resolution not in {"480P", "720P", "1080P"}:
+    if resolution not in {"", "AUTO", "480P", "720P", "1080P"}:
         raise HTTPException(400, "Wan 3.0 分辨率需选择 480p、720p 或 1080p；已停止提交，避免回退到其他计费档位。")
+    ratio = str(body.get("aspect_ratio") or body.get("ratio") or "").strip().lower()
+    if ratio in {"keep_ratio", "adaptive", "auto"}:
+        ratio = "adaptive"
+    elif ratio:
+        parts = re.fullmatch(r"([1-9]\d*)\s*:\s*([1-9]\d*)", ratio)
+        if not parts:
+            raise HTTPException(400, "Wan 3.0 视频比例无效，请选择 9:16、16:9 等明确比例，或选择自适应。")
+        ratio = f"{int(parts[1])}:{int(parts[2])}"
     # New API's legacy Alibaba adapter ignores top-level resolution and defaults
     # Wan 3 to 1080P when size is absent. It reads size, then metadata.parameters.
-    # Newer adapters also read resolution. Keep all three on the user's choice;
-    # an old pixel-size value must not override the explicit resolution dropdown.
-    body["resolution"] = resolution
-    body["size"] = resolution
+    # It also ignores top-level ratio/aspect_ratio and defaults to adaptive unless
+    # metadata.parameters.ratio is set. Send ratio even when resolution is Auto.
     metadata = dict(body.get("metadata") or {})
     parameters = dict(metadata.get("parameters") or {})
-    parameters["resolution"] = resolution
-    metadata["parameters"] = parameters
-    body["metadata"] = metadata
+    if resolution not in {"", "AUTO"}:
+        body["resolution"] = resolution
+        body["size"] = resolution
+        parameters["resolution"] = resolution
+        # The legacy adapter applies native size after resolution; remove a stale
+        # pixel size so it cannot silently override the selected resolution.
+        parameters.pop("size", None)
+    if ratio:
+        body["aspect_ratio"] = ratio
+        body["ratio"] = ratio
+        parameters["ratio"] = ratio
+    if parameters:
+        metadata["parameters"] = parameters
+        body["metadata"] = metadata
 
 
 @app.post("/api/canvas-video")

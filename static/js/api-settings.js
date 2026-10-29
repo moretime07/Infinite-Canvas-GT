@@ -708,6 +708,7 @@ function syncEditor(){
     item.id = nextId;
     if(oldId !== item.id) selectedId = item.id;
     item.name = nameInput.value.trim() || item.id;
+    normalizeOminiLinkEditorUrls();
     const selectedProtocol = effectiveProviderProtocol(item, baseInput.value.trim(), protocolInput?.value, videoBaseInput?.value.trim());
     item.base_url = selectedProtocol === 'jimeng' ? '' : baseInput.value.trim();
     const enteredVideoBaseUrl = videoBaseInput?.value.trim() || '';
@@ -2666,14 +2667,29 @@ function effectiveProviderProtocol(item, baseUrl=item?.base_url, requestedProtoc
     if(/^https:\/\/vod\.(intl\.)?tencentcloudapi\.com\/?$/.test(baseUrl || '')) return 'tencent-vod';
     return ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng', 'wand', 'tencent-vod'].includes(normalized) ? normalized : 'openai';
 }
-function defaultOminiLinkVideoBaseUrl(value){
-    if(!isOminiLinkApiUrl(value)) return '';
-    const parsed = new URL(String(value).trim());
+function normalizeOminiLinkUrls(baseUrl, videoBaseUrl=''){
+    const base = String(baseUrl || '').trim().replace(/\/+$/, '');
+    const video = String(videoBaseUrl || '').trim().replace(/\/+$/, '');
+    if(!isOminiLinkApiUrl(base)) return {base_url:base, video_base_url:video};
+    const parsed = new URL(base);
     const hostname = parsed.hostname.toLowerCase();
-    parsed.hostname = hostname.startsWith('vg-') ? hostname : `vg-${hostname}`;
+    const chatHost = hostname.replace(/^vg-/, '');
+    parsed.hostname = chatHost;
+    if(parsed.pathname === '/' || /^\/v3\/bytedance(?:\/|$)/.test(parsed.pathname)) parsed.pathname = '/v1';
     parsed.search = '';
     parsed.hash = '';
-    return parsed.toString().replace(/\/$/, '');
+    const chat = parsed.toString().replace(/\/+$/, '');
+    parsed.hostname = `vg-${chatHost}`;
+    return {base_url:chat, video_base_url:video || parsed.toString().replace(/\/+$/, '')};
+}
+function normalizeOminiLinkEditorUrls(){
+    if(!isOminiLinkApiUrl(baseInput?.value)) return;
+    const normalized = normalizeOminiLinkUrls(baseInput.value, videoBaseInput?.value);
+    baseInput.value = normalized.base_url;
+    if(videoBaseInput) videoBaseInput.value = normalized.video_base_url;
+}
+function defaultOminiLinkVideoBaseUrl(value){
+    return normalizeOminiLinkUrls(value).video_base_url;
 }
 function applyDetectedImageRequestMode(mode){
     const item = provider();
@@ -2733,6 +2749,7 @@ function runninghubModelSourceNote(data){
 async function probeAsync(){
     const item = provider();
     if(!item) return;
+    normalizeOminiLinkEditorUrls();
     if(effectiveProviderProtocol(item, baseInput.value, protocolInput?.value) === 'tencent-vod') return probeTencentVod(false);
     const btn = document.getElementById('probeAsyncBtn');
     const baseUrl = baseInput.value.trim();
@@ -2833,6 +2850,7 @@ async function probeAsync(){
 async function testConnection(){
     const item = provider();
     if(!item) return;
+    normalizeOminiLinkEditorUrls();
     if(effectiveProviderProtocol(item, baseInput.value, protocolInput?.value) === 'tencent-vod') return probeTencentVod(false);
     const btn = document.getElementById('testUrlBtn');
     const baseUrl = baseInput.value.trim();

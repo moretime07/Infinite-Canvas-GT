@@ -21,6 +21,7 @@ _self_restart.bat
 # Generated and uploaded media
 assets/
 output/
+tmp/
 
 # Bundled/local Python runtime and caches
 .venv/

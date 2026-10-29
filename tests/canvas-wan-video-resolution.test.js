@@ -9,11 +9,11 @@ const start = source.indexOf('async function runVideoNode(');
 const end = source.indexOf('\nasync function ', start + 1);
 assert.ok(start >= 0 && end > start);
 
-test('Wan video node sends its selected resolution without enabling upsampling', async () => {
+test('Wan video node sends its selected ratio and resolution without enabling upsampling', async () => {
     const requests = [];
     const node = {
         id:'video-1', type:'video', apiProvider:'wan-test', model:'wan3.0-video',
-        duration:5, aspectRatio:'16:9', resolution:'720p', enableUpsample:false
+        duration:5, aspectRatio:'9:16', resolution:'720p', enableUpsample:false
     };
     const sandbox = {
         nodes:[node], apiProviders:[{id:'wan-test', base_url:'https://wan.example.test/v1'}],
@@ -40,15 +40,20 @@ test('Wan video node sends its selected resolution without enabling upsampling',
     };
     vm.createContext(sandbox);
     vm.runInContext(source.slice(start, end), sandbox);
-    for (const resolution of ['480p', '720p', '1080p', '']) {
+    for (const ratio of ['9:16', '16:9', '1:1', '4:3', '3:4', '21:9', '9:21', 'adaptive', 'keep_ratio']) {
+      for (const resolution of ['480p', '720p', '1080p', '']) {
+        node.aspectRatio = ratio;
         node.resolution = resolution;
         await sandbox.runVideoNode(node.id);
         assert.equal(node.runStatus, 'done');
+        assert.equal(requests.at(-1).aspect_ratio, ratio);
         assert.equal(requests.at(-1).resolution, resolution);
         assert.equal(requests.at(-1).enable_upsample, false);
         assert.equal(requests.at(-1).model, 'wan3.0-video');
         assert.equal(requests.at(-1).images.length, 1);
         assert.equal(node.resolution, resolution);
+        assert.equal(node.aspectRatio, ratio);
+      }
     }
-    assert.equal(requests.length, 4);
+    assert.equal(requests.length, 36);
 });

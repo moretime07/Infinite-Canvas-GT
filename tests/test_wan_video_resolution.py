@@ -51,6 +51,7 @@ class WanVideoResolutionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(body["resolution"], expected)
                     self.assertEqual(body["size"], expected)
                     self.assertEqual(body["metadata"]["parameters"]["resolution"], expected)
+                    self.assertEqual(body["metadata"]["parameters"]["ratio"], "16:9")
                     # The legacy New API adapter ignores top-level resolution,
                     # reads size, then applies metadata.parameters overrides.
                     native_resolution = body.get("size") or "1080P"
@@ -72,12 +73,51 @@ class WanVideoResolutionTests(unittest.IsolatedAsyncioTestCase):
         body = await self.submit(resolution="")
         self.assertNotIn("size", body)
         self.assertNotIn("resolution", body)
-        self.assertNotIn("metadata", body)
+        self.assertEqual(body["metadata"]["parameters"], {"ratio": "16:9"})
 
     async def test_size_only_request_keeps_existing_behavior(self):
         body = await self.submit(resolution="", size="1280*720")
         self.assertEqual(body["size"], "1280*720")
-        self.assertNotIn("metadata", body)
+        self.assertEqual(body["metadata"]["parameters"], {"ratio": "16:9"})
+
+    async def test_selected_aspect_and_resolution_are_sent_to_native_wan_parameters(self):
+        for ratio in ("9:16", "16:9", "1:1", "4:3", "3:4", "21:9", "9:21"):
+            with self.subTest(ratio=ratio):
+                body = await self.submit(aspect_ratio=ratio, resolution="720p")
+                self.assertEqual(body["aspect_ratio"], ratio)
+                self.assertEqual(body["ratio"], ratio)
+                self.assertEqual(body["metadata"]["parameters"], {
+                    "ratio": ratio, "resolution": "720P",
+                })
+
+    async def test_auto_resolution_still_transmits_selected_portrait_ratio(self):
+        body = await self.submit(aspect_ratio="9:16", resolution="")
+        self.assertEqual(body["metadata"]["parameters"], {"ratio": "9:16"})
+        self.assertNotIn("resolution", body)
+
+    async def test_only_explicit_auto_ratio_uses_adaptive(self):
+        for ratio in ("adaptive", "keep_ratio"):
+            with self.subTest(ratio=ratio):
+                body = await self.submit(aspect_ratio=ratio)
+                self.assertEqual(body["metadata"]["parameters"]["ratio"], "adaptive")
+                self.assertEqual(body["ratio"], "adaptive")
+
+    async def test_invalid_ratio_is_not_replaced_by_an_upstream_default(self):
+        with self.assertRaises(main.HTTPException) as raised:
+            await self.submit(aspect_ratio="0:16")
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(self.requests, [])
+
+    def test_native_stale_size_and_adaptive_ratio_cannot_override_the_ui(self):
+        body = {
+            "model": "wan3.0-video", "aspect_ratio": "9:16", "ratio": "16:9",
+            "resolution": "720p", "size": "1920*1080",
+            "metadata": {"parameters": {"size": "1920*1080", "resolution": "1080P", "ratio": "adaptive", "seed": 7}},
+        }
+        main.apply_wan_video_resolution(body)
+        self.assertEqual(body["metadata"]["parameters"], {"resolution": "720P", "ratio": "9:16", "seed": 7})
+        self.assertEqual(body["size"], "720P")
+        self.assertEqual(body["ratio"], "9:16")
 
     async def test_other_models_do_not_receive_wan_parameters(self):
         body = await self.submit(model="veo3-fast", size="1280x720")
