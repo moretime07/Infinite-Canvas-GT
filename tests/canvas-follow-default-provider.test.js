@@ -212,7 +212,7 @@ const executableNames = [
     'syncCanvasNodeProvider', 'syncFollowingDefaultCanvasNodes', 'syncDefaultCanvasNodeProvider',
     'resolveCanvasNodeRequest', 'preflightCanvasNodeRequest',
     'unresolvedDefaultCanvasNodeError', 'stopUnresolvedDefaultCanvasRun', 'prepareCanvasNodeForRender',
-    'normalizeCanvasProviderSentinels', 'serializableCanvasNode', 'serializableCanvasLogs', 'runSnapshot', 'addGenerationLog',
+    'normalizeCanvasProviderSentinels', 'serializableCanvasNode', 'serializableCanvasLogs', 'runSnapshot', 'normalizedRunTimings', 'addGenerationLog',
     'followDefaultOption',
     'applyCanvasProviderSelection', 'applyChatProviderSelection',
     'applyImageProviderSelection', 'applyVideoProviderSelection',

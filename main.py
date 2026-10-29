@@ -29,6 +29,8 @@ import ipaddress
 import socket
 import xml.etree.ElementTree as ET
 from collections import deque
+from contextvars import ContextVar
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from threading import Lock, Thread
@@ -36,6 +38,7 @@ import httpx
 import tencent_vod
 import aiide_video
 import project_updater
+import video_download
 from PIL import Image, ImageOps
 from io import BytesIO
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, Request
@@ -241,7 +244,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.10.29.1"
+APP_VERSION = "2026.10.29.2"
 GITHUB_REPO_URL = "https://github.com/moretime07/Infinite-Canvas-GT"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/moretime07/Infinite-Canvas-GT/main/VERSION"
 GITHUB_TREE_URL = "https://api.github.com/repos/moretime07/Infinite-Canvas-GT/git/trees/main?recursive=1"
@@ -2441,6 +2444,88 @@ class ImageTaskQueryRequest(BaseModel):
 
 CANVAS_TASKS: Dict[str, Dict[str, Any]] = {}
 CANVAS_TASK_LOCK = Lock()
+VIDEO_TASK_PROGRESS = ContextVar("video_task_progress", default=None)
+
+
+def mark_video_timing_stage(stage, now=None):
+    """Exclusive wall-clock phases, isolated per task (never sum parallel transfers)."""
+    progress = VIDEO_TASK_PROGRESS.get()
+    if progress is None or stage == progress.get("timing_stage"):
+        return
+    now = time.monotonic() if now is None else now
+    previous = progress.get("timing_stage", "prepare")
+    stages = progress.setdefault("stages_ms", {})
+    stages[previous] = stages.get(previous, 0) + max(0, (now - progress.get("stage_started", progress["started"])) * 1000)
+    progress["timing_stage"] = stage
+    progress["stage_started"] = now
+
+
+def report_video_download(byte_count=0):
+    """Track this task only; child download coroutines share its progress record."""
+    progress = VIDEO_TASK_PROGRESS.get()
+    if progress is None:
+        return
+    now = time.monotonic()
+    first = "download_started" not in progress
+    if first:
+        progress["download_started"] = now
+        mark_video_timing_stage("download", now)
+    progress["downloaded_bytes"] = progress.get("downloaded_bytes", 0) + byte_count
+    if not first and now - progress.get("reported_at", 0) < 0.5:
+        return
+    progress["reported_at"] = now
+    with CANVAS_TASK_LOCK:
+        task = CANVAS_TASKS.get(progress["task_id"])
+        if task is not None:
+            transfers = list(progress.get("transfers", {}).values())
+            known_total = (len(transfers) >= progress.get("expected_downloads", 1)
+                           and all(item[1] is not None for item in transfers))
+            elapsed = max(0.1, now - progress["download_started"])
+            task.update(
+                phase="downloading", downloaded_bytes=progress["downloaded_bytes"], updated_at=time.time(),
+                download_total_bytes=sum(item[1] for item in transfers) if known_total else 0,
+                download_speed_bps=round(max(0, progress["downloaded_bytes"]) / elapsed),
+                download_mode="parallel" if any(item[2] == "parallel" for item in transfers) else "single",
+            )
+
+
+def video_transfer_progress():
+    transfer_id = uuid.uuid4().hex
+    previous = 0
+
+    def update(received, total, mode):
+        nonlocal previous
+        progress = VIDEO_TASK_PROGRESS.get()
+        if progress is not None:
+            progress.setdefault("transfers", {})[transfer_id] = (received, total, mode)
+        report_video_download(received - previous)
+        previous = received
+
+    return update
+
+
+async def save_video_outputs(urls, saver=None, **kwargs):
+    """Bound concurrent transfers, preserve order, and await all workers on failure."""
+    saver = saver or save_remote_video_to_output
+    urls = list(urls)
+    if not urls:
+        return []
+    report_video_download()
+    limit = asyncio.Semaphore(3)
+
+    async def save(url):
+        async with limit:
+            return await saver(url, **kwargs)
+
+    unique = list(dict.fromkeys(urls))
+    if VIDEO_TASK_PROGRESS.get() is not None:
+        VIDEO_TASK_PROGRESS.get()["expected_downloads"] = len(unique)
+    results = await asyncio.gather(*(save(url) for url in unique), return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    saved = dict(zip(unique, results))
+    return [saved[url] for url in urls]
 
 class CanvasVideoRequest(BaseModel):
     prompt: str = Field(min_length=1)
@@ -5160,7 +5245,29 @@ def export_canvas_output_image(source_path: str, destination_path: str, output_f
                 method=4,
             )
 
+def canvas_video_matches_container(source_path: str, output_format: str) -> bool:
+    # Extensions alone are not enough: an upstream can name an error page .mp4.
+    if Path(source_path).suffix.lower() != f".{output_format}":
+        return False
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return False
+    try:
+        probe = subprocess.run([
+            ffprobe, "-v", "error", "-show_entries", "format=format_name:stream=codec_type",
+            "-of", "json", source_path,
+        ], capture_output=True, text=True, timeout=10)
+        data = json.loads(probe.stdout) if probe.returncode == 0 else {}
+        formats = set(data.get("format", {}).get("format_name", "").split(","))
+        return output_format in formats and any(s.get("codec_type") == "video" for s in data.get("streams", []))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+
+
 def export_canvas_output_video(source_path: str, destination_path: str, output_format: str):
+    if canvas_video_matches_container(source_path, output_format):
+        shutil.copyfile(source_path, destination_path)
+        return "copy"
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise HTTPException(status_code=500, detail="未找到 ffmpeg，无法转换视频")
@@ -5183,12 +5290,14 @@ def export_canvas_output_video(source_path: str, destination_path: str, output_f
     if result.returncode != 0 or not os.path.isfile(destination_path) or os.path.getsize(destination_path) <= 0:
         message = (result.stderr or "ffmpeg 视频转换失败").strip()[:500]
         raise HTTPException(status_code=415, detail=f"视频转换失败：{message}")
+    return "transcode"
 
 def export_canvas_output_items(payload: CanvasOutputExportRequest) -> Dict[str, Any]:
     if not payload.items:
         raise HTTPException(status_code=400, detail="没有可导出的媒体")
     exported = []
     skipped = []
+    started = time.monotonic()
     for index, item in enumerate(payload.items[:200], start=1):
         kind = canvas_output_export_kind(item)
         source_path = None
@@ -5206,8 +5315,9 @@ def export_canvas_output_items(payload: CanvasOutputExportRequest) -> Dict[str, 
             basename = canvas_output_export_basename(payload, kind, index)
             destination_path = unique_canvas_output_export_path(folder, basename, output_format)
             source_path, temporary_path = materialize_canvas_output_export_source(item.url, kind)
+            export_mode = "convert"
             if kind == "video":
-                export_canvas_output_video(source_path, destination_path, output_format)
+                export_mode = export_canvas_output_video(source_path, destination_path, output_format)
             else:
                 export_canvas_output_image(source_path, destination_path, output_format)
             exported.append({
@@ -5215,6 +5325,7 @@ def export_canvas_output_items(payload: CanvasOutputExportRequest) -> Dict[str, 
                 "kind": kind,
                 "name": os.path.basename(destination_path),
                 "path": destination_path,
+                "mode": export_mode,
             })
         except HTTPException as exc:
             if destination_path and os.path.exists(destination_path):
@@ -5239,7 +5350,7 @@ def export_canvas_output_items(payload: CanvasOutputExportRequest) -> Dict[str, 
     if not exported:
         detail = skipped[0]["reason"] if skipped else "没有可导出的媒体"
         raise HTTPException(status_code=400, detail=f"导出失败：{detail}")
-    return {"exported": exported, "skipped": skipped}
+    return {"exported": exported, "skipped": skipped, "elapsed_ms": round((time.monotonic() - started) * 1000)}
 
 def filename_from_media_url(url: str, fallback: str = "download.bin") -> str:
     path = urllib.parse.urlsplit(str(url or "")).path
@@ -7491,48 +7602,52 @@ async def save_remote_video_to_output(url, prefix="video_", category="output"):
     stem = f"{prefix}{uuid.uuid4().hex[:10]}"
     filename = f"{stem}{clean_ext if clean_ext in video_exts else '.mp4'}"
     path = output_path_for(filename, category)
+    temp_path = ""
+    report_video_download()
     try:
-        timeout = httpx.Timeout(connect=20.0, read=VIDEO_POLL_TIMEOUT, write=60.0, pool=20.0)
+        timeout = httpx.Timeout(connect=20.0, read=video_download.READ_TIMEOUT, write=60.0, pool=20.0)
         headers = {
             "User-Agent": "ComfyUI-API-Modelscope/1.0",
             "Accept": "video/*,application/octet-stream,*/*;q=0.8",
+            "Accept-Encoding": "identity",
             **remote_media_request_headers(url),
         }
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            content_type = (response.headers.get("Content-Type") or "").lower()
-            if "text/html" in content_type or "application/json" in content_type:
-                raise RuntimeError(f"unexpected video content type: {content_type}")
-            ext = clean_ext
-            if ext in video_exts:
+        limits = httpx.Limits(max_connections=4, max_keepalive_connections=4)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers, limits=limits) as client:
+            def open_stream(extra_headers):
+                return client.stream("GET", url, headers=extra_headers)
+
+            async with open_stream({}) as response:
+                response.raise_for_status()
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                if "text/html" in content_type or "application/json" in content_type:
+                    raise RuntimeError(f"unexpected video content type: {content_type}")
+                ext = clean_ext
+                if ext not in video_exts:
+                    ext = next((suffix for mime, suffix in (
+                        ("webm", ".webm"), ("quicktime", ".mov"), ("x-matroska", ".mkv"), ("x-flv", ".flv")
+                    ) if mime in content_type), ".mp4")
                 filename = f"{stem}{ext}"
                 path = output_path_for(filename, category)
-            elif "webm" in content_type:
-                filename = f"{stem}.webm"
-                path = output_path_for(filename, category)
-            elif "quicktime" in content_type or "mov" in content_type:
-                filename = f"{stem}.mov"
-                path = output_path_for(filename, category)
-            elif "x-matroska" in content_type or "mkv" in content_type:
-                filename = f"{stem}.mkv"
-                path = output_path_for(filename, category)
-            elif "x-flv" in content_type or "flv" in content_type:
-                filename = f"{stem}.flv"
-                path = output_path_for(filename, category)
-            with open(path, "wb") as f:
-                f.write(response.content)
-            if os.path.getsize(path) <= 0:
-                raise RuntimeError("empty video response")
+                temp_path = f"{path}.part-{uuid.uuid4().hex[:10]}"
+                await video_download.save_response(response, open_stream, temp_path, progress=video_transfer_progress())
+                os.replace(temp_path, path)
+                temp_path = ""
             return output_url_for(filename, category)
     except Exception as e:
-        print(f"保存上游视频失败: {e}")
+        print(f"保存上游视频失败: {type(e).__name__}")  # Never log signed URLs or provider credentials.
         try:
             if os.path.exists(path):
                 os.remove(path)
         except Exception:
             pass
         return url
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 OMINILINK_RESULT_MAX_BYTES = 512 * 1024 * 1024
 
@@ -7540,69 +7655,60 @@ async def save_ominilink_video_to_output(url, prefix="video_", category="output"
     """Download an OminiLink result only after SSRF-safe validation at every hop."""
     video_exts = {".mp4", ".webm", ".mov", ".m4v", ".avi", ".mkv", ".flv"}
     temp_path = ""
+    report_video_download()
 
     async def download(active_client):
         nonlocal temp_path
-        current = str(url or "").strip()
-        redirects = 0
-        while True:
-            try:
-                logical_url, pinned_url, logical_authority, sni_hostname = ominilink_pinned_https_request(
-                    current,
-                    resolver=resolver,
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=502, detail="OminiLink 视频结果下载地址不安全。") from exc
-            async with active_client.stream(
-                "GET",
-                pinned_url,
-                headers={"Host": logical_authority},
-                extensions={"sni_hostname": sni_hostname},
-                follow_redirects=False,
-            ) as response:
-                status_code = int(getattr(response, "status_code", 0) or 0)
-                if 300 <= status_code < 400:
-                    location = str((getattr(response, "headers", {}) or {}).get("Location") or "").strip()
-                    if not location or redirects >= 3:
-                        raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
-                    redirects += 1
-                    current = urllib.parse.urljoin(logical_url, location)
-                    continue
-                response.raise_for_status()
-                headers = getattr(response, "headers", {}) or {}
-                content_type = str(headers.get("Content-Type") or "").lower()
-                if "text/html" in content_type or "application/json" in content_type:
-                    raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
-                content_length = str(headers.get("Content-Length") or "").strip()
-                if content_length:
-                    try:
-                        if int(content_length) > OMINILINK_RESULT_MAX_BYTES:
+        final_url = str(url or "").strip()
+
+        @asynccontextmanager
+        async def open_stream(extra_headers):
+            nonlocal final_url
+            current = str(url or "").strip()
+            redirects = 0
+            while True:
+                try:
+                    logical_url, pinned_url, logical_authority, sni_hostname = await asyncio.to_thread(
+                        ominilink_pinned_https_request, current, resolver=resolver,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=502, detail="OminiLink 视频结果下载地址不安全。") from exc
+                async with active_client.stream(
+                    "GET", pinned_url,
+                    headers={"Host": logical_authority, "Accept-Encoding": "identity", **extra_headers},
+                    extensions={"sni_hostname": sni_hostname}, follow_redirects=False,
+                ) as response:
+                    if 300 <= response.status_code < 400:
+                        location = str(response.headers.get("Location") or "").strip()
+                        if not location or redirects >= 3:
                             raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
-                    except ValueError:
-                        pass
-                clean_ext = os.path.splitext(urllib.parse.urlsplit(logical_url).path)[1].lower()
-                stem = f"{prefix}{uuid.uuid4().hex[:10]}"
-                filename = f"{stem}{clean_ext if clean_ext in video_exts else '.mp4'}"
-                path = output_path_for(filename, category)
-                temp_path = f"{path}.part-{uuid.uuid4().hex[:10]}"
-                total = 0
-                with open(temp_path, "xb") as handle:
-                    async for chunk in response.aiter_bytes():
-                        total += len(chunk)
-                        if total > OMINILINK_RESULT_MAX_BYTES:
-                            raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
-                        handle.write(chunk)
-                if total <= 0:
-                    raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
-                os.replace(temp_path, path)
-                temp_path = ""
-                return output_url_for(filename, category)
+                        redirects += 1
+                        current = urllib.parse.urljoin(logical_url, location)
+                        continue
+                    final_url = logical_url
+                    yield response
+                    return
+
+        async with open_stream({}) as response:
+            clean_ext = os.path.splitext(urllib.parse.urlsplit(final_url).path)[1].lower()
+            stem = f"{prefix}{uuid.uuid4().hex[:10]}"
+            filename = f"{stem}{clean_ext if clean_ext in video_exts else '.mp4'}"
+            path = output_path_for(filename, category)
+            temp_path = f"{path}.part-{uuid.uuid4().hex[:10]}"
+            await video_download.save_response(
+                response, open_stream, temp_path,
+                progress=video_transfer_progress(), max_bytes=OMINILINK_RESULT_MAX_BYTES,
+            )
+            os.replace(temp_path, path)
+            temp_path = ""
+            return output_url_for(filename, category)
 
     try:
         if client is not None:
             return await download(client)
-        timeout = httpx.Timeout(connect=20.0, read=VIDEO_POLL_TIMEOUT, write=60.0, pool=20.0)
-        limits = httpx.Limits(max_connections=1, max_keepalive_connections=0)
+        timeout = httpx.Timeout(connect=20.0, read=video_download.READ_TIMEOUT, write=60.0, pool=20.0)
+        # IP-pinned redirects may have different TLS authorities on the same IP.
+        limits = httpx.Limits(max_connections=4, max_keepalive_connections=0)
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=False,
@@ -8147,6 +8253,8 @@ def runninghub_extract_outputs(data):
 async def runninghub_store_remote_output(client, remote):
     if not str(remote or "").startswith(("http://", "https://")):
         return remote
+    if runninghub_output_ext(remote) in {"mp4", "webm", "mov", "m4v", "mkv"}:
+        return await save_remote_video_to_output(remote, prefix="rh_")
     response = await client.get(remote, follow_redirects=True)
     if not response.is_success:
         return remote
@@ -9057,6 +9165,8 @@ async def generate_runninghub_provider_image(prompt, size, model, reference_imag
         return runninghub_extract_image(result), result
 
 async def wait_for_runninghub_openapi_task(client, provider, task_id, output_kind=""):
+    if output_kind == "video":
+        mark_video_timing_stage("generate")
     query_url = runninghub_openapi_url(provider, "query")
     deadline = time.monotonic() + 1800
     last_payload = None
@@ -9121,6 +9231,7 @@ async def generate_runninghub_video(payload, provider):
             else:
                 body[key] = image_urls[0]
         runninghub_apply_schema_defaults(body, params)
+        mark_video_timing_stage("submit")
         response = await client.post(endpoint, headers=runninghub_json_headers(provider), json=body)
         response.raise_for_status()
         raw = response.json()
@@ -9134,7 +9245,7 @@ async def generate_runninghub_video(payload, provider):
             urls = [url for url in outputs if str(url).startswith(("http://", "https://", "/output/", "/assets/"))]
         if not urls:
             raise HTTPException(status_code=502, detail=f"RunningHub 视频生成成功但没有返回视频：{result}")
-        local_urls = [await save_remote_video_to_output(url, prefix="rh_video_") for url in urls]
+        local_urls = await save_video_outputs(urls, prefix="rh_video_")
         return {"videos": local_urls, "task_id": task_id, "raw": result}
 
 async def generate_openrouter_provider_image(prompt, size, quality, model, reference_images=None, provider=None):
@@ -11439,13 +11550,16 @@ async def runninghub_query(taskId: str = ""):
         code = raw.get("code") if isinstance(raw, dict) else None
         status = "PENDING"
         urls = []
+        download_ms = None
         if code in (0, "0"):
             status = "SUCCESS"
+            download_started = time.monotonic()
             for remote in runninghub_extract_outputs(raw.get("data")):
                 try:
                     urls.append(await runninghub_store_remote_output(client, remote))
                 except Exception:
                     urls.append(remote)
+            download_ms = round((time.monotonic() - download_started) * 1000)
         elif code in (804, "804"):
             status = "RUNNING"
         elif code in (813, "813"):
@@ -11454,7 +11568,8 @@ async def runninghub_query(taskId: str = ""):
             status = "FAILED"
         else:
             status = "UNKNOWN"
-        return {"success": True, "data": {"status": status, "urls": urls, "failReason": runninghub_fail_reason(raw), "code": code, "raw": raw}}
+        return {"success": True, "data": {"status": status, "urls": urls, "failReason": runninghub_fail_reason(raw), "code": code, "raw": raw,
+                "timings": {"download_ms": download_ms} if download_ms is not None else {}}}
 
 @app.post("/api/runninghub/upload-asset")
 async def runninghub_upload_asset(payload: RunningHubUploadAssetRequest):
@@ -13786,6 +13901,7 @@ def _ominilink_timeout_error(task_id, status=""):
     )
 
 async def wait_for_ominilink_video_task(client, provider, model, task_id) -> dict:
+    mark_video_timing_stage("generate")
     model = selected_model(model, "gemini-omni-flash-preview")
     task_id = str(task_id or "").strip()
     seedance = is_ominilink_seedance_model(model)
@@ -13922,6 +14038,7 @@ async def generate_ominilink_video(payload, provider, client=None) -> dict:
 
     async def execute(active_client):
         try:
+            mark_video_timing_stage("submit")
             response = await active_client.post(
                 submit_url,
                 headers=ominilink_video_headers(provider),
@@ -13968,10 +14085,7 @@ async def generate_ominilink_video(payload, provider, client=None) -> dict:
                         _ominilink_task_status(result),
                     ),
                 )
-            local_urls = [
-                await save_ominilink_video_to_output(url)
-                for url in urls
-            ]
+            local_urls = await save_video_outputs(urls, saver=save_ominilink_video_to_output)
             if any(not str(local_url or "").startswith(("/output/", "/assets/")) for local_url in local_urls):
                 raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。")
             return {
@@ -13993,6 +14107,7 @@ async def generate_ominilink_video(payload, provider, client=None) -> dict:
         return await execute(owned_client)
 
 async def wait_for_video_task(client, provider, task_id, submit_url=""):
+    mark_video_timing_stage("generate")
     base_url = video_api_root(provider)
     if not base_url:
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider['id']} 未配置 Base URL")
@@ -14010,6 +14125,8 @@ async def wait_for_video_task(client, provider, task_id, submit_url=""):
                 aiide_video.raise_for_redirect(response)
                 response.raise_for_status()
                 raw = response.json()
+                # Once found, try the working route first on subsequent polls.
+                task_urls = [task_url] + [url for url in task_urls if url != task_url]
                 break
             except HTTPException:
                 # Redirects are not alternate API endpoints. Never forward the key.
@@ -14084,6 +14201,7 @@ async def agnes_video_image_url(ref):
     return uploaded.get("url") or ""
 
 async def wait_for_agnes_video_task(client, provider, video_id, model):
+    mark_video_timing_stage("generate")
     base_url = video_api_root(provider)
     if not base_url:
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider['id']} 未配置 Base URL")
@@ -14149,6 +14267,7 @@ async def generate_agnes_video(client, payload, provider, base_url, requested_mo
     if payload.seed is not None:
         body["seed"] = payload.seed
     submit_url = f"{base_url}/v1/videos"
+    mark_video_timing_stage("submit")
     response = await client.post(submit_url, headers=api_headers(provider=provider, model=model), json=body)
     response.raise_for_status()
     raw = response.json()
@@ -14162,7 +14281,7 @@ async def generate_agnes_video(client, payload, provider, base_url, requested_mo
     urls = video_output_urls(result)
     if not urls:
         raise HTTPException(status_code=502, detail=f"Agnes 视频生成成功但没有返回视频：{result}")
-    local_urls = [await save_remote_video_to_output(url) for url in urls]
+    local_urls = await save_video_outputs(urls)
     return {"videos": local_urls, "task_id": task_id or video_id, "video_id": video_id or None, "raw": result}
 
 # ---- 玉玉API（yuli.host）OpenAI 视频格式：/v1/videos（multipart，支持 seconds 时长）----
@@ -14244,6 +14363,7 @@ async def generate_yuli_openai_video(client, payload, provider, base_url, reques
             files["input_reference"] = ref_file
             break
     headers = api_headers(json_body=False, provider=provider)
+    mark_video_timing_stage("submit")
     if files:
         response = await client.post(submit_url, headers=headers, data=data, files=files)
     else:
@@ -14264,7 +14384,7 @@ async def generate_yuli_openai_video(client, payload, provider, base_url, reques
     urls = video_output_urls(result)
     if not urls:
         raise HTTPException(status_code=502, detail=f"视频生成成功但没有返回视频：{result}")
-    local_urls = [await save_remote_video_to_output(url) for url in urls]
+    local_urls = await save_video_outputs(urls)
     return {"videos": local_urls, "task_id": task_id, "raw": result}
 
 def volcengine_video_prompt_text(prompt, aspect_ratio="", duration=None):
@@ -14450,10 +14570,12 @@ async def canvas_video(payload: CanvasVideoRequest):
     if tencent_vod.is_provider(provider):
         return await generate_tencent_vod_video(payload, provider)
     if is_wand_provider(provider):
+        mark_video_timing_stage("upstream")
         return await generate_wand_video(payload, provider)
     if is_ominilink_provider_config(provider):
         return await generate_ominilink_video(payload, provider)
     if is_jimeng_provider(provider):
+        mark_video_timing_stage("upstream")
         return await generate_jimeng_video(payload, provider)
     if is_runninghub_provider(provider):
         try:
@@ -14788,6 +14910,7 @@ async def canvas_video(payload: CanvasVideoRequest):
                         body["generate_audio"] = True
                     apply_wan_video_resolution(body)
             # --- 发起视频生成请求 ---
+            mark_video_timing_stage("submit")
             raw = None
             html_response = None
             last_response = None
@@ -14847,7 +14970,7 @@ async def canvas_video(payload: CanvasVideoRequest):
             urls = video_output_urls(result)
             if not urls:
                 raise HTTPException(status_code=502, detail=f"视频生成成功但没有返回视频：{result}")
-            local_urls = [await save_remote_video_to_output(url) for url in urls]
+            local_urls = await save_video_outputs(urls)
             response_payload = {"videos": local_urls, "task_id": task_id, "raw": result}
             if is_openrouter:
                 response_payload["request"] = {"references": openrouter_reference_counts}
@@ -14976,6 +15099,7 @@ async def generate_aiide_video(payload, provider, client=None):
         task_id = ""
         submitted = False
         try:
+            mark_video_timing_stage("submit")
             response = await active_client.post(submit_url, headers=headers, json=body, timeout=60, follow_redirects=False)
             submitted = True
             data = aiide_video.response_json(response, (api_key,))
@@ -14985,6 +15109,8 @@ async def generate_aiide_video(payload, provider, client=None):
                 raise HTTPException(502, "Aiide 未返回任务 ID 或视频地址，请到上游确认是否已创建任务，避免重复提交。")
             deadline = time.monotonic() + VIDEO_POLL_TIMEOUT
             delay = max(2.0, IMAGE_POLL_INTERVAL)
+            if not urls:
+                mark_video_timing_stage("generate")
             while not urls:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -15010,7 +15136,7 @@ async def generate_aiide_video(payload, provider, client=None):
                 delay = min(delay * 1.6, 12)
             try:
                 # Bounded downloader validates destinations and sends no provider credentials.
-                videos = [await save_ominilink_video_to_output(url, prefix="aiide_") for url in urls]
+                videos = await save_video_outputs(urls, saver=save_ominilink_video_to_output, prefix="aiide_")
             except HTTPException as exc:
                 raise HTTPException(exc.status_code, f"Aiide 视频已生成，但保存失败（任务 {task_id}），请勿重复生成："
                                     + str(exc.detail).replace("OminiLink", "Aiide")) from exc
@@ -15044,10 +15170,11 @@ async def generate_tencent_vod_video(payload, provider):
         return reference_to_data_url(ref)
 
     body = tencent_vod.video_request(payload, provider.get("tencent_sub_app_id"), resolve_reference)
+    mark_video_timing_stage("upstream")
     _, result = await tencent_vod.generate(tencent_vod_config(provider), body, kind="video", timeout=VIDEO_POLL_TIMEOUT)
     try:
         # Reuse the existing bounded, SSRF-safe media downloader (no provider credentials sent).
-        videos = [await save_ominilink_video_to_output(item["url"], prefix="tencent_vod_") for item in result["data"]]
+        videos = await save_video_outputs((item["url"] for item in result["data"]), saver=save_ominilink_video_to_output, prefix="tencent_vod_")
     except HTTPException as exc:
         raise HTTPException(exc.status_code, f"腾讯云任务已成功，但结果保存失败（任务 {result['task_id']}）："
                             + str(exc.detail).replace("OminiLink", "腾讯云 VOD")) from exc
@@ -15057,9 +15184,12 @@ async def generate_tencent_vod_video(payload, provider):
 
 async def run_canvas_video_task(task_id: str, payload: CanvasVideoRequest):
     """Run a long video request independently from the browser polling connection."""
+    progress = {"task_id": task_id, "started": time.monotonic()}
+    token = VIDEO_TASK_PROGRESS.set(progress)
     with CANVAS_TASK_LOCK:
         if task_id in CANVAS_TASKS:
             CANVAS_TASKS[task_id]["status"] = "running"
+            CANVAS_TASKS[task_id]["phase"] = "upstream"
             CANVAS_TASKS[task_id]["updated_at"] = time.time()
     try:
         result = await canvas_video(payload)
@@ -15090,6 +15220,23 @@ async def run_canvas_video_task(task_id: str, payload: CanvasVideoRequest):
                     "upstream_task_id": str(upstream_task_id or ""),
                     "updated_at": time.time(),
                 })
+    finally:
+        finished = time.monotonic()
+        mark_video_timing_stage("finished", finished)
+        download_started = progress.get("download_started", finished)
+        with CANVAS_TASK_LOCK:
+            task = CANVAS_TASKS.get(task_id)
+            if task is not None:
+                task["phase"] = task["status"]
+                task["downloaded_bytes"] = progress.get("downloaded_bytes", 0)
+                task["timings"] = {
+                    "version": 1,
+                    "stages_ms": {key: round(value) for key, value in progress.get("stages_ms", {}).items()},
+                    "upstream_ms": round((download_started - progress["started"]) * 1000),
+                    "download_ms": round((finished - download_started) * 1000),
+                    "total_ms": round((finished - progress["started"]) * 1000),
+                }
+        VIDEO_TASK_PROGRESS.reset(token)
 
 
 @app.post(

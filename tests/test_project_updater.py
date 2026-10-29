@@ -164,9 +164,10 @@ class ProgramUpdateTests(unittest.TestCase):
                 return "a" * 40, files
 
             result = updater.install(root, sys.executable, downloader=download)
-            self.assertEqual(result["version"], "2026.10.29.1")
+            self.assertEqual(result["version"], (source_root / "VERSION").read_text(encoding="utf-8-sig").strip())
             self.assertTrue((root / "motion_extractor/service.py").is_file())
             self.assertTrue((root / "project_updater.py").is_file())
+            self.assertTrue((root / "video_download.py").is_file())
             self.assertEqual((root / "API/.env").read_text(), "PRIVATE_KEY=local-only-placeholder")
             self.assertEqual((root / "data/canvas.json").read_text(), "private canvas")
             updater.rollback(root, Path(result["backup_dir"]).name)

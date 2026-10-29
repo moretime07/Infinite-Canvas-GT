@@ -53,6 +53,7 @@ const sandbox = {
     uid:() => 'pending-1',
     runSnapshot:node => ({node:{apiProvider:node.apiProvider, model:node.model}}),
     makePendingForRun:() => ({}),
+    nowMs:() => 1000, canvasVideoRunMeta:() => ({runMs:0, run:{}}),
     refreshRunNodes:() => {}, scheduleSave:() => {},
     waitCanvasVideoTaskResult:async () => ({videos:['/assets/output/video.mp4']}),
     collectRunMeta:() => ({runMs:0}), resultMediaUrls:result => result.videos || [], outputUrlValue:value => value,

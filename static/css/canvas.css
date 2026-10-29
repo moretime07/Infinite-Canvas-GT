@@ -633,6 +633,8 @@ input[type=range].canvas-range::-webkit-slider-runnable-track { height:3px; bord
 .output-time-pill { position:absolute; top:7px; right:7px; min-width:38px; height:22px; padding:0 8px; border-radius:999px; display:flex; align-items:center; justify-content:center; background:rgba(17,24,39,.86); color:#fff; font-size:10px; font-weight:900; z-index:3; pointer-events:none; box-shadow:0 6px 18px rgba(15,23,42,.18); }
 .output-time-pill.running { background:rgba(37,99,235,.9); }
 .output-time-pill.failed { background:rgba(100,116,139,.92); }
+.output-time-pill[title] { pointer-events:auto; cursor:help; }
+.output-video-stage { position:absolute; bottom:12px; left:8px; right:8px; text-align:center; color:var(--muted); font-size:11px; line-height:1.4; overflow-wrap:anywhere; pointer-events:none; }
 .output-img-wrap.recoverable { cursor:default; padding:12px; box-sizing:border-box; text-align:center; }
 .output-recover-state { width:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px; color:var(--text); }
 .output-recover-state i { width:22px; height:22px; color:var(--muted); }
@@ -925,6 +927,12 @@ body.theme-dark .minimap-viewport { border-color:#f8fafc; background:rgba(248,25
 .log-item { border:1px solid var(--line); border-radius:14px; background:var(--soft); padding:9px; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; }
 .log-item.failed { border-color:#fecaca; background:#fff7f7; }
 .log-main { min-width:0; }
+.log-timings { display:grid; grid-template-columns:repeat(auto-fit,minmax(155px,1fr)); gap:6px; margin:10px 0 6px; }
+.log-timing { display:flex; flex-direction:column; gap:4px; padding:8px 10px; border:1px solid var(--line); border-radius:9px; background:var(--card-solid); }
+.log-timing span { font-size:10px; color:var(--muted); }
+.log-timing strong { font-size:13px; font-variant-numeric:tabular-nums; color:var(--text); }
+.log-timing.total { border-color:rgba(99,102,241,.4); background:rgba(99,102,241,.08); }
+.log-timing-note { color:var(--muted); font-size:10px; line-height:1.6; margin-bottom:8px; }
 .log-meta { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:5px; }
 .log-chip { height:22px; border-radius:999px; padding:0 8px; display:flex; align-items:center; background:var(--card-solid); border:1px solid var(--line); color:var(--muted); font-size:10px; font-weight:900; }
 .log-chip.status-ok { background:rgba(16,185,129,.14); border-color:rgba(16,185,129,.28); color:#047857; }

@@ -1473,7 +1473,11 @@ function refreshOutputTimer(){
                 document.querySelectorAll('.output-time-pill.running').forEach(pill => {
                     const pendingId = pill.closest('[data-pending-id]')?.dataset.pendingId;
                     const pending = pendingById.get(pendingId);
-                    if(pending) pill.textContent = formatRunDuration(nowMs() - Number(pending.startedAt || nowMs()));
+                    if(pending){
+                        pill.textContent = formatRunDuration(nowMs() - Number(pending.startedAt || nowMs()));
+                        const stage = pill.closest('[data-pending-id]')?.querySelector('.output-video-stage');
+                        if(stage) stage.textContent = canvasVideoStageText(pending);
+                    }
                 });
             } else {
                 clearInterval(outputTimer);
@@ -4002,6 +4006,7 @@ const OUTPUT_EXPORT_DEFAULTS = Object.freeze({
     exportedOutputUrls: []
 });
 const outputExportRequests = new Set();
+const outputExportQueues = new Map();
 function ensureOutputExportSettings(node){
     if(!node || node.type !== 'output') return node;
     Object.entries(OUTPUT_EXPORT_DEFAULTS).forEach(([key, value]) => {
@@ -4084,9 +4089,17 @@ function bindOutputExportControls(body, node){
 }
 async function exportOutputNodeMedia(nodeId, options={}){
     const node = nodes.find(item => item.id === nodeId);
-    if(!node || node.type !== 'output' || outputExportRequests.has(nodeId)) return null;
+    if(!node || node.type !== 'output') return null;
     ensureOutputExportSettings(node);
     const requested = outputExportMediaItems(options.items || node.images);
+    if(outputExportRequests.has(nodeId)){
+        if(!options.manual){
+            const queued = outputExportQueues.get(nodeId) || new Map();
+            requested.forEach(item => queued.set(item.url, item));
+            outputExportQueues.set(nodeId, queued);
+        }
+        return null;
+    }
     const exported = new Set(node.exportedOutputUrls);
     const items = options.manual ? requested : requested.filter(item => !exported.has(item.url));
     if(!items.length){
@@ -4094,7 +4107,7 @@ async function exportOutputNodeMedia(nodeId, options={}){
         return null;
     }
     outputExportRequests.add(nodeId);
-    setOutputExportStatus(node, '正在导出到本机文件夹...', 'loading');
+    setOutputExportStatus(node, '正在导出到本机文件夹（同格式视频无损复制）...', 'loading');
     try {
         const response = await fetch('/api/canvas-output-export', {
             method:'POST',
@@ -4115,7 +4128,9 @@ async function exportOutputNodeMedia(nodeId, options={}){
         const completedUrls = (result.exported || []).map(item => item.url).filter(Boolean);
         node.exportedOutputUrls = [...new Set([...node.exportedOutputUrls, ...completedUrls])];
         const skipped = result.skipped?.length || 0;
-        setOutputExportStatus(node, `已导出 ${completedUrls.length} 项${skipped ? `，跳过 ${skipped} 项` : ''}`, skipped ? 'warning' : 'success');
+        const copied = (result.exported || []).filter(item => item.mode === 'copy').length;
+        const elapsed = Number.isFinite(result.elapsed_ms) ? `，耗时 ${(result.elapsed_ms / 1000).toFixed(1)} 秒` : '';
+        setOutputExportStatus(node, `已导出 ${completedUrls.length} 项${copied ? `（${copied} 个视频无损复制）` : ''}${skipped ? `，跳过 ${skipped} 项` : ''}${elapsed}`, skipped ? 'warning' : 'success');
         scheduleSave();
         return result;
     } catch(error) {
@@ -4123,6 +4138,11 @@ async function exportOutputNodeMedia(nodeId, options={}){
         return null;
     } finally {
         outputExportRequests.delete(nodeId);
+        const queued = outputExportQueues.get(nodeId);
+        outputExportQueues.delete(nodeId);
+        if(queued?.size && node.autoExport){
+            window.setTimeout(() => exportOutputNodeMedia(nodeId, {items:[...queued.values()]}), 0);
+        }
     }
 }
 function scheduleOutputNodeAutoExport(node, items){
@@ -6568,6 +6588,21 @@ function pendingOutputStyle(pending){
     if(!size) return '';
     return ` style="aspect-ratio:${Math.max(1, size.w)}/${Math.max(1, size.h)}"`;
 }
+function canvasVideoStageText(pending){
+    const en = langIsEn();
+    if(pending.videoPhase === 'downloading'){
+        const bytes = Number(pending.downloadedBytes || 0);
+        const total = Number(pending.downloadTotalBytes || 0);
+        const speed = Number(pending.downloadSpeedBps || 0);
+        const mode = pending.downloadMode === 'parallel' ? (en ? 'Parallel download' : '并行下载视频') : (en ? 'Downloading result' : '正在下载生成视频');
+        const size = bytes > 0 ? ` · ${(bytes / 1048576).toFixed(1)}${total > 0 ? ` / ${(total / 1048576).toFixed(1)}` : ''} MB` : '';
+        const percent = total > 0 ? ` · ${Math.min(100, Math.floor(bytes / total * 100))}%` : '';
+        const rate = speed > 0 ? ` · ${speed >= 1048576 ? (speed / 1048576).toFixed(1) + ' MB/s' : (speed / 1024).toFixed(0) + ' KB/s'}${en ? ' avg' : ' 平均'}` : '';
+        return mode + size + percent + rate;
+    }
+    if(pending.canvasTaskId) return en ? 'Upstream processing (includes queue / upload)' : '上游处理中（含排队 / 素材上传）';
+    return en ? 'Preparing references / submitting' : '准备参考素材 / 提交任务';
+}
 function renderPendingOutput(pending){
     if(pending?.paused){
         const message = pending.pauseMessage || (langIsEn()
@@ -6600,7 +6635,9 @@ function renderPendingOutput(pending){
             <button class="output-del" title="${tr('common.delete')}">×</button>
         </div>`;
     }
-    return `<div class="output-img-wrap loading-wrap" data-pending-id="${escapeAttr(pending.id)}"${pendingOutputStyle(pending)}><span class="output-time-pill running">${formatRunDuration(nowMs() - Number(pending.startedAt || nowMs()))}</span><div class="output-spinner"></div><button class="output-del" title="${tr('common.delete')}">×</button></div>`;
+    const stage = pending.run?.nodeType === 'video' || pending.canvasTaskType === 'video'
+        ? `<span class="output-video-stage">${escapeHtml(canvasVideoStageText(pending))}</span>` : '';
+    return `<div class="output-img-wrap loading-wrap" data-pending-id="${escapeAttr(pending.id)}"${pendingOutputStyle(pending)}><span class="output-time-pill running" title="${langIsEn() ? 'Total waiting time, not video duration' : '总等待时间，不是视频时长'}">${formatRunDuration(nowMs() - Number(pending.startedAt || nowMs()))}</span><div class="output-spinner"></div>${stage}<button class="output-del" title="${tr('common.delete')}">×</button></div>`;
 }
 function captureOutputScrolls(){
     const state = new Map();
@@ -10631,6 +10668,33 @@ async function rhBuildNodeInfoList(node, media){
     }
     return result;
 }
+function markRunningHubTiming(pending, stage){
+    if(!pending || pending.timingStage === stage) return;
+    const now = nowMs();
+    const run = pending.run || (pending.run = {});
+    const timings = run.timings || (run.timings = {source:'browser', stages_ms:{}});
+    const previous = pending.timingStage || 'prepare';
+    timings.stages_ms[previous] = (timings.stages_ms[previous] || 0) + Math.max(0, now - (pending.timingStartedAt ?? pending.startedAt ?? now));
+    pending.timingStage = stage;
+    pending.timingStartedAt = now;
+}
+function runningHubRunMeta(pending, result, recovered=false){
+    const runMs = Math.max(0, nowMs() - Number(pending?.startedAt || nowMs()));
+    const run = pending?.run || {};
+    // Older saved pending tasks have no phase boundaries: do not invent them.
+    if(pending?.timingStage && pending.timingStage !== 'finished'){
+        markRunningHubTiming(pending, 'finished');
+        const timings = run.timings;
+        const downloadMs = result?.timings?.download_ms;
+        if(Number.isFinite(downloadMs) && downloadMs >= 0 && Number.isFinite(timings.stages_ms.generate)){
+            timings.stages_ms.download = Math.min(downloadMs, timings.stages_ms.generate);
+            timings.stages_ms.generate -= timings.stages_ms.download;
+        }
+        timings.total_ms = runMs;
+        if(recovered) timings.recovered = true;
+    }
+    return {run, runMs};
+}
 async function runRhNode(nodeId, opts={}){
     const node = nodes.find(n => n.id === nodeId);
     if(!node || (node.running && !opts.cascade)) return;
@@ -10655,7 +10719,9 @@ async function runRhNode(nodeId, opts={}){
     const pendingId = uid('p');
     const run = runSnapshot(node, media.prompt || 'RunningHub', media.refs);
     run.taskLabel = 'RunningHub';
-    if(out) out._pending = [...(out._pending || []), makePendingForRun(pendingId, run, node, {refs:media.refs, cascadeTargetId})];
+    const pending = makePendingForRun(pendingId, run, node, {refs:media.refs, cascadeTargetId});
+    markRunningHubTiming(pending, 'prepare');
+    if(out) out._pending = [...(out._pending || []), pending];
     if(!opts.cascade) node.running = true;
     refreshRunNodes(node, out);
     try {
@@ -10665,6 +10731,7 @@ async function runRhNode(nodeId, opts={}){
         const body = mode === 'workflow'
             ? {workflowId:node.workflowId.trim(), nodeInfoList, useWallet:rhUseWallet(node), ...workflowExtras}
             : {webappId:node.webappId.trim(), nodeInfoList, instanceType:node.instanceType || '', useWallet:rhUseWallet(node)};
+        markRunningHubTiming(pending, 'submit');
         const submit = await cascadeFetch(endpoint, {
             method:'POST',
             headers:{'Content-Type':'application/json'},
@@ -10677,6 +10744,8 @@ async function runRhNode(nodeId, opts={}){
         const taskId = submit.taskId;
         if(!taskId) throw new Error(tr('canvas.rhNoTaskId'));
         run.request = {task_id:taskId, webappId:node.webappId, workflowId:node.workflowId, backend:'runninghub', mode};
+        markRunningHubTiming(pending, 'generate');
+        scheduleSave();
         let result = null;
         for(let i = 0; i < 720; i++){
             if(cascadeTargetId) ensureCascadeActive(cascadeTargetId);
@@ -10695,7 +10764,7 @@ async function runRhNode(nodeId, opts={}){
         if(!result) throw new Error(tr('canvas.rhTimeout'));
         const outputs = result.urls || [];
         if(!outputs.length) throw new Error(tr('canvas.rhOutputsEmpty'));
-        const meta = collectRunMeta(out, pendingId);
+        const meta = runningHubRunMeta(pending, result);
         if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
         appendOutputImages(out, outputs, media.refs[0], [meta]);
         mergeGeneratedOutputs(node, outputs, Boolean(opts.cascade));
@@ -10705,7 +10774,7 @@ async function runRhNode(nodeId, opts={}){
         refreshRunNodes(node, out);
         scheduleSave();
     } catch(err) {
-        const meta = collectRunMeta(out, pendingId);
+        const meta = runningHubRunMeta(pending);
         addGenerationLog({run, outputs:[], runMs:meta.runMs || 0, error:err.message || String(err)});
         if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
         if(isCascadeAbortError(err)){
@@ -11419,6 +11488,7 @@ async function runVideoNode(nodeId, opts={}){
     else refreshRunNodes(node, out);
     try {
         await prepareAiideVideoReferences(node, requestPayload, resolvedProvider, {cascadeTargetId});
+        pending.prepareMs = Math.max(0, nowMs() - pending.startedAt);
         const task = await createCanvasVideoTask(requestPayload, {cascadeTargetId});
         pending.canvasTaskId = task.task_id;
         pending.canvasTaskType = 'video';
@@ -11427,7 +11497,7 @@ async function runVideoNode(nodeId, opts={}){
         pending.paused = false;
         scheduleSave();
         const result = await waitCanvasVideoTaskResult(task.task_id, {cascadeTargetId});
-        const meta = collectRunMeta(out, pendingId);
+        const meta = canvasVideoRunMeta(pending, result);
         if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
         const outputUrls = resultMediaUrls(result).map(item => {
             const url = outputUrlValue(item);
@@ -11442,7 +11512,7 @@ async function runVideoNode(nodeId, opts={}){
         refreshRunNodes(node, out);
         scheduleSave();
     } catch(err) {
-        const meta = collectRunMeta(out, pendingId);
+        const meta = canvasVideoRunMeta(pending, err.taskData);
         if(isCascadeAbortError(err) && pending.canvasTaskId){
             pending.paused = true;
             pending.canvasTaskStatus = 'paused';
@@ -13021,6 +13091,62 @@ function logTaskLabel(log){
     }
     return log?.model || '-';
 }
+function normalizedRunTimings(timings){
+    if(!timings || typeof timings !== 'object') return null;
+    const result = {stages_ms:{}};
+    const valid = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+    // Persist only timing metadata, never arbitrary upstream data or credentials.
+    for(const key of ['prepare', 'submit', 'generate', 'upstream', 'download']){
+        if(valid(timings.stages_ms?.[key])) result.stages_ms[key] = Math.round(timings.stages_ms[key]);
+    }
+    for(const key of ['prepare_ms', 'upstream_ms', 'download_ms', 'total_ms']){
+        if(valid(timings[key])) result[key] = Math.round(timings[key]);
+    }
+    if(timings.source === 'browser') result.source = 'browser';
+    if(timings.recovered === true) result.recovered = true;
+    return Object.keys(result.stages_ms).length || Object.hasOwn(result, 'total_ms') ? result : null;
+}
+function formatTimingDuration(ms){
+    if(!Number.isFinite(ms) || ms < 0) return langIsEn() ? 'Not recorded' : '未记录';
+    if(ms < 1000) return `${Math.round(ms)} ms`;
+    const seconds = Math.round(ms / 100) / 10;
+    if(seconds < 60) return `${seconds.toFixed(1)} ${langIsEn() ? 's' : '秒'}`;
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes} ${langIsEn() ? 'min' : '分'} ${(seconds - minutes * 60).toFixed(1)} ${langIsEn() ? 's' : '秒'}`;
+}
+function logTimingRows(log){
+    const en = langIsEn();
+    const timing = normalizedRunTimings(log.timings);
+    const stages = timing?.stages_ms || {};
+    const rows = [];
+    const add = (label, value) => { if(Number.isFinite(value)) rows.push({label, value}); };
+    if(Object.keys(stages).length){
+        add(en ? 'Reference preparation / upload' : '素材准备 / 上传', stages.prepare);
+        add(Object.hasOwn(stages, 'generate')
+            ? (en ? 'Request submission' : '请求提交')
+            : (en ? 'Submission / generation (combined)' : '提交 / 生成（合计）'), stages.submit);
+        add(en ? 'Generation (incl. queue / polling)' : '素材生成（含排队 / 轮询）', stages.generate);
+        add(en ? 'Upstream (upload / queue / generation)' : '上游处理（上传 / 排队 / 生成）', stages.upstream);
+        add(en ? 'Result download / save' : '素材下载 / 保存', stages.download);
+    } else if(timing){
+        add(en ? 'Reference preparation / upload' : '素材准备 / 上传', timing.prepare_ms);
+        add(en ? 'Upstream (upload / queue / generation)' : '上游处理（上传 / 排队 / 生成）', timing.upstream_ms);
+        add(en ? 'Result download / save' : '素材下载 / 保存', timing.download_ms);
+    }
+    rows.push({label:en ? 'Total task time' : '任务总耗时', value:log.runMs, total:true});
+    return rows;
+}
+function renderLogTimings(log){
+    const en = langIsEn();
+    const rows = logTimingRows(log);
+    const timing = normalizedRunTimings(log.timings);
+    const notes = [en ? 'Until Output is ready; excludes folder export. Failed tasks show time spent before failure.' : '统计至 Output 结果就绪，不含文件夹导出；失败任务显示截至失败时的耗时。'];
+    if(rows.length === 1) notes.push(en ? 'Stage timings were not recorded for this task.' : '此记录未采集分阶段耗时。');
+    else notes.push(en ? 'Preparation includes preflight checks / consent; inline reference uploads are included in submission. Queue and generation cannot be separated without upstream metrics.' : '准备包含前置检查 / 上传确认；随请求发送的素材计入提交耗时。上游未提供明细时，排队和生成合并计时。');
+    if(timing?.source === 'browser') notes.push(en ? 'Measured by the browser; includes network / polling waits.' : '按浏览器观测计时，包含网络和轮询等待。');
+    if(timing?.recovered) notes.push(en ? 'Recovered task: elapsed time includes the offline / paused period.' : '恢复的任务：耗时包含离线 / 暂停等待期间。');
+    return `<div class="log-timings">${rows.map(row => `<div class="log-timing${row.total ? ' total' : ''}"><span>${escapeHtml(row.label)}</span><strong>${escapeHtml(formatTimingDuration(row.value))}</strong></div>`).join('')}</div><div class="log-timing-note">${escapeHtml(notes.join(' '))}</div>`;
+}
 function addGenerationLog({run, outputs=[], runMs=0, error=''}) {
     if(!canvas) return;
     canvas.logs = canvas.logs || [];
@@ -13036,6 +13162,7 @@ function addGenerationLog({run, outputs=[], runMs=0, error=''}) {
         outputs:(outputs || []).filter(Boolean),
         refs:run?.refs || [],
         runMs:Number(runMs || 0),
+        timings:normalizedRunTimings(run?.timings),
         error:error ? String(error) : '',
     };
     canvas.logs = [normalizeCanvasProviderSentinels(entry, entry.nodeType), ...serializableCanvasLogs(canvas.logs)].slice(0, 500);
@@ -13074,9 +13201,10 @@ function renderCanvasLog(){
                     <span class="log-chip ${log.status === 'failed' ? 'status-failed' : 'status-ok'}">${escapeHtml(log.status === 'failed' ? tr('canvas.failed') : tr('canvas.success'))}</span>
                     <span class="log-chip">${escapeHtml(log.platform || '-')}</span>
                     ${taskLabel ? `<span class="log-chip">${escapeHtml(taskLabel)}</span>` : ''}
-                    <span class="log-chip">${escapeHtml(formatRunDuration(log.runMs || 0))}</span>
+                    <span class="log-chip">${langIsEn() ? 'Total' : '总耗时'} ${escapeHtml(formatTimingDuration(log.runMs))}</span>
                 </div>
                 <div class="log-subline">${subParts.map(part => `<span title="${escapeAttr(part)}">${escapeHtml(part)}</span>`).join('')}</div>
+                ${renderLogTimings(log)}
                 ${log.error ? `<div class="log-error" title="${escapeAttr(log.error)}" data-error="${escapeAttr(log.error)}">${escapeHtml(log.error)}</div>` : ''}
                 <div class="log-prompt" title="${escapeAttr(log.prompt || tr('canvas.noPromptMeta'))}" data-prompt="${escapeAttr(log.prompt || '')}">${escapeHtml(log.prompt || tr('canvas.noPromptMeta'))}</div>
             </div>
@@ -13234,13 +13362,22 @@ async function waitCanvasVideoTaskResult(taskId, options={}){
             throw new Error(await responseErrorMessage(res, tr('canvas.videoFailed')));
         }
         const data = await res.json();
-        if(data.status === 'succeeded') return data.result || {};
+        const found = findPendingTask(taskId);
+        if(found){
+            found.pending.videoPhase = data.phase || 'upstream';
+            found.pending.downloadedBytes = data.downloaded_bytes || 0;
+            found.pending.downloadTotalBytes = data.download_total_bytes || 0;
+            found.pending.downloadSpeedBps = data.download_speed_bps || 0;
+            found.pending.downloadMode = data.download_mode || 'single';
+        }
+        if(data.status === 'succeeded') return {...(data.result || {}), ...(data.timings ? {timings:data.timings} : {})};
         if(data.status === 'failed'){
             const error = new Error(data.error || tr('canvas.videoFailed'));
             error.taskData = data;
             throw error;
         }
-        await sleep(1800);
+        // This polls our own server, not the paid upstream API.
+        await sleep(data.phase === 'downloading' ? 1000 : 1800);
     }
 }
 async function createCanvasComfyTask(payload, options={}){
@@ -13494,7 +13631,7 @@ async function pollRunningHubPending(pendingId){
                 const outputs = data.urls || [];
                 if(!outputs.length) throw new Error(tr('canvas.rhOutputsEmpty'));
                 const run = pending.run || {};
-                const meta = collectRunMeta(out, pendingId);
+                const meta = runningHubRunMeta(pending, data, true);
                 out._pending = (out._pending || []).filter(item => item.id !== pendingId);
                 appendOutputImages(out, outputs, run.refs?.[0], [meta]);
                 const gen = nodes.find(node => node.id === run?.node?.id);
@@ -13516,7 +13653,7 @@ async function pollRunningHubPending(pendingId){
         const pending = pendingById(out, pendingId);
         if(out && pending){
             const run = pending.run || {};
-            const meta = collectRunMeta(out, pendingId);
+            const meta = runningHubRunMeta(pending, undefined, true);
             out._pending = (out._pending || []).filter(item => item.id !== pendingId);
             const gen = nodes.find(node => node.id === run?.node?.id);
             if(gen){
@@ -13543,14 +13680,41 @@ function resumeRunningHubTasks(){
         });
     });
 }
+function canvasVideoRunMeta(pending, result){
+    const run = pending?.run || {};
+    let runMs = Math.max(0, nowMs() - Number(pending?.startedAt || nowMs()));
+    if(Number.isFinite(result?.timings?.total_ms)){
+        run.timings = {...result.timings, prepare_ms:Number(pending?.prepareMs || 0)};
+        if(result.timings.stages_ms){
+            run.timings.stages_ms = {...result.timings.stages_ms};
+            run.timings.stages_ms.prepare = (run.timings.stages_ms.prepare || 0) + run.timings.prepare_ms;
+        }
+        // Do not charge browser pauses / a later result recovery to generation time.
+        runMs = Math.max(0, result.timings.total_ms + run.timings.prepare_ms);
+    } else if(pending?.startedAt){
+        run.timings = {source:'browser', total_ms:runMs, stages_ms:{}};
+        if(Number.isFinite(pending.prepareMs)){
+            const prepare = Math.min(runMs, Math.max(0, pending.prepareMs));
+            run.timings.stages_ms = {prepare, upstream:runMs - prepare};
+        } else if(!pending.canvasTaskId) run.timings.stages_ms.prepare = runMs;
+    }
+    return {runMs, run};
+}
+function canvasVideoTimingTitle(meta){
+    const en = langIsEn();
+    let title = en ? 'Task time (not video duration; excludes folder export)' : '任务耗时（不是视频时长，不含文件夹导出）';
+    const timings = meta?.run?.timings;
+    if(timings){
+        title += '\n' + logTimingRows({timings, runMs:meta.runMs})
+            .map(row => `${row.label}: ${formatTimingDuration(row.value)}`).join('\n');
+    }
+    return title;
+}
 function completeCanvasVideoTask(taskId, result){
     const found = findPendingTask(taskId);
     if(!found) return;
     const {out, pending} = found;
-    const meta = {
-        runMs:nowMs() - Number(pending.startedAt || nowMs()),
-        run:pending.run || {},
-    };
+    const meta = canvasVideoRunMeta(pending, result);
     meta.run.request = requestMetaFromResult(result);
     const videos = resultMediaUrls(result).map(item => {
         const url = outputUrlValue(item);
@@ -13573,12 +13737,11 @@ function completeCanvasVideoTask(taskId, result){
     refreshRunNodes(gen, out);
     scheduleSave();
 }
-function failCanvasVideoTask(taskId, message){
+function failCanvasVideoTask(taskId, message, taskData){
     const found = findPendingTask(taskId);
     if(!found) return;
     const {out, pending} = found;
-    const run = pending.run || {};
-    const runMs = nowMs() - Number(pending.startedAt || nowMs());
+    const {run, runMs} = canvasVideoRunMeta(pending, taskData);
     out._pending = (out._pending || []).filter(p => p.id !== pending.id);
     const gen = nodes.find(n => n.id === run?.node?.id);
     if(gen){
@@ -13600,7 +13763,7 @@ async function pollCanvasVideoTask(taskId, options={}){
         return 'succeeded';
     } catch(err) {
         if(isCascadeAbortError(err)) return 'aborted';
-        failCanvasVideoTask(taskId, err.message || String(err));
+        failCanvasVideoTask(taskId, err.message || String(err), err.taskData);
         return 'failed';
     } finally {
         activeCanvasTaskPolls.delete(taskId);
@@ -13656,7 +13819,8 @@ function renderOutputMedia(item, useGridLayout=false){
     const kind = mediaKindForOutputItem(item);
     const grid = useGridLayout ? (meta.grid || null) : null;
     const gridStyle = grid ? ` style="grid-row:${Number(grid.row || 0) + 1};grid-column:${Number(grid.col || 0) + 1};aspect-ratio:${Math.max(1, Number(grid.w || 1))}/${Math.max(1, Number(grid.h || 1))}"` : '';
-    const timePill = meta.runMs && !meta.viewed ? `<span class="output-time-pill">${formatRunDuration(meta.runMs)}</span>` : '';
+    const timingTitle = kind === 'video' ? canvasVideoTimingTitle(meta) : (langIsEn() ? 'Task time' : '任务耗时');
+    const timePill = meta.runMs && !meta.viewed ? `<span class="output-time-pill" title="${escapeAttr(timingTitle)}">${formatRunDuration(meta.runMs)}</span>` : '';
     if(isMissingAssetUrl(url)){
         return `<div class="output-img-wrap" data-output-url="${safe}" data-missing-url="${safe}"${gridStyle}>${missingAssetHtml(url, true)}${timePill}<button class="output-del" title="${tr('common.delete')}">×</button></div>`;
     }

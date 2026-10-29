@@ -28,6 +28,7 @@ test('Wan video node sends its selected ratio and resolution without enabling up
         isOminiLinkProvider:() => false, outputForNode:() => null, uid:() => 'pending-1',
         runSnapshot:() => ({}), makePendingForRun:() => ({}), refreshRunNodes:() => {}, scheduleSave:() => {},
         prepareAiideVideoReferences:async () => {},
+        nowMs:() => 1000, canvasVideoRunMeta:() => ({runMs:0, run:{}}),
         createCanvasVideoTask:async payload => {
             requests.push(JSON.parse(JSON.stringify(payload)));
             return {task_id:'mock-task', status:'queued'};

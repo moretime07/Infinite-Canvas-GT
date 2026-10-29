@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -84,6 +85,8 @@ class CanvasOutputExportTests(unittest.TestCase):
                 self.assertEqual(os.path.dirname(first["path"]), os.path.abspath(video_dir))
                 self.assertNotEqual(first["name"], second["name"])
                 self.assertTrue(os.path.isfile(second["path"]))
+                self.assertEqual(first["mode"], "copy")
+                self.assertEqual(Path(source_path).read_bytes(), Path(first["path"]).read_bytes())
         finally:
             if os.path.exists(source_path):
                 os.remove(source_path)
@@ -115,11 +118,15 @@ class SaveRemoteVideoTests(unittest.IsolatedAsyncioTestCase):
         captured = {}
 
         class FakeResponse:
+            status_code = 200
             headers = {"Content-Type": "video/mp4"}
             content = b"\x00\x00\x00\x20ftypisomtest-video"
 
             def raise_for_status(self):
                 return None
+
+            async def aiter_bytes(self, chunk_size=None):
+                yield self.content
 
         class FakeClient:
             def __init__(self, *args, **kwargs):
@@ -131,9 +138,11 @@ class SaveRemoteVideoTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
-            async def get(self, url):
+            @asynccontextmanager
+            async def stream(self, method, url, **kwargs):
+                captured["method"] = method
                 captured["url"] = url
-                return FakeResponse()
+                yield FakeResponse()
 
         url = "https://openrouter.ai/api/v1/videos/task-id/content?index=0"
         saved_url = ""
