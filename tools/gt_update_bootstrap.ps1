@@ -1,5 +1,9 @@
 param([Parameter(Mandatory=$true)][string]$AppDir)
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = 'utf-8'
 $gtRoot = (Resolve-Path -LiteralPath $AppDir).Path
 if (-not (Test-Path -LiteralPath (Join-Path $gtRoot 'main.py'))) { throw 'Put this tool in the installed project folder (beside main.py).' }
 $gtPython = @((Join-Path $gtRoot '.venv\Scripts\python.exe'), (Join-Path $gtRoot 'python\python.exe')) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
