@@ -23,11 +23,11 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.06.23.1782155110"></script>
-    <script src="/static/js/theme.js?v=2026.06.23.1782155110"></script>
-    <script src="/static/js/i18n.js?v=2026.06.23.1784521788"></script>
+    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.10.29.1.1782155110"></script>
+    <script src="/static/js/theme.js?v=2026.10.29.1.1782155110"></script>
+    <script src="/static/js/i18n.js?v=2026.10.29.1.1784521788"></script>
     <style>
-        @import url('/static/vendor/css/fonts.css?v=2026.06.23.1782155110');
+        @import url('/static/vendor/css/fonts.css?v=2026.10.29.1.1782155110');
 
         /* 本地 Tailwind 工具类兜底：CDN 慢/未就绪时也能立刻给图标尺寸，避免首屏左侧栏空白 */
         .w-1\.5 { width: 0.375rem; }
@@ -1644,16 +1644,16 @@
         </script>
 
         <main class="stage">
-            <iframe id="frame-zimage" data-src="/static/zimage.html?v=2026.06.23.1784622820" class="active" scrolling="yes"></iframe>
-            <iframe id="frame-enhance" data-src="/static/enhance.html?v=2026.06.23.1784622820" scrolling="yes"></iframe>
-            <iframe id="frame-klein" data-src="/static/klein.html?v=2026.06.23.1784622820" scrolling="yes"></iframe>
-            <iframe id="frame-angle" data-src="/static/angle.html?v=2026.06.23.1784622820" scrolling="yes"></iframe>
-            <iframe id="frame-online" data-src="/static/online.html?v=2026.06.23.1784622820" scrolling="yes"></iframe>
-            <iframe id="frame-gpt-chat" data-src="/static/gpt-chat.html?v=2026.06.23.1784622820" scrolling="yes"></iframe>
-            <iframe id="frame-canvas" data-src="/static/canvas-list.html?v=2026.06.23.1784622820" scrolling="yes"></iframe>
-            <iframe id="frame-asset-manager" data-src="/static/asset-manager.html?v=2026.06.23.1784088472" scrolling="yes"></iframe>
-            <iframe id="frame-api-settings" data-src="/static/api-settings.html?v=2026.06.23.1793242467" scrolling="yes"></iframe>
-            <iframe id="frame-comfyui-settings" data-src="/static/comfyui-settings.html?v=2026.06.23.1784622820" scrolling="yes"></iframe>
+            <iframe id="frame-zimage" data-src="/static/zimage.html?v=2026.10.29.1.1784622820" class="active" scrolling="yes"></iframe>
+            <iframe id="frame-enhance" data-src="/static/enhance.html?v=2026.10.29.1.1793257217" scrolling="yes"></iframe>
+            <iframe id="frame-klein" data-src="/static/klein.html?v=2026.10.29.1.1784622820" scrolling="yes"></iframe>
+            <iframe id="frame-angle" data-src="/static/angle.html?v=2026.10.29.1.1793257217" scrolling="yes"></iframe>
+            <iframe id="frame-online" data-src="/static/online.html?v=2026.10.29.1.1784622820" scrolling="yes"></iframe>
+            <iframe id="frame-gpt-chat" data-src="/static/gpt-chat.html?v=2026.10.29.1.1793257217" scrolling="yes"></iframe>
+            <iframe id="frame-canvas" data-src="/static/canvas-list.html?v=2026.10.29.1.1793257217" scrolling="yes"></iframe>
+            <iframe id="frame-asset-manager" data-src="/static/asset-manager.html?v=2026.10.29.1.1793257217" scrolling="yes"></iframe>
+            <iframe id="frame-api-settings" data-src="/static/api-settings.html?v=2026.10.29.1.1793257217" scrolling="yes"></iframe>
+            <iframe id="frame-comfyui-settings" data-src="/static/comfyui-settings.html?v=2026.10.29.1.1793257217" scrolling="yes"></iframe>
 
         </main>
     </div>
@@ -1698,21 +1698,7 @@
                         </div>
                         <div class="connectivity-list" data-connectivity-source="github"></div>
                     </button>
-                    <button id="update-source-modelscope" class="update-source-card" type="button" data-update-source="modelscope" onclick="setUpdateSource('modelscope')">
-                        <div class="update-source-head">
-                            <div class="update-source-title">
-                                <strong>ModelScope 下载源</strong>
-                                <span>ModelScope 空间与版本文件，适合国内网络。</span>
-                            </div>
-                            <div class="update-source-head-right">
-                                <span class="update-source-check" aria-hidden="true">
-                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                                </span>
-                                <span class="update-source-badge">待测试</span>
-                            </div>
-                        </div>
-                        <div class="connectivity-list" data-connectivity-source="modelscope"></div>
-                    </button>
+
                 </div>
                 <div id="project-update-summary" class="update-modal-summary warn">
                     <span class="update-modal-dot" aria-hidden="true"></span>
@@ -1723,6 +1709,7 @@
                 </div>
             </div>
             <div class="studio-modal-actions">
+                <button id="project-update-rollback-btn" class="studio-modal-btn" type="button" onclick="rollbackProjectUpdate()">回滚程序</button>
                 <button id="connectivity-test-btn" class="studio-modal-btn" type="button" onclick="runUpdateConnectivityTest()">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
@@ -1764,11 +1751,11 @@
         const PAGE_IDS = ['zimage','enhance','klein','angle','online','gpt-chat','canvas','asset-manager','api-settings','comfyui-settings'];
         const LOCAL_PAGE_IDS = ['zimage','enhance','klein','angle'];
         const PROJECT_URL = 'https://github.com/moretime07/Infinite-Canvas-GT';
-        let appInfo = { version:'', repo_url:PROJECT_URL, version_url:'https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION' };
+        let appInfo = { version:'', repo_url:PROJECT_URL, version_url:'https://raw.githubusercontent.com/moretime07/Infinite-Canvas-GT/main/VERSION' };
         let updateConnectivityResult = null;
         let projectUpdateRunning = false;
         let projectUpdateAbort = null;  // 当前更新请求的 AbortController，便于用户中途取消
-        let updateSource = localStorage.getItem('studio_update_source') || 'github';
+        let updateSource = 'github'; // Do not inherit another fork's stored source.
         let projectUpdateNotes = null;
 
         function setSidebarPinned(pinned, options = {}) {
@@ -2196,11 +2183,11 @@
         }
 
         function updateSourceLabel(source = updateSource) {
-            return source === 'modelscope' ? 'ModelScope' : 'GitHub';
+            return 'GitHub · Infinite-Canvas-GT';
         }
 
         function setUpdateSource(source) {
-            updateSource = source === 'modelscope' ? 'modelscope' : 'github';
+            updateSource = 'github';
             localStorage.setItem('studio_update_source', updateSource);
             refreshProjectUpdateModalText();
         }
@@ -2216,14 +2203,8 @@
             return {source, ok:okRequired, avg, okItems:okItems.length, total:sourceItems.length};
         }
 
-        function bestUpdateSourceFromConnectivity(data) {
-            const results = data?.results || [];
-            const github = sourceConnectivityStats('github', results);
-            const ms = sourceConnectivityStats('modelscope', results);
-            if(github.ok && ms.ok) return ms.avg < github.avg ? 'modelscope' : 'github';
-            if(ms.ok) return 'modelscope';
-            if(github.ok) return 'github';
-            return updateSource;
+        function bestUpdateSourceFromConnectivity() {
+            return 'github';
         }
 
         function updateTargetLabel(name) {
@@ -2262,17 +2243,11 @@
         }
 
         function updateConnectivityTargets() {
-            const sources = appInfo.sources || {};
-            const github = sources.github || {};
-            const ms = sources.modelscope || {};
+            const github = (appInfo.sources || {}).github || {};
             return [
-                { name:'GitHub 更新列表', url:github.tree_url || appInfo.tree_url || 'https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1', source:'github', required:true },
-                { name:'GitHub 版本文件', url:github.version_url || appInfo.version_url || 'https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION', source:'github', required:true },
-                { name:'GitHub 主页', url:'https://github.com/', source:'github' },
-                { name:'ModelScope 版本文件', url:ms.version_url || 'https://www.modelscope.cn/api/v1/studio/Daniel8152/Infinite-Canvas/repo?Revision=master&FilePath=VERSION', source:'modelscope', required:true },
-                { name:'ModelScope 空间页面', url:ms.repo_url || 'https://modelscope.cn/studios/Daniel8152/Infinite-Canvas', source:'modelscope' },
-                { name:'ModelScope 主页', url:'https://modelscope.cn/', source:'modelscope' },
-                { name:'Google 连通性', url:'https://www.google.com/generate_204', source:'reference' },
+                {name:'GitHub 更新列表', url:github.tree_url || 'https://api.github.com/repos/moretime07/Infinite-Canvas-GT/git/trees/main?recursive=1', source:'github', required:true},
+                {name:'GitHub 版本文件', url:github.version_url || 'https://raw.githubusercontent.com/moretime07/Infinite-Canvas-GT/main/VERSION', source:'github', required:true},
+                {name:'GitHub 主页', url:'https://github.com/', source:'github'}
             ];
         }
 
@@ -2345,8 +2320,8 @@
                 }
             });
             if(copyEl) copyEl.textContent = updateUiText(
-                `将从 ${sourceName} 更新 main.py、VERSION 和 static 文件。更新前会自动备份，更新完成后后端会自动重启。当前 ${versionLabel(localVersion)}，最新 ${versionLabel(remoteVersion || localVersion)}。`,
-                `This updates main.py, VERSION, and static files from ${sourceName}. A backup is created first, then the backend restarts automatically. Current ${versionLabel(localVersion)}, latest ${versionLabel(remoteVersion || localVersion)}.`
+                `请先保存画布并等待生成任务完成。将从 ${sourceName} 完整更新程序、内置工作流及所需依赖；不覆盖密钥、画布、素材。程序修改会先备份，失败恢复，完成后自动重启。当前 ${versionLabel(localVersion)}，最新 ${versionLabel(remoteVersion || localVersion)}。`,
+                `Save the canvas and wait for jobs to finish. Update all program files, built-in workflows and dependencies from ${sourceName}; keep keys, canvases and media. Code is backed up before replacement, then the backend restarts. Current ${versionLabel(localVersion)}, latest ${versionLabel(remoteVersion || localVersion)}.`
             );
             if(testText) testText.textContent = updateConnectivityResult ? updateUiText('重新测试', 'Retest') : updateUiText('测试连通性', 'Test connectivity');
             if(cancelText) cancelText.textContent = updateUiText('取消', 'Cancel');
@@ -2360,8 +2335,8 @@
                     'warn',
                     updateUiText('建议先测试连通性', 'Connectivity test recommended'),
                     updateUiText(
-                        '测试会同时测速 GitHub 和 ModelScope。你可以根据结果切换下载源。',
-                        'The test checks both GitHub and ModelScope. Choose the faster reachable source before updating.'
+                        '仅从 moretime07/Infinite-Canvas-GT 下载，不回退到其他仓库。请在部署电脑本机更新。',
+                        'Only moretime07/Infinite-Canvas-GT is used, with no other fork as fallback. Update on the host computer.'
                     )
                 );
             } else if(updateConnectivityResult.backend_missing) {
@@ -2555,6 +2530,7 @@
         }
 
         async function confirmProjectUpdate() {
+            if(projectUpdateRunning) return;
             const isEn = window.StudioI18n?.lang?.() === 'en';
             const btn = document.getElementById('update-now-btn');
             const text = document.getElementById('update-now-text');
@@ -2566,18 +2542,20 @@
             if(btn) btn.disabled = true;
             if(confirmBtn) confirmBtn.disabled = true;
             if(testBtn) testBtn.disabled = true;
+            const rollbackBtn = document.getElementById('project-update-rollback-btn');
+            if(rollbackBtn) rollbackBtn.disabled = true;
             if(text) text.textContent = isEn ? 'Updating...' : '更新中...';
             if(confirmText) confirmText.textContent = isEn ? 'Updating...' : '更新中...';
             const sourceName = updateSourceLabel();
             setUpdateSummary('warn', isEn ? 'Updating' : '正在更新', isEn ? `Downloading files from ${sourceName} and creating a local backup.` : `正在从 ${sourceName} 下载文件，并创建本地备份。`);
             // 客户端兜底超时：即使后端异常挂起，UI 也能恢复，不会永远停在「更新中」
             const ac = new AbortController();
-            const killer = setTimeout(() => ac.abort(), 300000);
+            const killer = setTimeout(() => ac.abort(), 600000);
             try {
                 const res = await fetch('/api/update-from-github', {
                     method:'POST',
-                    headers:{'Content-Type':'application/json'},
-                    body:JSON.stringify({ auto_restart:true, restart_delay:3, source:updateSource, fallback:true }),
+                    headers:{'Content-Type':'application/json', 'X-Infinite-Canvas-Restart':'1'},
+                    body:JSON.stringify({ auto_restart:true, restart_delay:3, source:'github', fallback:false }),
                     signal:ac.signal
                 });
                 const data = await res.json().catch(() => ({}));
@@ -2604,10 +2582,10 @@
                 document.getElementById('github-entry-btn')?.classList.remove('update-available');
                 btn?.classList.remove('show');
                 setProjectVersionBadge(data.version || document.getElementById('github-entry-btn')?.dataset.remoteVersion || appInfo.version);
-                if(restarting) waitForBackendAndReload();
+                if(restarting) await waitForBackendAndReload(data.previous_instance_id);
             } catch(e) {
                 const msg = (e && e.name === 'AbortError')
-                    ? (isEn ? 'Update timed out. Switch source or check your network, then retry.' : '更新超时。请切换下载源或检查网络后重试。')
+                    ? (isEn ? 'Request timed out; the backend may still be updating. Do not repeat the update yet.' : '请求超时，后台可能仍在更新，请勿立即重复点击或关闭服务。')
                     : describeNetworkError(e, isEn);
                 setUpdateSummary('fail', isEn ? 'Update failed' : '更新失败', msg);
             } finally {
@@ -2616,23 +2594,29 @@
                 if(btn) btn.disabled = false;
                 if(confirmBtn) confirmBtn.disabled = false;
                 if(testBtn) testBtn.disabled = false;
+                if(rollbackBtn) rollbackBtn.disabled = false;
                 if(text) text.textContent = oldText || (isEn ? 'Update' : '一键更新');
                 if(confirmText) confirmText.textContent = isEn ? 'Start update' : '开始更新';
                 refreshUpdateButtonText();
             }
         }
-        async function waitForBackendAndReload() {
-            const deadline = Date.now() + 90 * 1000;
+        async function waitForBackendAndReload(previousInstance) {
+            const deadline = Date.now() + 120 * 1000;
             await new Promise(r => setTimeout(r, 4000));
             while(Date.now() < deadline) {
                 try {
-                    const r = await fetch('/api/app-info', { cache:'no-store' });
-                    if(r.ok) { location.reload(); return; }
+                    const r = await fetch('/api/system/status', {cache:'no-store'});
+                    const status = r.ok ? await r.json() : {};
+                    if(status.ok && status.instance_id && status.instance_id !== previousInstance) {
+                        location.reload(); return;
+                    }
                 } catch {}
                 await new Promise(r => setTimeout(r, 1500));
             }
+            setUpdateSummary('fail', '后端未恢复', '请运行启动服务.bat 查看启动错误；程序备份在 data/update_backups。');
         }
         async function rollbackProjectUpdate() {
+            if(projectUpdateRunning) return;
             const isEn = window.StudioI18n?.lang?.() === 'en';
             try {
                 const list = await fetch('/api/update-backups').then(r => r.json());
@@ -2653,7 +2637,7 @@
                 if(!confirm(isEn ? `Restore "${target.name}"? Backend will restart.` : `要还原 "${target.name}" 吗？后端会自动重启。`)) return;
                 const res = await fetch('/api/update-rollback', {
                     method:'POST',
-                    headers:{'Content-Type':'application/json'},
+                    headers:{'Content-Type':'application/json', 'X-Infinite-Canvas-Restart':'1'},
                     body:JSON.stringify({ name:target.name, auto_restart:true, restart_delay:3 })
                 });
                 const data = await res.json().catch(() => ({}));
@@ -2661,7 +2645,7 @@
                 alert(isEn
                     ? `Restored ${data.count || 0} files. Backend is restarting.`
                     : `已还原 ${data.count || 0} 个文件。后端正在重启。`);
-                if(data.restart_scheduled) waitForBackendAndReload();
+                if(data.restart_scheduled) await waitForBackendAndReload(data.previous_instance_id);
             } catch(e) {
                 alert((isEn ? 'Rollback failed: ' : '回滚失败：') + describeNetworkError(e, isEn));
             }
@@ -2696,7 +2680,7 @@
                     const sources = appInfo.sources || {};
                     const candidates = [
                         {source:'github', url:sources.github?.version_url || appInfo.version_url || ''},
-                        {source:'modelscope', url:sources.modelscope?.version_url || ''},
+                        // GT has no ModelScope mirror; never mix forks.
                     ].filter(item => item.url);
                     for(const item of candidates) {
                         try {
@@ -2708,7 +2692,7 @@
                 }
                 const hasUpdate = !!(current && best?.version && compareVersions(best.version, current) > 0);
                 if(hasUpdate) {
-                    if(best.source === 'modelscope') setUpdateSource('modelscope');
+                    setUpdateSource('github');
                     setProjectUpdateNotes(best.update_notes || null);
                     showUpdateNotice(current, best.version);
                 }
@@ -2716,9 +2700,10 @@
                     if(hasUpdate) {
                         openProjectUpdateModal();
                     } else if(reachable) {
-                        alert(isEn ? `You are on the latest version (${versionLabel(current)}).` : `已是最新版本（${versionLabel(current)}）。`);
+                        openProjectUpdateModal();
+                        setUpdateSummary('ok', isEn ? 'Up to date' : '当前已是最新版本', isEn ? 'You can reinstall this version or restore a local code backup.' : '可以重新安装当前版本，或点击“回滚程序”恢复本地程序备份。');
                     } else {
-                        alert(isEn ? 'Could not reach GitHub or ModelScope. Check your network/proxy and try again.' : '无法连接 GitHub 或 ModelScope 更新源，请检查网络或代理后重试。');
+                        alert(isEn ? 'Cannot reach the GT GitHub repository. Check your network/proxy.' : '无法连接 GT GitHub 更新源，请检查网络或代理后重试。');
                     }
                 }
             } catch(e) {

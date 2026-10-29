@@ -35,6 +35,7 @@ from threading import Lock, Thread
 import httpx
 import tencent_vod
 import aiide_video
+import project_updater
 from PIL import Image, ImageOps
 from io import BytesIO
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, Request
@@ -240,20 +241,13 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.06.03"
+APP_VERSION = "2026.10.29.1"
 GITHUB_REPO_URL = "https://github.com/moretime07/Infinite-Canvas-GT"
-GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
-GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
-GITHUB_RAW_ROOT = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main"
+GITHUB_VERSION_URL = "https://raw.githubusercontent.com/moretime07/Infinite-Canvas-GT/main/VERSION"
+GITHUB_TREE_URL = "https://api.github.com/repos/moretime07/Infinite-Canvas-GT/git/trees/main?recursive=1"
+GITHUB_RAW_ROOT = "https://raw.githubusercontent.com/moretime07/Infinite-Canvas-GT/main"
 GITHUB_UPDATE_NOTES_URL = GITHUB_RAW_ROOT + "/static/update-notes.json"
-MODELSCOPE_REPO_URL = "https://modelscope.ai/studios/daniel8152/Infinite-Canvas"
-MODELSCOPE_RAW_ROOT = "https://www.modelscope.ai/studios/daniel8152/Infinite-Canvas/raw/main"
-# ModelScope 仓库默认分支为 master；raw 网页路径会返回 HTML，必须用仓库文件 API 才能拿到纯文本
-# 注意：.ai 站命名空间为小写 daniel8152，API 路径大小写敏感（推送/文件 API 用大写会 404/拒绝）
-MODELSCOPE_FILE_API_ROOT = "https://www.modelscope.ai/api/v1/studio/daniel8152/Infinite-Canvas/repo?Revision=master&FilePath="
-MODELSCOPE_VERSION_URL = MODELSCOPE_FILE_API_ROOT + "VERSION"
-MODELSCOPE_UPDATE_NOTES_URL = MODELSCOPE_FILE_API_ROOT + "static/update-notes.json"
-MODELSCOPE_TREE_URL = "https://www.modelscope.ai/api/v1/studio/daniel8152/Infinite-Canvas/repo/files?Revision=master&Recursive=true"
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -346,6 +340,25 @@ LOAD_LOCK = Lock()
 RUNNINGHUB_WORKFLOW_LOCK = Lock()
 NEXT_TASK_ID = 1
 UPDATE_LOCK = Lock()
+UPDATE_ACTIVE_REQUESTS = 0
+
+
+@app.middleware("http")
+async def protect_program_update(request: Request, call_next):
+    global UPDATE_ACTIVE_REQUESTS
+    if request.url.path == "/api/system/restart" and UPDATE_LOCK.locked():
+        return JSONResponse(status_code=409, content={"detail": "正在更新程序，暂时不能重启。"})
+    mutating = request.method not in {"GET", "HEAD", "OPTIONS"} and request.url.path.startswith("/api/")
+    control = request.url.path in {"/api/update-from-github", "/api/update-rollback", "/api/system/restart"}
+    if mutating and not control:
+        if UPDATE_LOCK.locked() or BACKEND_RESTART_SCHEDULED:
+            return JSONResponse(status_code=409, content={"detail": "正在更新程序，请稍后再操作。"})
+        UPDATE_ACTIVE_REQUESTS += 1
+    try:
+        return await call_next(request)
+    finally:
+        if mutating and not control:
+            UPDATE_ACTIVE_REQUESTS -= 1
 JIMENG_LOGIN_SESSION = {
     "proc": None,
     "stdout": "",
@@ -1746,32 +1759,9 @@ def fetch_remote_update_notes(url: str, version: str = "", timeout: float = 5.0)
     return info
 
 def fetch_update_notes_with_fallback(preferred_source: str, version: str, timeout: float = 3.0) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    urls = {
-        "github": GITHUB_UPDATE_NOTES_URL,
-        "modelscope": MODELSCOPE_UPDATE_NOTES_URL,
-    }
-    preferred = preferred_source if preferred_source in urls else "github"
-    order = [preferred, "modelscope" if preferred == "github" else "github"]
-    notes_by_source: Dict[str, Any] = {}
-    best_notes: Dict[str, Any] = {"version": version, "items": []}
-    for source in order:
-        notes = fetch_remote_update_notes(urls[source], version, timeout=timeout)
-        notes["source"] = source
-        notes_by_source[source] = notes
-        if notes.get("ok") and (notes.get("items") or []):
-            best_notes = notes
-            break
-    for source, url in urls.items():
-        if source not in notes_by_source:
-            notes_by_source[source] = {
-                "ok": False,
-                "error": "未尝试：已有更新说明可用" if best_notes.get("items") else "未尝试",
-                "url": url,
-                "source": source,
-                "version": version,
-                "items": [],
-            }
-    return best_notes, notes_by_source
+    notes = fetch_remote_update_notes(GITHUB_UPDATE_NOTES_URL, version, timeout=timeout)
+    notes["source"] = "github"
+    return notes, {"github": notes}
 
 def versioned_static_html(html: str) -> str:
     version = current_app_version()
@@ -1955,13 +1945,6 @@ def app_info():
                 "tree_url": GITHUB_TREE_URL,
                 "update_notes_url": GITHUB_UPDATE_NOTES_URL,
             },
-            "modelscope": {
-                "label": "ModelScope",
-                "repo_url": MODELSCOPE_REPO_URL,
-                "version_url": MODELSCOPE_VERSION_URL,
-                "tree_url": MODELSCOPE_TREE_URL,
-                "update_notes_url": MODELSCOPE_UPDATE_NOTES_URL,
-            },
         },
         "update_notes": read_local_update_notes(version),
     }
@@ -2038,9 +2021,6 @@ def update_connectivity_targets() -> List[Tuple[str, str, str, bool]]:
         ("GitHub 更新列表", GITHUB_TREE_URL, "github", True),
         ("GitHub 版本文件", GITHUB_VERSION_URL, "github", True),
         ("GitHub 主页", "https://github.com/", "github", False),
-        ("ModelScope 版本文件", MODELSCOPE_VERSION_URL, "modelscope", True),
-        ("ModelScope 空间页面", MODELSCOPE_REPO_URL, "modelscope", False),
-        ("ModelScope 主页", "https://modelscope.cn/", "modelscope", False),
         ("Google 连通性", "https://www.google.com/generate_204", "reference", False),
     ]
 
@@ -2065,7 +2045,7 @@ def update_connectivity():
         item["required"] = required
         results.append(item)
     sources = {}
-    for source in ("github", "modelscope"):
+    for source in ("github",):
         source_required = [item for item in results if item.get("source") == source and item.get("required")]
         sources[source] = {
             "ok": all(item["ok"] for item in source_required),
@@ -2076,7 +2056,7 @@ def update_connectivity():
         "results": results,
         "sources": sources,
         "required": sources["github"]["required"],
-        "optional": ["GitHub 主页", "ModelScope 空间页面", "ModelScope 主页", "Google 连通性"],
+        "optional": ["GitHub 主页", "Google 连通性"],
     }
 
 def fetch_remote_version(url: str, timeout: float = 5.0) -> Dict[str, Any]:
@@ -2120,50 +2100,20 @@ def version_gt(a: str, b: str) -> bool:
 
 @app.get("/api/check-update")
 def check_update():
-    """服务端检测 GitHub 与 ModelScope 两个源的远端版本（走系统代理，避免浏览器跨域/被墙）。"""
     current = current_app_version()
-    # 并发检测两个源，避免串行 8s+8s 拖慢首屏更新提示
-    holder: Dict[str, Dict[str, Any]] = {}
-    def _probe(key: str, url: str):
-        item = fetch_remote_version(url, timeout=5.0)
-        item["source"] = key
-        holder[key] = item
-    threads = [
-        Thread(target=_probe, args=("github", GITHUB_VERSION_URL), daemon=True),
-        Thread(target=_probe, args=("modelscope", MODELSCOPE_VERSION_URL), daemon=True),
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=5.5)
-    github = holder.get("github") or {"version": "", "ok": False, "error": "检测超时（超过 5s）", "url": GITHUB_VERSION_URL, "source": "github"}
-    modelscope = holder.get("modelscope") or {"version": "", "ok": False, "error": "检测超时（超过 5s）", "url": MODELSCOPE_VERSION_URL, "source": "modelscope"}
-    best: Dict[str, Any] = {}
-    for item in (github, modelscope):
-        if item["ok"] and item["version"]:
-            if not best or version_gt(item["version"], best["version"]):
-                best = {"source": item["source"], "version": item["version"]}
-    update_available = bool(best and version_gt(best["version"], current))
-    notes_by_source: Dict[str, Any] = {}
-    if best and best.get("version"):
-        best_notes, notes_by_source = fetch_update_notes_with_fallback(str(best.get("source") or "github"), best["version"], timeout=3.0)
-        best["update_notes"] = best_notes if best_notes.get("ok") else {"version": best["version"], "items": []}
-    return {
-        "current": current,
-        "github": github,
-        "modelscope": modelscope,
-        "latest": best,
-        "update_notes": best.get("update_notes") if best else {},
-        "update_notes_sources": notes_by_source,
-        "update_available": update_available,
-        "reachable": bool(github["ok"] or modelscope["ok"]),
-    }
+    github = fetch_remote_version(GITHUB_VERSION_URL, timeout=5.0)
+    github["source"] = "github"
+    best = {"source": "github", "version": github["version"]} if github["ok"] else {}
+    notes, sources = fetch_update_notes_with_fallback("github", best["version"]) if best else ({}, {})
+    if best:
+        best["update_notes"] = notes
+    return {"current": current, "github": github, "latest": best,
+            "update_notes": notes, "update_notes_sources": sources,
+            "update_available": bool(best and version_gt(best["version"], current)),
+            "reachable": github["ok"]}
 
 def update_allowed_file(path: str) -> bool:
-    path = str(path or "").replace("\\", "/").lstrip("/")
-    if not path or any(part in {"", ".", ".."} for part in path.split("/")):
-        return False
-    return path in {"main.py", "VERSION"} or path.startswith("static/")
+    return project_updater.allowed_file(path)
 
 # 缓存 GitHub Tree API 响应（含 ETag），减少 60 次/h 限流压力
 GITHUB_TREE_CACHE: Dict[str, Any] = {"etag": "", "data": None, "expires_at": 0.0}
@@ -2215,61 +2165,7 @@ def github_bytes(url: str) -> bytes:
     resp = github_get(url, headers={"User-Agent": "Infinite-Canvas-Updater"}, timeout=60)
     return resp.content
 
-def download_github_update_files(files: List[str], staging_root: str) -> None:
-    staging_root_abs = os.path.abspath(staging_root)
-    for rel in files:
-        safe_update_target(rel)
-        raw_url = f"{GITHUB_RAW_ROOT}/{urllib.parse.quote(rel, safe='/')}"
-        data = github_bytes(raw_url)
-        stage_path = os.path.abspath(os.path.join(staging_root_abs, *rel.split("/")))
-        if os.path.commonpath([staging_root_abs, stage_path]) != staging_root_abs:
-            raise ValueError(f"更新暂存路径不安全：{rel}")
-        os.makedirs(os.path.dirname(stage_path), exist_ok=True)
-        with open(stage_path, "wb") as f:
-            f.write(data)
 
-def modelscope_update_file_list() -> List[str]:
-    """通过 ModelScope 仓库文件 API 列出所有允许更新的文件（不依赖 git）。"""
-    resp = github_get(MODELSCOPE_TREE_URL, headers={"User-Agent": "Infinite-Canvas-Updater"}, timeout=30)
-    payload = json.loads(resp.content.decode("utf-8", errors="replace"))
-    files_node = ((payload.get("Data") or {}).get("Files")) or []
-    out: List[str] = []
-    for entry in files_node:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("Type") != "blob":
-            continue
-        path = str(entry.get("Path") or "").replace("\\", "/")
-        if update_allowed_file(path):
-            out.append(path)
-    return sorted(set(out))
-
-def modelscope_file_bytes(rel: str) -> bytes:
-    url = MODELSCOPE_FILE_API_ROOT + urllib.parse.quote(rel, safe="/")
-    resp = github_get(url, headers={"User-Agent": "Infinite-Canvas-Updater"}, timeout=60)
-    return resp.content
-
-def download_modelscope_update_files(staging_root: str) -> List[str]:
-    # 用 HTTP 仓库文件 API 下载（与 GitHub raw 同样思路），不依赖本机安装 Git。
-    # 之前用 git clone 会要求目标机装 Git for Windows，很多用户没装 → 一键更新失败。
-    files = modelscope_update_file_list()
-    if not files:
-        raise RuntimeError("ModelScope 未返回任何文件")
-    if "main.py" not in files or "VERSION" not in files:
-        raise RuntimeError("ModelScope 更新源缺少 main.py 或 VERSION")
-    if not any(f.startswith("static/") for f in files):
-        raise RuntimeError("ModelScope 未返回 static 文件，已取消更新")
-    staging_root_abs = os.path.abspath(staging_root)
-    for rel in files:
-        safe_update_target(rel)
-        data = modelscope_file_bytes(rel)
-        stage_path = os.path.abspath(os.path.join(staging_root_abs, *rel.split("/")))
-        if os.path.commonpath([staging_root_abs, stage_path]) != staging_root_abs:
-            raise ValueError(f"更新暂存路径不安全：{rel}")
-        os.makedirs(os.path.dirname(stage_path), exist_ok=True)
-        with open(stage_path, "wb") as f:
-            f.write(data)
-    return files
 
 def safe_update_target(path: str) -> str:
     rel = str(path or "").replace("\\", "/").lstrip("/")
@@ -2397,386 +2293,98 @@ def schedule_backend_restart(delay_seconds: float = 1.5) -> bool:
         return False
 
 
-def schedule_self_restart(delay_seconds: int = 3) -> bool:
-    """派生脱离父进程的小脚本，等几秒后启动启动服务脚本，并干掉当前 PID。"""
-    delay = max(1, int(delay_seconds or 3))
-    pid = os.getpid()
-    try:
-        if os.name == "nt":
-            launcher = os.path.join(BASE_DIR, "启动服务.bat")
-            if not os.path.exists(launcher):
-                launcher = os.path.join(BASE_DIR, "start.bat")
-            bat_path = os.path.join(BASE_DIR, "_self_restart.bat")
-            log_path = os.path.join(BASE_DIR, "_self_restart.log")
-            script = (
-                "@echo off\r\n"
-                "chcp 65001 >nul\r\n"
-                "setlocal\r\n"
-                f"set \"APP_DIR={BASE_DIR}\"\r\n"
-                f"set \"LAUNCHER={launcher}\"\r\n"
-                f"set \"LOG_FILE={log_path}\"\r\n"
-                "echo [%date% %time%] restart scheduled >> \"%LOG_FILE%\"\r\n"
-                f"timeout /t {delay} /nobreak >nul\r\n"
-                "echo [%date% %time%] stopping old process >> \"%LOG_FILE%\"\r\n"
-                f"taskkill /F /PID {pid} >nul 2>&1\r\n"
-                "timeout /t 2 /nobreak >nul\r\n"
-                "cd /d \"%APP_DIR%\"\r\n"
-                "if exist \"%LAUNCHER%\" (\r\n"
-                "  echo [%date% %time%] starting launcher: %LAUNCHER% >> \"%LOG_FILE%\"\r\n"
-                "  start \"ComfyUI-API-Modelscope\" /D \"%APP_DIR%\" cmd /k call \"%LAUNCHER%\"\r\n"
-                ") else (\r\n"
-                "  echo [%date% %time%] launcher missing, fallback to python main.py >> \"%LOG_FILE%\"\r\n"
-                "  if exist \"%APP_DIR%\\python\\python.exe\" (\r\n"
-                "    start \"ComfyUI-API-Modelscope\" /D \"%APP_DIR%\" cmd /k \"\"%APP_DIR%\\python\\python.exe\" main.py\"\r\n"
-                "  ) else (\r\n"
-                "    start \"ComfyUI-API-Modelscope\" /D \"%APP_DIR%\" cmd /k python main.py\r\n"
-                "  )\r\n"
-                ")\r\n"
-                "del \"%~f0\"\r\n"
-            )
-            with open(bat_path, "w", encoding="utf-8") as f:
-                f.write(script)
-            subprocess.Popen(
-                ["cmd", "/c", bat_path],
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-                close_fds=True,
-            )
-        else:
-            launcher = os.path.join(BASE_DIR, "mac-启动服务.command")
-            if not os.path.exists(launcher):
-                launcher = os.path.join(BASE_DIR, "start.sh")
-            sh_path = os.path.join(BASE_DIR, "_self_restart.sh")
-            script = (
-                "#!/bin/sh\n"
-                f"sleep {delay}\n"
-                f"kill -9 {pid} 2>/dev/null\n"
-                f"cd \"{BASE_DIR}\"\n"
-                f"if [ -x \"{launcher}\" ]; then nohup \"{launcher}\" >/dev/null 2>&1 &\n"
-                f"elif [ -f \"{launcher}\" ]; then nohup /bin/sh \"{launcher}\" >/dev/null 2>&1 &\n"
-                "fi\n"
-                "rm -- \"$0\"\n"
-            )
-            with open(sh_path, "w", encoding="utf-8") as f:
-                f.write(script)
-            os.chmod(sh_path, 0o755)
-            subprocess.Popen(
-                ["/bin/sh", sh_path],
-                start_new_session=True,
-                close_fds=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        return True
-    except Exception as exc:
-        logging.exception("schedule_self_restart failed: %s", exc)
-        return False
+
 
 class UpdateRequest(BaseModel):
-    auto_restart: bool = False
+    auto_restart: bool = True
     restart_delay: int = 3
     source: str = "github"
-    fallback: bool = True
+    fallback: bool = False
 
-def github_update_file_list() -> Tuple[List[str], List[str], List[str]]:
-    tree_data = github_json(GITHUB_TREE_URL, use_etag_cache=True)
-    entries = tree_data.get("tree") or []
-    static_files = []
-    root_files = []
-    for entry in entries:
-        path = str(entry.get("path") or "").replace("\\", "/")
-        if entry.get("type") == "blob" and update_allowed_file(path):
-            if path.startswith("static/"):
-                static_files.append(path)
-            else:
-                root_files.append(path)
-    if "main.py" not in root_files:
-        root_files.append("main.py")
-    if "VERSION" not in root_files:
-        root_files.append("VERSION")
-    static_files = sorted(set(static_files))
-    root_files = sorted(set(root_files))
-    files = root_files + static_files
-    if not static_files:
-        raise RuntimeError("GitHub 未返回 static 文件，已取消更新")
-    return root_files, static_files, files
 
-def staged_update_file_list(staging_root: str) -> Tuple[List[str], List[str], List[str]]:
-    root_files = []
-    static_files = []
-    for root_dir, _, names in os.walk(staging_root):
-        for name in names:
-            path = os.path.abspath(os.path.join(root_dir, name))
-            rel = os.path.relpath(path, staging_root).replace("\\", "/")
-            if not update_allowed_file(rel):
-                continue
-            if rel.startswith("static/"):
-                static_files.append(rel)
-            else:
-                root_files.append(rel)
-    if "main.py" not in root_files or "VERSION" not in root_files:
-        raise RuntimeError("更新源缺少 main.py 或 VERSION")
-    if not static_files:
-        raise RuntimeError("更新源未返回 static 文件，已取消更新")
-    root_files = sorted(set(root_files))
-    static_files = sorted(set(static_files))
-    return root_files, static_files, root_files + static_files
+class RollbackRequest(BaseModel):
+    name: str = ""
+    auto_restart: bool = True
+    restart_delay: int = 3
 
-UPDATE_SOURCE_LABELS = {"github": "GitHub", "modelscope": "ModelScope"}
 
-def normalize_update_source(value: str) -> str:
-    source = str(value or "github").strip().lower()
-    if source == "ms":
-        return "modelscope"
-    if source not in {"github", "modelscope"}:
-        return "github"
-    return source
+async def require_update_access(request: Request):
+    if not _is_authorized_backend_restart_request(request):
+        raise HTTPException(403, "请在部署电脑上用 localhost 或 127.0.0.1 打开网页更新。")
+    with CANVAS_TASK_LOCK:
+        active = any(item.get("status") in {"queued", "running", "pending", "processing", "jimeng_pending"} for item in CANVAS_TASKS.values())
+    if UPDATE_ACTIVE_REQUESTS or active or await MOTION_TASK_SERVICE.has_active_tasks():
+        raise HTTPException(409, "仍有任务或请求运行中。请等待任务完成、保存画布后再更新。")
+    if BACKEND_RESTART_SCHEDULED:
+        raise HTTPException(409, "后端正在重启，请稍后再试。")
 
-def stage_update_from_source(source: str, staging_root: str) -> Tuple[List[str], List[str], List[str]]:
-    """下载指定源的更新文件到 staging，返回 (root_files, static_files, files)。失败抛异常。"""
-    if source == "modelscope":
-        download_modelscope_update_files(staging_root)
-        return staged_update_file_list(staging_root)
-    root_files, static_files, files = github_update_file_list()
-    download_github_update_files(files, staging_root)
-    return root_files, static_files, files
+
+def finish_program_update(result, req):
+    global BACKEND_RESTART_SCHEDULED
+    restart = schedule_backend_restart(req.restart_delay) if req.auto_restart else False
+    if restart:
+        BACKEND_RESTART_SCHEDULED = True
+    return {**result, "ok": True, "source": "github", "source_label": "GitHub · Infinite-Canvas-GT",
+            "fallback_used": False, "restart_required": True, "restart_scheduled": restart,
+            "previous_instance_id": APP_INSTANCE_ID}
+
+
+async def run_update_worker(operation, *args):
+    worker = asyncio.create_task(asyncio.to_thread(operation, *args))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # A disconnected browser must not unlock the app while files are changing.
+        return await worker
+
 
 @app.post("/api/update-from-github")
-def update_from_github(req: UpdateRequest = UpdateRequest()):
+async def update_from_github(request: Request, req: UpdateRequest = UpdateRequest()):
     if not UPDATE_LOCK.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="正在更新中，请稍后再试")
-    staging_root = ""
-    requested_source = normalize_update_source(req.source)
-    # 冗余设计：先用用户选择的源，失败后自动切换到另一个源兜底，全部失败才报错
-    source_order = [requested_source]
-    if req.fallback:
-        other = "modelscope" if requested_source == "github" else "github"
-        source_order.append(other)
+        raise HTTPException(409, "正在更新中，请稍后再试")
     try:
-        backup_root = os.path.join(DATA_DIR, "update_backups", time.strftime("%Y%m%d-%H%M%S"))
-
-        # 下载阶段（带兜底切换），任意源成功即停止
-        source = requested_source
-        root_files = static_files = files = None
-        download_errors: List[str] = []
-        fallback_used = False
-        for idx, candidate in enumerate(source_order):
-            attempt_staging = os.path.join(
-                DATA_DIR, "update_staging",
-                f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{candidate}",
-            )
-            if os.path.isdir(attempt_staging):
-                shutil.rmtree(attempt_staging, ignore_errors=True)
-            label = UPDATE_SOURCE_LABELS.get(candidate, candidate)
-            print(f"[update] 尝试下载源 [{idx + 1}/{len(source_order)}] {label}（{candidate}）→ {attempt_staging}")
-            try:
-                root_files, static_files, files = stage_update_from_source(candidate, attempt_staging)
-                source = candidate
-                staging_root = attempt_staging
-                fallback_used = idx > 0
-                print(f"[update] 下载源 {label} 成功，共 {len(files or [])} 个文件")
-                break
-            except Exception as exc:  # noqa: BLE001 — 记录后尝试下一个源
-                if os.path.isdir(attempt_staging):
-                    shutil.rmtree(attempt_staging, ignore_errors=True)
-                print(f"[update] 下载源 {label} 失败：{exc}")
-                traceback.print_exc()
-                download_errors.append(f"{label}：{exc}")
-        if not staging_root:
-            detail = "；".join(download_errors) or "未知错误"
-            print(f"[update] 所有下载源均失败 → {detail}")
-            raise HTTPException(status_code=502, detail=f"所有下载源均失败 → {detail}")
-
-        updated = []
-        for rel in root_files:
-            target = safe_update_target(rel)
-            if os.path.exists(target):
-                backup_path = os.path.join(backup_root, *rel.split("/"))
-                os.makedirs(os.path.dirname(backup_path), exist_ok=True)
-                shutil.copy2(target, backup_path)
-
-        staged_static_dir = os.path.join(staging_root, "static")
-        if not os.path.isdir(staged_static_dir):
-            raise RuntimeError("GitHub static 暂存目录不存在，已取消更新")
-        static_dir = safe_static_dir()
-        backup_static_dir = os.path.join(backup_root, "static")
-        if os.path.isdir(static_dir):
-            os.makedirs(os.path.dirname(backup_static_dir), exist_ok=True)
-            shutil.copytree(static_dir, backup_static_dir)
-            shutil.rmtree(static_dir)
-        try:
-            shutil.copytree(staged_static_dir, static_dir)
-        except Exception:
-            if os.path.isdir(static_dir):
-                shutil.rmtree(static_dir, ignore_errors=True)
-            if os.path.isdir(backup_static_dir):
-                shutil.copytree(backup_static_dir, static_dir)
-            raise
-        updated.extend(static_files)
-
-        replaced_root_files = []
-        try:
-            for rel in root_files:
-                target = safe_update_target(rel)
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                temp_path = f"{target}.update_tmp"
-                shutil.copy2(os.path.join(staging_root, *rel.split("/")), temp_path)
-                os.replace(temp_path, target)
-                replaced_root_files.append(rel)
-                updated.append(rel)
-        except Exception:
-            for rel in reversed(replaced_root_files):
-                backup_path = os.path.join(backup_root, *rel.split("/"))
-                target = safe_update_target(rel)
-                if os.path.exists(backup_path):
-                    temp_path = f"{target}.rollback_tmp"
-                    shutil.copy2(backup_path, temp_path)
-                    os.replace(temp_path, target)
-            if os.path.isdir(static_dir):
-                shutil.rmtree(static_dir, ignore_errors=True)
-            if os.path.isdir(backup_static_dir):
-                shutil.copytree(backup_static_dir, static_dir)
-            raise
-
-        restart_scheduled = False
-        if req.auto_restart and updated:
-            restart_scheduled = schedule_self_restart(req.restart_delay)
-        new_version = ""
-        try:
-            staged_version = os.path.join(staging_root, "VERSION")
-            if os.path.exists(staged_version):
-                with open(staged_version, "r", encoding="utf-8") as f:
-                    new_version = (f.read().strip().splitlines() or [""])[0].strip()
-        except Exception:
-            new_version = ""
-        notes_file = os.path.join(staging_root, "static", "update-notes.json")
-        update_notes = {}
-        try:
-            if os.path.exists(notes_file):
-                with open(notes_file, "r", encoding="utf-8") as f:
-                    update_notes = safe_update_notes(json.load(f), new_version)
-        except Exception:
-            update_notes = {}
-        return {
-            "ok": True,
-            "source": source,
-            "source_label": UPDATE_SOURCE_LABELS.get(source, source),
-            "requested_source": requested_source,
-            "fallback_used": fallback_used,
-            "download_errors": download_errors,
-            "updated": updated,
-            "count": len(updated),
-            "version": new_version,
-            "update_notes": update_notes,
-            "backup_dir": backup_root if os.path.exists(backup_root) else "",
-            "restart_required": True,
-            "restart_scheduled": restart_scheduled,
-        }
+        await require_update_access(request)
+        # Legacy clients may request ModelScope; never download another fork.
+        result = await run_update_worker(project_updater.install, BASE_DIR, sys.executable)
+        return finish_program_update(result, req)
     except HTTPException:
         raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"更新失败：{exc}") from exc
+    except Exception:
+        logging.exception("GT program update failed")
+        raise HTTPException(500, "GT 更新失败，未完成的程序替换已尝试恢复；个人数据未覆盖。请检查网络，必要时运行安装依赖.bat 后重试。")
     finally:
-        if staging_root and os.path.isdir(staging_root):
-            shutil.rmtree(staging_root, ignore_errors=True)
         UPDATE_LOCK.release()
 
+
 def list_update_backups() -> List[Dict[str, Any]]:
-    root = os.path.join(DATA_DIR, "update_backups")
-    if not os.path.isdir(root):
+    root = Path(DATA_DIR) / "update_backups"
+    if not root.is_dir():
         return []
-    items = []
-    for name in sorted(os.listdir(root), reverse=True):
-        bp = os.path.join(root, name)
-        if not os.path.isdir(bp):
-            continue
-        file_count = 0
-        for _, _, fs in os.walk(bp):
-            file_count += len(fs)
-        try:
-            created_at = os.path.getmtime(bp)
-        except OSError:
-            created_at = 0.0
-        items.append({
-            "name": name,
-            "file_count": file_count,
-            "created_at": created_at,
-        })
-    return items
+    return [{"name": path.name, "file_count": sum(1 for item in path.rglob("*") if item.is_file()),
+             "created_at": path.stat().st_mtime}
+            for path in sorted(root.iterdir(), reverse=True)
+            if path.is_dir() and (path / "manifest.json").is_file()]
+
 
 @app.get("/api/update-backups")
 def get_update_backups():
     return {"backups": list_update_backups()}
 
-class RollbackRequest(BaseModel):
-    name: str = ""
-    auto_restart: bool = False
-    restart_delay: int = 3
 
 @app.post("/api/update-rollback")
-def rollback_update(req: RollbackRequest):
-    if not req.name:
-        raise HTTPException(status_code=400, detail="缺少备份名称")
+async def rollback_update(request: Request, req: RollbackRequest):
     if not UPDATE_LOCK.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="正在更新中，请稍后再试")
+        raise HTTPException(409, "正在更新中，请稍后再试")
     try:
-        backup_root_abs = os.path.abspath(os.path.join(DATA_DIR, "update_backups"))
-        backup_dir = os.path.abspath(os.path.join(backup_root_abs, req.name))
-        if os.path.commonpath([backup_root_abs, backup_dir]) != backup_root_abs:
-            raise HTTPException(status_code=400, detail="备份路径不安全")
-        if not os.path.isdir(backup_dir):
-            raise HTTPException(status_code=404, detail="备份不存在")
-        restored = []
-        skipped = []
-        backup_static_dir = os.path.join(backup_dir, "static")
-        if os.path.isdir(backup_static_dir):
-            static_dir = safe_static_dir()
-            if os.path.isdir(static_dir):
-                shutil.rmtree(static_dir)
-            try:
-                shutil.copytree(backup_static_dir, static_dir)
-            except Exception:
-                if os.path.isdir(static_dir):
-                    shutil.rmtree(static_dir, ignore_errors=True)
-                raise
-            for dirpath, _, filenames in os.walk(backup_static_dir):
-                for fn in filenames:
-                    src = os.path.join(dirpath, fn)
-                    restored.append(os.path.relpath(src, backup_dir).replace("\\", "/"))
-        for dirpath, _, filenames in os.walk(backup_dir):
-            for fn in filenames:
-                src = os.path.join(dirpath, fn)
-                rel = os.path.relpath(src, backup_dir).replace("\\", "/")
-                if rel.startswith("static/"):
-                    continue
-                if not update_allowed_file(rel):
-                    skipped.append(rel)
-                    continue
-                try:
-                    target = safe_update_target(rel)
-                except ValueError:
-                    skipped.append(rel)
-                    continue
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                temp_path = f"{target}.rollback_tmp"
-                with open(src, "rb") as fin, open(temp_path, "wb") as fout:
-                    shutil.copyfileobj(fin, fout)
-                os.replace(temp_path, target)
-                restored.append(rel)
-        restart_scheduled = False
-        if req.auto_restart and restored:
-            restart_scheduled = schedule_self_restart(req.restart_delay)
-        return {
-            "ok": True,
-            "restored": restored,
-            "skipped": skipped,
-            "count": len(restored),
-            "restart_required": True,
-            "restart_scheduled": restart_scheduled,
-        }
+        await require_update_access(request)
+        result = await run_update_worker(project_updater.rollback, BASE_DIR, req.name)
+        result["restored"] = result["updated"]
+        return finish_program_update(result, req)
     except HTTPException:
         raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"回滚失败：{exc}") from exc
+    except Exception:
+        logging.exception("GT program rollback failed")
+        raise HTTPException(500, "回滚失败，请检查本地备份；个人数据未覆盖。")
     finally:
         UPDATE_LOCK.release()
 

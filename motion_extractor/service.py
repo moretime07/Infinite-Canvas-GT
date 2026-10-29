@@ -295,6 +295,10 @@ class MotionTaskService:
         self._private: dict[str, _PrivateTask] = {}
         self._lock = asyncio.Lock()
 
+    async def has_active_tasks(self) -> bool:
+        async with self._lock:
+            return any(record["state"] not in _TERMINAL_STATES for record in self._records.values())
+
     def preflight(self, source_path: Path) -> VideoMetadata:
         """Synchronously validate local media before it can enter the GPU queue."""
         return self._prober(Path(source_path))
