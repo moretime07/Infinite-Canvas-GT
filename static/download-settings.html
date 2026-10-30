@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>视频下载代理</title>
+    <script src="/static/js/theme.js?v=2026.10.30.1.1782155110"></script>
+    <link rel="stylesheet" href="/static/css/download-settings.css?v=2026.10.30.1.1793324420">
+</head>
+<body>
+<main>
+    <header><span class="eyebrow">NETWORK · DOWNLOAD</span><h1>视频下载代理</h1><p>为生成视频的下载选择代理线路，不改变模型调用或系统代理。</p></header>
+    <section class="card">
+        <div class="scope"><strong>作用于运行后台的电脑</strong><p>例如后台运行在 5080 电脑上，127.0.0.1 就是那台电脑，不是局域网同事的电脑。设置仅保存在后台本机，不会随画布导出。</p></div>
+        <form id="proxyForm">
+            <fieldset id="proxyFields" disabled>
+                <label class="toggle"><input id="proxyEnabled" type="checkbox"><span>启用视频下载代理<small>默认关闭。保存后，对下一次开始的下载生效。</small></span></label>
+                <div class="fields">
+                    <label>代理协议<select id="proxyProtocol"><option value="http">HTTP（常见混合代理端口）</option><option value="https">HTTPS（代理本身使用 TLS）</option><option value="socks5">SOCKS5</option></select></label>
+                    <label>代理服务器<input id="proxyHost" type="text" value="127.0.0.1" maxlength="253" autocomplete="off" spellcheck="false" required aria-describedby="hostHelp"></label>
+                    <label>代理端口<input id="proxyPort" type="number" value="10808" min="1" max="65535" step="1" required></label>
+                </div>
+                <p class="hint" id="hostHelp">服务器只填 IP 或主机名。端口须与代理软件中一致，例如 10808 或 7890；不是 VPN 订阅地址。此处不支持需要账号密码的代理。</p>
+                <div class="notice">HTTP 代理也可以下载 HTTPS 视频，不必因为视频地址是 HTTPS 就选择 HTTPS 协议。启用后，代理能看到下载目标和流量信息；请只使用你信任的代理。保留 TLS 证书验证，不会静默切换直连。</div>
+                <div class="actions"><button id="proxyTest" type="button">测试代理连接</button><button id="proxySave" type="submit" class="primary">保存设置</button></div>
+                <p class="hint">测试仅通过填写的代理访问 Google 的公开连通性测试地址，不发送 API Key、提示词或素材；不会消耗生成额度，也不代表实际 CDN 下载速度。</p>
+            </fieldset>
+        </form>
+        <p id="proxyStatus" role="status" aria-live="polite">正在读取设置…</p>
+    </section>
+    <section class="card help"><h2>怎么填写？</h2><ol><li>在运行后台的电脑上启动你已有的代理软件。</li><li>查看它的 HTTP／混合端口或 SOCKS5 端口，选对应协议。</li><li>通常服务器填 <code>127.0.0.1</code>，端口按代理软件填写。</li><li>勾选启用，测试连接，再保存。已有下载不会中断或重新计费。</li></ol><p>此设置只代理下载生成的视频，不代理上传素材、提交生成、轮询、图片下载或本地文件导出。关闭自定义代理后恢复原有网络策略。局域网用户需由后台电脑的管理员设置。</p></section>
+</main>
+<script src="/static/js/download-settings.js?v=2026.10.30.1.1793324926"></script>
+</body>
+</html>

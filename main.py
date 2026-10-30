@@ -39,6 +39,7 @@ import tencent_vod
 import aiide_video
 import project_updater
 import video_download
+import download_proxy
 from PIL import Image, ImageOps
 from io import BytesIO
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, Request
@@ -2227,7 +2228,7 @@ def _parse_restart_host(value: str) -> Optional[Tuple[str, int]]:
         return None
 
 
-def _is_authorized_backend_restart_request(request: Request) -> bool:
+def _is_authorized_backend_restart_request(request: Request, header_name="x-infinite-canvas-restart") -> bool:
     if not is_loopback_client(request):
         return False
     host = _parse_restart_host(request.headers.get("host", ""))
@@ -2261,7 +2262,72 @@ def _is_authorized_backend_restart_request(request: Request) -> bool:
     fetch_site = str(request.headers.get("sec-fetch-site") or "").strip().lower()
     if fetch_site and fetch_site != "same-origin":
         return False
-    return request.headers.get("x-infinite-canvas-restart") == "1"
+    return request.headers.get(header_name) == "1"
+
+
+def video_download_client_options(url=None):
+    try:
+        settings = download_proxy.load_settings(os.path.join(DATA_DIR, "download-proxy.json"))
+        return download_proxy.client_options(settings, url)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="视频下载代理配置无法读取，请在更多设置 → 视频下载代理中重新保存。") from exc
+
+
+def require_download_proxy_admin(request: Request):
+    if not _is_authorized_backend_restart_request(request, "x-infinite-canvas-download-proxy"):
+        raise HTTPException(status_code=403, detail="请在运行后台的电脑上，通过 localhost 或 127.0.0.1 打开设置。局域网客户端不能修改服务器下载代理。")
+
+
+@app.get("/api/settings/download-proxy")
+async def get_download_proxy_settings(request: Request):
+    can_edit = (is_loopback_client(request)
+                and _parse_restart_host(request.headers.get("host", "")) is not None
+                and request.headers.get("sec-fetch-site", "") in {"", "same-origin", "none"})
+    if not can_edit:
+        return {"can_edit": False, "settings": None}
+    try:
+        settings = download_proxy.load_settings(os.path.join(DATA_DIR, "download-proxy.json"))
+        return {"can_edit": True, "settings": settings.model_dump()}
+    except Exception:
+        return {"can_edit": True, "settings": download_proxy.DownloadProxySettings().model_dump(),
+                "warning": "保存的代理配置无法读取；请重新保存。当前下载不会静默改为直连。"}
+
+
+@app.put("/api/settings/download-proxy")
+async def set_download_proxy_settings(payload: download_proxy.DownloadProxySettings, request: Request):
+    require_download_proxy_admin(request)
+    try:
+        download_proxy.save_settings(os.path.join(DATA_DIR, "download-proxy.json"), payload)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="代理设置保存失败，请检查 data 目录的写入权限。") from exc
+    return {"settings": payload.model_dump(), "message": "已保存，对下一次开始的视频下载生效；正在下载的任务保持原连接。"}
+
+
+@app.post("/api/settings/download-proxy/test")
+async def test_download_proxy_settings(payload: download_proxy.DownloadProxySettings, request: Request):
+    require_download_proxy_admin(request)
+    if not payload.enabled:
+        raise HTTPException(status_code=400, detail="请先勾选启用，再测试代理。")
+    started = time.monotonic()
+
+    async def probe():
+        async with httpx.AsyncClient(**download_proxy.client_options(payload), timeout=8.0,
+                                     follow_redirects=False) as client:
+            # Public, fixed, tiny response. No generation keys, prompts or signed media URLs.
+            return await client.head("https://www.gstatic.com/generate_204")
+
+    try:
+        response = await asyncio.wait_for(probe(), timeout=10.0)
+        if response.status_code not in {200, 204}:
+            raise HTTPException(status_code=502, detail=f"代理测试地址返回 HTTP {response.status_code}，请检查协议和代理线路。")
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail="缺少 SOCKS5 支持，请运行安装/更新依赖后重启后台。") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="代理测试失败：请确认代理软件已启动、协议和端口正确，且允许本机连接。") from exc
+    return {"ok": True, "latency_ms": round((time.monotonic() - started) * 1000),
+            "message": "代理 HTTPS 连接正常；测试仅验证公开测试地址，不保证视频 CDN 的速度。此测试不会保存设置。"}
 
 
 def schedule_backend_restart(delay_seconds: float = 1.5) -> bool:
@@ -7604,6 +7670,7 @@ async def save_remote_video_to_output(url, prefix="video_", category="output"):
     path = output_path_for(filename, category)
     temp_path = ""
     report_video_download()
+    proxy_options = video_download_client_options(url)
     try:
         timeout = httpx.Timeout(connect=20.0, read=video_download.READ_TIMEOUT, write=60.0, pool=20.0)
         headers = {
@@ -7613,7 +7680,8 @@ async def save_remote_video_to_output(url, prefix="video_", category="output"):
             **remote_media_request_headers(url),
         }
         limits = httpx.Limits(max_connections=4, max_keepalive_connections=4)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers, limits=limits) as client:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers, limits=limits,
+                                     **proxy_options) as client:
             def open_stream(extra_headers):
                 return client.stream("GET", url, headers=extra_headers)
 
@@ -7641,6 +7709,8 @@ async def save_remote_video_to_output(url, prefix="video_", category="output"):
                 os.remove(path)
         except Exception:
             pass
+        if proxy_options.get("proxy"):
+            raise HTTPException(status_code=502, detail="视频下载失败（已启用下载代理）。请在更多设置 → 视频下载代理中测试协议、端口和线路；未自动切换直连。") from e
         return url
     finally:
         if temp_path and os.path.exists(temp_path):
@@ -7709,17 +7779,21 @@ async def save_ominilink_video_to_output(url, prefix="video_", category="output"
         timeout = httpx.Timeout(connect=20.0, read=video_download.READ_TIMEOUT, write=60.0, pool=20.0)
         # IP-pinned redirects may have different TLS authorities on the same IP.
         limits = httpx.Limits(max_connections=4, max_keepalive_connections=0)
+        proxy_options = video_download_client_options()
+        if proxy_options.get("proxy"):
+            proxy_options = {"trust_env": False,
+                             "transport": download_proxy.PinnedProxyTransport(proxy_options["proxy"])}
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=False,
             limits=limits,
-            trust_env=False,
+            **{"trust_env": False, **proxy_options},
         ) as owned_client:
             return await download(owned_client)
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail="OminiLink 视频结果下载失败。") from exc
+        raise HTTPException(status_code=502, detail="视频结果下载失败，请检查网络；若启用了下载代理，请在更多设置中测试代理协议、端口和线路。") from exc
     finally:
         if temp_path:
             try:
