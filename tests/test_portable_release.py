@@ -6,11 +6,15 @@ import subprocess
 import tempfile
 import unittest
 
-from tools.portable.release_assets import ARCHIVE_NAME, split_archive
+from tools.portable.release_assets import ARCHIVE_NAME, PART_SIZE, split_archive
 
 
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell merger")
 class PortableReleaseTests(unittest.TestCase):
+    def test_default_parts_fit_full_bundle_and_github_limit(self):
+        self.assertLess(PART_SIZE, 2 * 1024 ** 3)
+        self.assertLessEqual(3_950_000_000, PART_SIZE * 2)
+
     def prepare(self, root):
         archive = root / ARCHIVE_NAME
         payload = b"PK-portable-test-content" * 100

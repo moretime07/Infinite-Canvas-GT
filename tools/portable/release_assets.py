@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import shutil
 
-PART_SIZE = 1_950_000_000  # Under GitHub's per-asset 2 GiB limit.
+PART_SIZE = 2_000_000_000  # Under GitHub's per-asset 2 GiB limit (2,147,483,648 bytes).
 ARCHIVE_NAME = "InfiniteCanvas-GT-Full.zip"
 
 
