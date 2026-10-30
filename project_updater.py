@@ -199,8 +199,14 @@ def prepare_runtime(root, stage, python=sys.executable):
     new = code_path(stage, "requirements.txt")
     changed = not old.exists() or old.read_bytes() != new.read_bytes()
     if changed:
-        result = subprocess.run([python, "-m", "pip", "install", "--disable-pip-version-check", "-r", str(new)],
-                                capture_output=True, timeout=180)
+        helper = code_path(stage, "tools/install_dependencies.py")
+        if not helper.is_file():
+            raise RuntimeError("发布包缺少依赖安装工具，程序文件未替换。")
+        try:
+            result = subprocess.run([python, str(helper), "--requirements", str(new), "--no-pip-upgrade"],
+                                    capture_output=True, timeout=720)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("依赖下载超时，程序文件未替换。请检查安装代理/证书后运行安装依赖.bat。") from None
         if result.returncode:
             raise RuntimeError("依赖安装失败，程序文件未替换。请运行安装依赖.bat 后重试。")
     for name in stage.rglob("*.py"):

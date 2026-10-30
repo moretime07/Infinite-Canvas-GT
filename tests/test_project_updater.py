@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import shutil
+import subprocess
 import sys
 import threading
 import unittest
@@ -21,6 +22,34 @@ def write(root, name, value):
 
 
 class ProgramUpdateTests(unittest.TestCase):
+    def test_changed_dependencies_use_staged_safe_installer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage = Path(directory) / "app", Path(directory) / "stage"
+            write(root, "requirements.txt", "old")
+            write(stage, "requirements.txt", "new")
+            write(stage, "tools/install_dependencies.py", "# helper")
+            with patch.object(updater.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+                updater.prepare_runtime(root, stage, "project-python")
+            command = run.call_args_list[0].args[0]
+            self.assertEqual(command[:2], ["project-python", str(stage / "tools/install_dependencies.py")])
+            self.assertIn("--no-pip-upgrade", command)
+            self.assertEqual(run.call_args_list[0].kwargs["timeout"], 720)
+
+    def test_dependency_failure_or_timeout_prevents_import_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, stage = Path(directory) / "app", Path(directory) / "stage"
+            write(root, "main.py", "# existing code")
+            write(stage, "requirements.txt", "new")
+            write(stage, "tools/install_dependencies.py", "# helper")
+            for outcome in (subprocess.CompletedProcess([], 1), subprocess.TimeoutExpired("installer", 720)):
+                with self.subTest(outcome=type(outcome).__name__):
+                    side_effect = [outcome]
+                    with patch.object(updater.subprocess, "run", side_effect=side_effect) as run:
+                        with self.assertRaisesRegex(RuntimeError, "程序文件未替换"):
+                            updater.prepare_runtime(root, stage)
+                    self.assertEqual(run.call_count, 1)
+                    self.assertEqual((root / "main.py").read_text(), "# existing code")
+
     def test_personal_paths_and_traversal_are_rejected(self):
         for name in ("API/.env", "data/api_providers.json", "assets/local.png", "output/a.mp4",
                      "history.json", "global_config.json", ".venv/a.py", "tmp/a.py", ".git/config",

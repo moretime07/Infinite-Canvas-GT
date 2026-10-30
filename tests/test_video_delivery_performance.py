@@ -158,6 +158,8 @@ class VideoDeliveryTests(unittest.IsolatedAsyncioTestCase):
         original_client = httpx.AsyncClient
         with tempfile.TemporaryDirectory() as folder, patch.object(
             main, "output_path_for", side_effect=lambda filename, category: str(Path(folder) / filename)
+        ), patch.object(
+            main, "video_download_client_options", return_value={"trust_env": False}
         ), patch.object(main.httpx, "AsyncClient", side_effect=lambda **kwargs: original_client(transport=transport, **kwargs)):
             with self.assertRaises(asyncio.CancelledError):
                 await main.save_remote_video_to_output("https://example.test/video.mp4")

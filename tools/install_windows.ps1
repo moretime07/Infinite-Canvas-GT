@@ -2,10 +2,16 @@
 param(
     [string]$PythonExecutable = '',
     [switch]$InstallPython,
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    [ValidateSet('auto', 'pypi', 'tuna', 'configured')][string]$PackageSource = 'auto',
+    [string]$IndexUrl = '',
+    [string]$ProxyUrl = '',
+    [string]$CaBundle = ''
 )
 
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
 $appRoot = Split-Path -Parent $PSScriptRoot
 $venvPython = Join-Path $appRoot '.venv\Scripts\python.exe'
 $versionProbe = "import sys, struct; assert (3, 10) <= sys.version_info[:2] < (3, 14) and struct.calcsize('P') == 8; print(sys.executable)"
@@ -72,12 +78,12 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Could not create .venv. Install Python with its pip and venv components enabled.' }
     }
     Write-Host 'Installing base dependencies into .venv (not into system Python)...'
-    & $venvPython -m pip install --upgrade pip
-    if ($LASTEXITCODE -ne 0) { throw 'pip update failed. Check your network/proxy and rerun the installer.' }
-    & $venvPython -m pip install -r (Join-Path $appRoot 'requirements.txt')
-    if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed. Check your network/proxy and rerun the installer.' }
-    & $venvPython -m pip check
-    if ($LASTEXITCODE -ne 0) { throw 'Dependency conflicts found. See pip check output above.' }
+    $dependencyArgs = @('-X', 'utf8', (Join-Path $PSScriptRoot 'install_dependencies.py'), '--requirements', (Join-Path $appRoot 'requirements.txt'), '--source', $PackageSource)
+    if ($IndexUrl) { $dependencyArgs += @('--index-url', $IndexUrl) }
+    if ($ProxyUrl) { $dependencyArgs += @('--proxy', $ProxyUrl) }
+    if ($CaBundle) { $dependencyArgs += @('--ca-bundle', $CaBundle) }
+    & $venvPython @dependencyArgs
+    if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed. See the safe error summary above. You can select -PackageSource tuna or supply -ProxyUrl / -CaBundle, then rerun.' }
     & $venvPython -c "import main; assert main.app; print('Application import: OK')"
     if ($LASTEXITCODE -ne 0) { throw 'Application startup check failed. Keep the error output for troubleshooting.' }
     Write-Host ''

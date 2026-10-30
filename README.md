@@ -34,8 +34,9 @@ cd Infinite-Canvas-GT
 双击 **`安装依赖.bat`**。脚本将：
 
 1. 查找 64 位 Python 3.10–3.13，推荐 Python 3.11；没有 Python 时，如电脑有 WinGet，会询问是否安装 Python 3.11。
-2. 在项目内部创建 `.venv`，联网安装 `requirements.txt` 中的基础依赖，不修改系统 Python 的依赖。
-3. 检查依赖与后端导入是否正常。失败会显示错误，修复网络或 Python 后可再次运行。
+2. 在项目内部创建 `.venv`，联网安装 `requirements.txt` 中的基础依赖，不修改系统 Python 的依赖。默认先用 PyPI 官方源，遇到 SSL 断连、网络错误或超时，再尝试清华 TUNA 镜像。
+3. 隔离额外 pip 下载源和 `trusted-host` 设置，保留代理及 CA 证书；不修改全局 `pip.ini`，不关闭 TLS 校验。旧版 pip 更新失败不会单独导致整个安装中断。
+4. 检查依赖与后端导入是否正常。失败会显示不含认证地址的错误摘要；修复网络或 Python 后可再次运行，不需要删除画布或 API 配置。
 
 如果没有 WinGet，先从 [Python 官网](https://www.python.org/downloads/windows/) 安装 64 位 Python 3.11，再运行脚本。基础 API 调用功能不需要 NVIDIA 显卡，不会自动安装 PyTorch、下载动作提取模型或发起收费生成。
 
@@ -46,6 +47,37 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\install_windows.ps1 
 ```
 
 需要明确指定解释器时，加 `-PythonExecutable "C:\path\to\python.exe"`。需要允许 WinGet 安装 Python 时，加 `-InstallPython`。这只为当前脚本放行执行策略，不修改系统永久执行策略。
+
+### 安装网络问题：SSL EOF、反复重试或公司代理
+
+从 `2026.10.30.2` 起，基础安装及新版自动更新的依赖安装共用上述单源重试机制。不会因电脑遗留的 NVIDIA 等额外 pip 源反复重试；只有网络错误才切换备用源，版本冲突/编译失败不会靠换源掩盖。
+
+多数电脑直接双击安装即可。受限网络可在**项目目录**打开 PowerShell，按需选择以下一种方式：
+
+```powershell
+# 明确只用清华 TUNA HTTPS 镜像
+.\安装依赖.bat -PackageSource tuna
+
+# 使用自己的 HTTP/混合代理端口；示例端口以代理软件实际设置为准
+.\安装依赖.bat -ProxyUrl http://127.0.0.1:7890
+
+# 公司 HTTPS 检查网络：使用 IT 提供的可信 CA 证书（不是关闭证书校验）
+.\安装依赖.bat -CaBundle "C:\certs\company-ca.pem"
+
+# 公司要求使用内网包源时，沿用现有 pip 主源（不使用额外源）
+.\安装依赖.bat -PackageSource configured
+
+# 或显式指定经公司认可的 HTTPS 源
+.\安装依赖.bat -IndexUrl https://packages.example.com/simple
+```
+
+`-PackageSource pypi` 可只使用官方源；代理与 CA 参数可以组合。显式指定源或选择 `configured` 时，不会自动转向其他公共源。参数仅作用于此次安装的子进程，不写入项目配置或系统设置。为避免密码留在终端历史，不要在命令中填写带密码的代理/下载源地址；必要时让 IT 配置现有的受保护网络配置。
+
+安装器保留已有 `PIP_PROXY`、`PIP_CERT`、`PIP_CLIENT_CERT`、HTTP(S) 代理和 CA 环境配置，也读取 pip 配置中的代理/证书；默认不沿用 pip 主源和额外源。原始 pip 输出可能含带凭据的地址，因此不会写入安装日志，只展示阶段、下载源名称和错误类别。单次网络重试有上限，仍失败时检查网络/代理、证书、磁盘及 Python 版本，不能保证被网络策略拦截的电脑无需配置即可安装。
+
+**网页中的“视频下载代理”仅用于下载生成视频，不用于安装 Python 依赖。** 安装时需要代理，请使用上述安装参数或已有网络配置。
+
+仍在使用旧版安装脚本的电脑，需要先下载本仓库最新 ZIP；新电脑解压后安装即可。旧电脑先备份个人数据、停止后台，再用下方“启用 GT 自动更新”工具更新程序；该工具下载最新更新器。不要只复制新的 `.bat` 而漏掉 `tools/install_dependencies.py` 等文件。
 
 ### 3. 启动
 
@@ -74,8 +106,7 @@ http://127.0.0.1:3000/
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python tools/install_dependencies.py --requirements requirements.txt
 python main.py
 ```
 
@@ -118,7 +149,7 @@ python main.py
 
 旧版更新按钮的地址写在旧程序里，不能远程自动变更，所以上述切换只需做一次。首次工具要求旧项目已经有 `.venv/Scripts/python.exe` 或 `python/python.exe`；否则先按安装步骤安装依赖。
 
-**日常更新：** 在部署电脑用 `http://127.0.0.1:3000/` 打开网页，保存画布并等待生成任务结束，点击更新按钮。更新器固定到同一个 Git 提交下载并校验文件，完整更新 Python 模块、前端、脚本、内置工作流；基础依赖列表变化时按需安装，不自动安装 GPU 模型或强制升级已满足要求的包。更新前检查新版能否导入，更新后自动重启并刷新页面。
+**日常更新：** 在部署电脑用 `http://127.0.0.1:3000/` 打开网页，保存画布并等待生成任务结束，点击更新按钮。更新器固定到同一个 Git 提交下载并校验文件，完整更新 Python 模块、前端、脚本、内置工作流；基础依赖列表变化时按需安装，不自动安装 GPU 模型或强制升级已满足要求的包。新版依赖下载使用与安装器相同的安全备用源逻辑，保留现有代理/CA；需要指定公司包源时，先手动用上方参数安装新版依赖。更新前检查新版能否导入，更新后自动重启并刷新页面。
 
 - API 密钥、`data/`、`assets/`、`output/`、历史文件以及 `.venv/` 不参与程序文件覆盖，也不会上传。程序备份只含被替换的代码，保存在 `data/update_backups/`。
 - 程序文件替换失败时自动恢复，新增文件也会清理；网页更新设置中可以手动回滚。备份保留在本机，不会自动删除。Python 依赖的版本变化不包含在代码回滚中；依赖安装失败请运行 `安装依赖.bat` 后重试。
@@ -175,7 +206,7 @@ HTTP 代理也可以下载 HTTPS 视频，不需要因为视频地址以 `https:
 - **迁移到另一台电脑**：下载干净代码并重新安装依赖；只有确实需要迁移个人资料时才私下复制上表中的数据。不要把这些文件提交到公开仓库或发给不相关的人。
 - **`ModuleNotFoundError`**：运行 `安装依赖.bat`，使用项目启动脚本，不要换用未安装依赖的其他 Python。
 - **端口 3000 被占用 / 仍然运行旧代码**：关闭旧服务，或在本机画布空白处右键使用“重启后端”功能；仅关浏览器不会结束后端进程。
-- **pip 下载失败**：检查网络、代理及证书，再重跑安装脚本。不要为了安装而关闭 TLS 证书校验。
+- **pip 出现 `SSLError` / `UNEXPECTED_EOF_WHILE_READING` / 反复 `/pip/` 重试**：使用最新完整安装包，按上方“安装网络问题”选择备用源、安装代理或可信 CA；脚本会自动处理常见断连并隔离额外源。不要使用 `--trusted-host` 或关闭 TLS 校验绕过错误。
 - **动作提取不可用**：基础安装不包含 GPU 依赖。运行独立的动作提取安装脚本，检查 CUDA 和 FFmpeg，不影响普通云端 API 功能。
 
 ## 开发者提交前检查
