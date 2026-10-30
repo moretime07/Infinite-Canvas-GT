@@ -3,4 +3,5 @@
 启动服务.bat text eol=crlf
 启用GT自动更新.bat text eol=crlf
 *.ps1 text eol=crlf
+*.cmd text eol=crlf
 *.command text eol=lf

@@ -40,6 +40,7 @@ import aiide_video
 import project_updater
 import video_download
 import download_proxy
+from portable_runtime import listen_options
 from PIL import Image, ImageOps
 from io import BytesIO
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Header, Request
@@ -297,6 +298,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str = None):
 
 CLIENT_ID = str(uuid.uuid4())
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_HOST, APP_PORT = listen_options(os.environ)
 APP_INSTANCE_ID = uuid.uuid4().hex
 BACKEND_RESTART_LOCK = Lock()
 BACKEND_RESTART_SCHEDULED = False
@@ -2339,7 +2341,7 @@ def schedule_backend_restart(delay_seconds: float = 1.5) -> bool:
         "--pid", str(os.getpid()),
         "--python", sys.executable,
         "--app-dir", BASE_DIR,
-        "--port", "3000",
+        "--port", str(APP_PORT),
         "--delay", str(max(0.5, float(delay_seconds))),
         "--log", log_path,
     ]
@@ -18272,5 +18274,5 @@ if __name__ == "__main__":
     # 关闭服务端协议级 WebSocket ping：部分客户端（如 PS UXP 面板）不会自动回 pong，
     # 默认 20s ping/20s 超时会把这些连接每隔一会儿就踢掉造成"频繁断连"。
     # 客户端有自己的应用层心跳 + 断线重连兜底，这里禁用协议 ping 更稳。
-    uvicorn.run(app, host="0.0.0.0", port=3000,
+    uvicorn.run(app, host=APP_HOST, port=APP_PORT,
                 ws_ping_interval=None, ws_ping_timeout=None)

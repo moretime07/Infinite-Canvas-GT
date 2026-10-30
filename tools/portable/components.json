@@ -1,0 +1,26 @@
+{
+  "release": "2026.10.30.3",
+  "target": "Windows x64",
+  "privacy": "Fresh public runtimes and models only; no provider keys or user data",
+  "python": {
+    "version": "3.11.18",
+    "source": "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.11.18%2B20261026-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+    "sha256": "67215a7bf1643e33d01b17ee3f1e91a8b0b39163746855ee02594bf0608f68b4"
+  },
+  "ffmpeg": {
+    "version": "n9.0.2-37-gae19868753-20261029",
+    "source": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip",
+    "sha256": "809bdb68f8e9bb5db07e24ae8e09e7d85751dfe97060dd8b75a4097f5620df14"
+  },
+  "git": {
+    "version": "2.56.0.windows.4",
+    "source": "https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.4/MinGit-2.56.0.4-64-bit.zip",
+    "sha256": "e3bf78351fe777fba47ddee5950082f8a98bb0f02604fdc7ba3ee2cb68ffa877"
+  },
+  "gpu": {
+    "torch": "2.11.0+cu128",
+    "torchvision": "0.26.0+cu128",
+    "onnxruntime-gpu": "1.26.0",
+    "driver": "Not included; a compatible NVIDIA driver is required"
+  }
+}

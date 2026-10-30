@@ -18,6 +18,14 @@
 
 ## Windows 安装与运行（推荐）
 
+### 完整便携包（EXE＋配套文件夹）
+
+从 [GitHub Releases](https://github.com/moretime07/Infinite-Canvas-GT/releases/latest) 下载完整便携版。约 3.94 GB 的 ZIP 分为 `.zip.001`、`.zip.002` 两部分（每个附件小于 2 GiB）；把两个分卷、`Merge-Bundle.cmd`、`Merge-Bundle.ps1`、`bundle.json` 下载到同一文件夹，双击 **Merge-Bundle.cmd** 校验并合成普通 ZIP，再完整解压。两个分卷都必须下载，不要改名，也不要单独解压其中一个。建议预留 20 GB 空间。
+
+如果拿到的是 `InfiniteCanvas-GT-Full.zip` 完整发行 ZIP，完整解压后直接双击 **InfiniteCanvas.exe**，无需安装 Python 或基础依赖。内置 FFmpeg、Git、CUDA 12.8 运行库和深度白模/骨骼姿态的模型。不要只复制 EXE；使用说明见包内 `免安装使用说明.md`。
+
+便携启动器仅监听本机，需要本人填写 API Key；本地 GPU 功能仍需要兼容的 NVIDIA 驱动。ComfyUI 独立服务、即梦 WSL 环境及个人账号不在包内。转发给同事请使用原始干净 ZIP，不要转发已经保存个人数据的目录。GitHub 的 **Code → Download ZIP** 是源码包，不是完整便携包，仍按下方步骤安装。
+
 ### 1. 下载程序
 
 在本仓库点击 **Code → Download ZIP**，完整解压到可写目录，例如 `D:\Infinite-Canvas-GT`。不要在压缩包里直接运行，也不要解压到 `Program Files`。更新旧版本前先备份个人数据，见下方说明。

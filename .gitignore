@@ -22,6 +22,7 @@ _self_restart.bat
 assets/
 output/
 tmp/
+dist/
 
 # Bundled/local Python runtime and caches
 .venv/

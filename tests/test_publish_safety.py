@@ -11,6 +11,7 @@ class PublishSafetyTests(unittest.TestCase):
                      "assets/library/private.png", "assets/uploads/private.mp4",
                      "output/video.mp4", "tmp/pdfs/local-guide.pdf", "global_config.json", "history.json",
                      "shortcut.lnk", "backup.zip", ".venv/pyvenv.cfg",
+                     "dist/InfiniteCanvas-GT-Full/InfiniteCanvas.exe", "dist/bundle.json",
                      "final-fix-private-review/report.md"):
             with self.subTest(name=name):
                 self.assertTrue(private_path(name))

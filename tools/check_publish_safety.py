@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 
 
-PRIVATE_ROOTS = {"api", "data", "assets", "output", "tmp", "python", ".venv", ".codex", ".playwright-cli", "test-results"}
+PRIVATE_ROOTS = {"api", "data", "assets", "output", "tmp", "dist", "python", ".venv", ".codex", ".playwright-cli", "test-results"}
 PRIVATE_NAMES = {"history.json", "global_config.json", "_self_restart.bat"}
 PRIVATE_SUFFIXES = {".log", ".lnk", ".pem", ".key", ".p12", ".pfx", ".zip", ".7z", ".rar", ".sqlite", ".sqlite3"}
 TOKEN_PATTERNS = [

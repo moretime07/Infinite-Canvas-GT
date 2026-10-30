@@ -1,6 +1,7 @@
 numpy>=1.26,<3
 opencv-python-headless>=4.10,<5
-onnxruntime-gpu>=1.22,<2
+# CUDA 12.8 matches the pinned PyTorch cu128 build. PyPI >=1.27 defaults to CUDA 13.
+onnxruntime-gpu>=1.22,<1.27
 huggingface-hub>=0.30,<2
 imageio>=2.37,<3
 imageio-ffmpeg>=0.6,<1
