@@ -1,4 +1,4 @@
-"""Host-local proxy preferences for generated-video transfers only.
+"""Host-local proxy preferences for video downloads and cloud media uploads.
 
 Never changes environment variables, system proxy settings or generation clients.
 The caller stores this file under the ignored runtime data directory.
@@ -86,6 +86,9 @@ class PinnedProxyTransport(httpx.AsyncHTTPTransport):
 class DownloadProxySettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: StrictBool = False
+    # Separate opt-in: upgrading an existing download-only setup must not
+    # silently route user uploads through its proxy.
+    upload_enabled: StrictBool = False
     protocol: Literal["http", "https", "socks5"] = "http"
     host: str = Field(default="127.0.0.1", max_length=253)
     port: int = Field(default=10808, ge=1, le=65535, strict=True)
@@ -147,3 +150,7 @@ def client_options(settings, url=None):
         except ValueError:
             pass
     return {"proxy": settings.proxy_url(), "trust_env": False}
+
+
+def upload_client_options(settings, url=None):
+    return client_options(settings.model_copy(update={"enabled": settings.upload_enabled}), url)

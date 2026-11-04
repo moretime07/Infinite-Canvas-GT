@@ -20,7 +20,7 @@ class SettingsTests(unittest.TestCase):
             setting = dp.DownloadProxySettings(enabled=True, protocol=protocol, host="[::1]", port=10808)
             self.assertEqual(setting.proxy_url(), f"{protocol}://[::1]:10808")
         for changes in ({"port":0}, {"port":65536}, {"port":True}, {"port":"7890"},
-                        {"enabled":"yes"}, {"protocol":"socks4"}, {"password":"secret"},
+                        {"enabled":"yes"}, {"upload_enabled":"yes"}, {"protocol":"socks4"}, {"password":"secret"},
                         *({"host":host} for host in ("", "http://127.0.0.1", "user:secret@localhost", "a/b", "a\nb", "-bad.test", "a..b"))):
             with self.subTest(changes=changes), self.assertRaises(ValidationError):
                 dp.DownloadProxySettings(**changes)
@@ -67,7 +67,7 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_save_reload_and_csrf_rejection(self):
         url = "/api/settings/download-proxy"
-        payload = dp.DownloadProxySettings(enabled=True, protocol="socks5", port=7890).model_dump()
+        payload = dp.DownloadProxySettings(enabled=True, upload_enabled=True, protocol="socks5", port=7890).model_dump()
         self.assertFalse((await self.client.get(url)).json()["settings"]["enabled"])
         for headers in ({}, {**HEADERS, "Origin":"https://evil.test"}, {**HEADERS, "Sec-Fetch-Site":"cross-site"}):
             self.assertEqual((await self.client.put(url, json=payload, headers=headers)).status_code, 403)
@@ -108,6 +108,23 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
                                               json=dp.DownloadProxySettings(enabled=True).model_dump())
         self.assertEqual(response.status_code, 502)
         self.assertNotIn("PRIVATE", response.text)
+
+    async def test_upload_only_probe_uses_proxy_and_does_not_save(self):
+        factory = AsyncMock()
+        factory.return_value.__aenter__.return_value.head.return_value = httpx.Response(204)
+        payload = dp.DownloadProxySettings(upload_enabled=True, port=7890).model_dump()
+        with patch.object(main.httpx, "AsyncClient", return_value=factory.return_value) as constructor:
+            result = await self.client.post("/api/settings/download-proxy/test", headers=HEADERS, json=payload)
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(constructor.call_args.kwargs["proxy"], "http://127.0.0.1:7890")
+        self.assertFalse(list(Path(self.folder.name).iterdir()))
+
+    async def test_disabled_probe_does_not_access_network(self):
+        with patch.object(main.httpx, "AsyncClient") as constructor:
+            result = await self.client.post("/api/settings/download-proxy/test", headers=HEADERS,
+                                           json=dp.DownloadProxySettings().model_dump())
+        self.assertEqual(result.status_code, 400)
+        constructor.assert_not_called()
 
 
 class DownloadRoutingTests(unittest.IsolatedAsyncioTestCase):

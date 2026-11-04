@@ -2,6 +2,7 @@
     const form = document.getElementById('proxyForm');
     const fields = document.getElementById('proxyFields');
     const enabled = document.getElementById('proxyEnabled');
+    const uploadEnabled = document.getElementById('proxyUploadEnabled');
     const protocol = document.getElementById('proxyProtocol');
     const host = document.getElementById('proxyHost');
     const port = document.getElementById('proxyPort');
@@ -9,13 +10,15 @@
     const test = document.getElementById('proxyTest');
     let editable = false;
     let busy = false;
+    let supportsUploadProxy = false;
 
     function show(message, kind = '') {
         status.textContent = message;
         status.dataset.kind = kind;
     }
     function values() {
-        return {enabled:enabled.checked, protocol:protocol.value, host:host.value.trim(), port:Number(port.value)};
+        return {enabled:enabled.checked, ...(supportsUploadProxy ? {upload_enabled:uploadEnabled.checked} : {}),
+            protocol:protocol.value, host:host.value.trim(), port:Number(port.value)};
     }
     async function request(path, method = 'GET', payload) {
         const response = await fetch('/api/settings/download-proxy' + path, {
@@ -25,7 +28,7 @@
         });
         const data = await response.json().catch(() => ({}));
         if(!response.ok) {
-            const message = response.status === 404 ? '后台尚未加载下载代理功能，请重启后台后重新打开设置。'
+            const message = response.status === 404 ? '后台尚未加载传输代理功能，请重启后台后重新打开设置。'
                 : typeof data.detail === 'string' ? data.detail
                 : response.status === 422 ? '请检查代理协议、主机名和端口（1–65535），不要在主机名里填写完整 URL。'
                 : '请求失败，请检查后台是否正在运行。';
@@ -56,9 +59,13 @@
             return;
         }
         enabled.checked = data.settings.enabled;
+        supportsUploadProxy = typeof data.settings.upload_enabled === 'boolean';
+        uploadEnabled.checked = data.settings.upload_enabled === true;
+        uploadEnabled.disabled = !supportsUploadProxy;
         protocol.value = data.settings.protocol;
         host.value = data.settings.host;
         port.value = data.settings.port;
-        show(data.warning || (enabled.checked ? '自定义视频下载代理已启用。' : '自定义视频下载代理未启用。'), data.warning ? 'error' : '');
+        const warning = data.warning || (!supportsUploadProxy ? '后台尚未加载素材上传代理功能，请重启后台后刷新此页；仅关闭网页不会重启后台。' : '');
+        show(warning || `视频下载代理：${enabled.checked ? '已启用' : '未启用'}；素材上传代理：${uploadEnabled.checked ? '已启用' : '未启用'}。`, warning ? 'error' : '');
     }).catch(error => show(error.message, 'error'));
 })();

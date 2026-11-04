@@ -2272,12 +2272,20 @@ def video_download_client_options(url=None):
         settings = download_proxy.load_settings(os.path.join(DATA_DIR, "download-proxy.json"))
         return download_proxy.client_options(settings, url)
     except Exception as exc:
-        raise HTTPException(status_code=503, detail="视频下载代理配置无法读取，请在更多设置 → 视频下载代理中重新保存。") from exc
+        raise HTTPException(status_code=503, detail="视频下载代理配置无法读取，请在更多设置 → 上传/下载代理中重新保存。") from exc
+
+
+def cloud_upload_client_options(url=None):
+    try:
+        settings = download_proxy.load_settings(os.path.join(DATA_DIR, "download-proxy.json"))
+        return download_proxy.upload_client_options(settings, url)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="素材上传代理配置无法读取，请在更多设置 → 上传/下载代理中重新保存；未切换直连。") from exc
 
 
 def require_download_proxy_admin(request: Request):
     if not _is_authorized_backend_restart_request(request, "x-infinite-canvas-download-proxy"):
-        raise HTTPException(status_code=403, detail="请在运行后台的电脑上，通过 localhost 或 127.0.0.1 打开设置。局域网客户端不能修改服务器下载代理。")
+        raise HTTPException(status_code=403, detail="请在运行后台的电脑上，通过 localhost 或 127.0.0.1 打开设置。局域网客户端不能修改服务器上传/下载代理。")
 
 
 @app.get("/api/settings/download-proxy")
@@ -2292,7 +2300,7 @@ async def get_download_proxy_settings(request: Request):
         return {"can_edit": True, "settings": settings.model_dump()}
     except Exception:
         return {"can_edit": True, "settings": download_proxy.DownloadProxySettings().model_dump(),
-                "warning": "保存的代理配置无法读取；请重新保存。当前下载不会静默改为直连。"}
+                "warning": "保存的代理配置无法读取；请重新保存。当前上传/下载不会静默改为直连。"}
 
 
 @app.put("/api/settings/download-proxy")
@@ -2302,18 +2310,19 @@ async def set_download_proxy_settings(payload: download_proxy.DownloadProxySetti
         download_proxy.save_settings(os.path.join(DATA_DIR, "download-proxy.json"), payload)
     except OSError as exc:
         raise HTTPException(status_code=500, detail="代理设置保存失败，请检查 data 目录的写入权限。") from exc
-    return {"settings": payload.model_dump(), "message": "已保存，对下一次开始的视频下载生效；正在下载的任务保持原连接。"}
+    return {"settings": payload.model_dump(), "message": "已保存，对下一次开始的素材云端上传和视频下载生效；进行中的传输保持原连接。"}
 
 
 @app.post("/api/settings/download-proxy/test")
 async def test_download_proxy_settings(payload: download_proxy.DownloadProxySettings, request: Request):
     require_download_proxy_admin(request)
-    if not payload.enabled:
-        raise HTTPException(status_code=400, detail="请先勾选启用，再测试代理。")
+    if not (payload.enabled or payload.upload_enabled):
+        raise HTTPException(status_code=400, detail="请先勾选素材上传代理或视频下载代理，再测试连接。")
     started = time.monotonic()
 
     async def probe():
-        async with httpx.AsyncClient(**download_proxy.client_options(payload), timeout=8.0,
+        options = download_proxy.client_options(payload.model_copy(update={"enabled": True}))
+        async with httpx.AsyncClient(**options, timeout=8.0,
                                      follow_redirects=False) as client:
             # Public, fixed, tiny response. No generation keys, prompts or signed media URLs.
             return await client.head("https://www.gstatic.com/generate_204")
@@ -2329,7 +2338,7 @@ async def test_download_proxy_settings(payload: download_proxy.DownloadProxySett
     except Exception as exc:
         raise HTTPException(status_code=502, detail="代理测试失败：请确认代理软件已启动、协议和端口正确，且允许本机连接。") from exc
     return {"ok": True, "latency_ms": round((time.monotonic() - started) * 1000),
-            "message": "代理 HTTPS 连接正常；测试仅验证公开测试地址，不保证视频 CDN 的速度。此测试不会保存设置。"}
+            "message": "代理 HTTPS 连接正常；测试仅验证公开测试地址，不保证上传服务可用或视频 CDN 的速度。此测试不会保存设置。"}
 
 
 def schedule_backend_restart(delay_seconds: float = 1.5) -> bool:
@@ -7556,45 +7565,81 @@ def local_media_path_for_cloud_upload(ref_url: str, allowed_prefixes=("image/", 
 def local_video_path_for_cloud_upload(ref_url: str) -> str:
     return local_media_path_for_cloud_upload(ref_url, ("video/",))
 
+def cloud_upload_http_message(status: int) -> str:
+    # Do not expose upstream HTML, reflected URLs, credentials or filenames.
+    if status in {401, 403}:
+        return "上传服务拒绝访问，可能是网络出口或服务访问限制；请检查代理线路，或使用自己的公网素材链接。"
+    if status == 407:
+        return "代理要求账号密码认证，当前设置不支持；请改用可信的免认证本机代理端口。"
+    if status == 413:
+        return "素材超过上传服务的大小限制；请压缩素材，或使用自己的公网存储。"
+    if status == 429:
+        return "上传服务请求过于频繁；请稍后重试。"
+    if status >= 500:
+        return "上传服务或中间网关暂时异常；请稍后重试，或使用自己的公网素材链接。"
+    if status in {404, 405}:
+        return "上传接口地址不存在或不支持当前请求；请检查上传服务地址配置。"
+    return "上传服务未接受请求；请检查素材格式、大小和上传服务的可用性。"
+
+
+async def upload_cloud_media(path: str, source_url: str, *, service: str, label: str,
+                             upload_url: str, file_field: str, expires: str, data=None) -> Dict[str, str]:
+    options = cloud_upload_client_options(upload_url)
+    proxy_active = bool(options.get("proxy"))
+    route = ("已使用自定义素材上传代理，未切换直连。" if proxy_active else
+             "未使用自定义素材上传代理；可在更多设置 → 上传/下载代理中启用。")
+    try:
+        async with httpx.AsyncClient(**options,
+                                     timeout=httpx.Timeout(connect=20.0, read=600.0, write=600.0, pool=20.0),
+                                     follow_redirects=True) as client:
+            with open(path, "rb") as fh:
+                files = {file_field: (os.path.basename(path), fh, content_type_for_path(path))}
+                response = await client.post(upload_url, files=files, data=data)
+        if not response.is_success:
+            raise HTTPException(status_code=response.status_code,
+                                detail=f"{label} 上传失败（HTTP {response.status_code}）：{cloud_upload_http_message(response.status_code)}{route}")
+        direct_url = response.text.strip()
+        try:
+            parsed = urllib.parse.urlsplit(direct_url)
+            valid = (parsed.scheme in {"http", "https"} and parsed.hostname
+                     and not parsed.username and not parsed.password
+                     and not re.search(r"[\s<>\x00-\x1f\x7f]", direct_url))
+            _ = parsed.port  # Reject malformed ports before returning a link.
+        except ValueError:
+            valid = False
+        if not valid:
+            raise HTTPException(status_code=502,
+                                detail=f"{label} 未返回有效素材直链（HTTP {response.status_code}），可能返回了网页或空响应；请检查上传服务或代理线路。{route}")
+        return {"url": direct_url, "source": source_url, "name": os.path.basename(path), "expires": expires, "service": service}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if isinstance(exc, httpx.ProxyError):
+            message = "代理连接或隧道建立失败；请检查代理是否运行、协议和端口是否正确。"
+        elif isinstance(exc, httpx.TimeoutException):
+            message = "上传连接或传输超时；请检查网络、代理线路和素材大小后重试。"
+        elif isinstance(exc, httpx.ConnectError):
+            message = "无法建立安全连接；请检查网络、代理协议/端口和证书配置，不要关闭证书验证。"
+        elif isinstance(exc, ImportError):
+            message = "代理依赖不可用；使用 SOCKS5 时请更新依赖后重启后台。"
+        elif isinstance(exc, OSError):
+            message = "素材文件无法读取；请确认文件仍存在且后台有读取权限。"
+        else:
+            message = "上传传输异常；请检查上传服务和代理线路后重试。"
+        raise HTTPException(status_code=502, detail=f"{label} 上传失败：{message}{route}") from exc
+
+
 async def upload_video_to_litterbox(path: str, source_url: str) -> Dict[str, str]:
     upload_url = os.getenv("LITTERBOX_UPLOAD_URL", "https://litterbox.catbox.moe/resources/internals/api.php").strip() or "https://litterbox.catbox.moe/resources/internals/api.php"
     time_value = os.getenv("LITTERBOX_TIME", "72h").strip() or "72h"
-    ct = content_type_for_path(path)
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=600.0, write=600.0, pool=20.0), follow_redirects=True) as client:
-            with open(path, "rb") as fh:
-                files = {"fileToUpload": (os.path.basename(path), fh, ct)}
-                data = {"reqtype": "fileupload", "time": time_value}
-                response = await client.post(upload_url, data=data, files=files)
-        if not response.is_success:
-            raise HTTPException(status_code=response.status_code, detail=f"Litterbox 上传失败：{response.text[:300]}")
-        direct_url = response.text.strip().splitlines()[0].strip()
-        if not re.match(r"^https?://", direct_url, re.I):
-            raise HTTPException(status_code=502, detail=f"Litterbox 返回了无法识别的链接：{response.text[:300]}")
-        return {"url": direct_url, "source": source_url, "name": os.path.basename(path), "expires": time_value, "service": "litterbox"}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Litterbox 上传异常：{exc}") from exc
+    return await upload_cloud_media(path, source_url, service="litterbox", label="Litterbox",
+                                    upload_url=upload_url, file_field="fileToUpload", expires=time_value,
+                                    data={"reqtype": "fileupload", "time": time_value})
 
 async def upload_video_to_temp_sh(path: str, source_url: str) -> Dict[str, str]:
     upload_url = os.getenv("TEMP_SH_UPLOAD_URL", "https://temp.sh/upload").strip() or "https://temp.sh/upload"
-    ct = content_type_for_path(path)
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=600.0, write=600.0, pool=20.0), follow_redirects=True) as client:
-            with open(path, "rb") as fh:
-                files = {"file": (os.path.basename(path), fh, ct)}
-                response = await client.post(upload_url, files=files)
-        if not response.is_success:
-            raise HTTPException(status_code=response.status_code, detail=f"Temp.sh 上传失败：{response.text[:300]}")
-        direct_url = response.text.strip().splitlines()[0].strip()
-        if not re.match(r"^https?://", direct_url, re.I):
-            raise HTTPException(status_code=502, detail=f"Temp.sh 返回了无法识别的链接：{response.text[:300]}")
-        return {"url": direct_url, "source": source_url, "name": os.path.basename(path), "expires": "3 days", "service": "temp.sh"}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Temp.sh 上传异常：{exc}") from exc
+    return await upload_cloud_media(path, source_url, service="temp.sh", label="Temp.sh",
+                                    upload_url=upload_url, file_field="file", expires="3 days")
 
 async def upload_local_video_to_cloud(
     ref_url: str,
@@ -7611,12 +7656,12 @@ async def upload_local_video_to_cloud(
     if service in {"temp", "temp.sh", "tempsh"}:
         return await upload_video_to_temp_sh(path, ref_url)
     errors = []
-    for name, func in (("litterbox", upload_video_to_litterbox), ("temp.sh", upload_video_to_temp_sh)):
+    for func in (upload_video_to_litterbox, upload_video_to_temp_sh):
         try:
             return await func(path, ref_url)
         except HTTPException as exc:
-            errors.append(f"{name}: {exc.detail}")
-    raise HTTPException(status_code=502, detail="云端上传失败：" + "；".join(errors))
+            errors.append(exc.detail)
+    raise HTTPException(status_code=502, detail="云端上传失败：\n" + "\n".join(errors))
 
 async def upload_local_video_to_temp_sh(ref_url: str) -> Dict[str, str]:
     return await upload_local_video_to_cloud(ref_url, "auto")
@@ -7712,7 +7757,7 @@ async def save_remote_video_to_output(url, prefix="video_", category="output"):
         except Exception:
             pass
         if proxy_options.get("proxy"):
-            raise HTTPException(status_code=502, detail="视频下载失败（已启用下载代理）。请在更多设置 → 视频下载代理中测试协议、端口和线路；未自动切换直连。") from e
+            raise HTTPException(status_code=502, detail="视频下载失败（已启用下载代理）。请在更多设置 → 上传/下载代理中测试协议、端口和线路；未自动切换直连。") from e
         return url
     finally:
         if temp_path and os.path.exists(temp_path):
