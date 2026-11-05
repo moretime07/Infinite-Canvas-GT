@@ -65,6 +65,31 @@ class CanvasVideoTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task["error"], "upstream failed")
         self.assertEqual(task["status_code"], 502)
         self.assertEqual(task["upstream_task_id"], "upstream-failed")
+        self.assertFalse(task["recoverable"])
+
+    async def test_background_video_task_marks_result_download_recoverable(self):
+        task_id = "canvas_video_recoverable"
+        payload = main.CanvasVideoRequest(prompt="test prompt", provider_id="wan")
+        with main.CANVAS_TASK_LOCK:
+            main.CANVAS_TASKS[task_id] = {
+                "id": task_id, "type": "video", "status": "queued",
+                "result": None, "error": "",
+            }
+
+        async def fail(_payload):
+            exc = main.HTTPException(502, "saved result unavailable")
+            exc.upstream_task_id = "upstream-recoverable"
+            exc.recoverable = True
+            raise exc
+
+        with patch.object(main, "canvas_video", side_effect=fail):
+            await main.run_canvas_video_task(task_id, payload)
+
+        with main.CANVAS_TASK_LOCK:
+            task = dict(main.CANVAS_TASKS[task_id])
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(task["upstream_task_id"], "upstream-recoverable")
+        self.assertTrue(task["recoverable"])
 
 
 if __name__ == "__main__":

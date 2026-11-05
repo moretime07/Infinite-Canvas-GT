@@ -2685,6 +2685,11 @@ class CanvasVideoRequest(BaseModel):
     multimodal: bool = False
     trusted_asset: bool = False
 
+class CanvasVideoTaskQueryRequest(BaseModel):
+    provider_id: str = "comfly"
+    task_id: str = Field(min_length=1, max_length=240)
+    model: str = ""
+
 class CanvasMotionTaskRequest(BaseModel):
     source_url: str
     depth_enabled: bool = True
@@ -15090,11 +15095,17 @@ async def generate_dashscope_wan3_video(payload: CanvasVideoRequest, provider: d
                 try:
                     videos = await save_video_outputs([video_url])
                 except Exception as exc:
-                    raise_dashscope_wan3_error(
+                    reason = str(getattr(exc, "detail", "") or "").strip()
+                    if not reason:
+                        reason = "请检查网络连接和视频下载代理设置。"
+                    error = HTTPException(
                         502,
-                        f"阿里云 Wan 3.0 任务已成功，但结果保存失败，task_id={task_id}。",
-                        task_id,
+                        f"阿里云 Wan 3.0 任务已成功，但结果保存失败，task_id={task_id}。{reason} "
+                        "任务结果已保留；修复网络或代理后可用下方按钮重新获取，无需重新生成。",
                     )
+                    error.upstream_task_id = task_id
+                    error.recoverable = True
+                    raise error from exc
                 return {
                     "videos": videos,
                     "task_id": task_id,
@@ -15106,6 +15117,45 @@ async def generate_dashscope_wan3_video(payload: CanvasVideoRequest, provider: d
                 detail = dashscope_wan3_error_detail(f"阿里云 Wan 3.0 任务状态为 {status}", task_raw)
                 raise_dashscope_wan3_error(502, detail, task_id)
             await asyncio.sleep(min(poll_delay, max(0.05, deadline - time.monotonic())))
+
+
+async def fetch_dashscope_wan3_task(provider: dict, task_id: str, model: str) -> dict:
+    """Query an existing native Wan task without submitting or billing again."""
+    if not is_maas_wan3_provider(provider, model):
+        raise HTTPException(400, "当前任务不是阿里云 MaaS Wan 3.0 原生任务，无法使用该结果恢复接口。")
+    api_key = provider_env_key_value(provider["id"])
+    if not api_key:
+        raise HTTPException(400, f"未配置 {provider.get('name') or provider['id']} 的 API Key，请在 API 设置中填写。")
+    root = dashscope_wan3_api_root(provider)
+    task_url = f"{root}/api/v1/tasks/{urllib.parse.quote(task_id, safe='')}"
+    timeout = httpx.Timeout(connect=20.0, read=60.0, write=30.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        try:
+            response = await client.get(task_url, headers=dashscope_wan3_headers(api_key, json_body=False))
+        except httpx.HTTPError as exc:
+            log_net_error(f"查询阿里云 Wan 3.0 任务网络/TLS错误 task_id={task_id}", exc)
+            raise_dashscope_wan3_error(
+                502,
+                f"查询阿里云 Wan 3.0 任务失败，task_id={task_id}。请检查网络后重试，无需重新生成。",
+                task_id,
+            )
+        try:
+            raw = response.json() if response.content else {}
+        except Exception:
+            raw = None
+        if response.status_code >= 400:
+            raise_dashscope_wan3_error(
+                response.status_code,
+                dashscope_wan3_error_detail("查询阿里云 Wan 3.0 任务失败", raw, response.status_code),
+                task_id,
+            )
+        if not isinstance(raw, dict):
+            raise_dashscope_wan3_error(
+                502,
+                f"阿里云 Wan 3.0 查询接口返回了非 JSON 响应，task_id={task_id}。",
+                task_id,
+            )
+        return raw
 
 
 @app.post("/api/canvas-video")
@@ -15767,6 +15817,7 @@ async def run_canvas_video_task(task_id: str, payload: CanvasVideoRequest):
                     "error": str(detail),
                     "status_code": status_code,
                     "upstream_task_id": str(upstream_task_id or ""),
+                    "recoverable": bool(getattr(exc, "recoverable", False)),
                     "updated_at": time.time(),
                 })
     finally:
@@ -15872,6 +15923,55 @@ async def get_canvas_video_task(task_id: str):
     if not task or task.get("type") != "video":
         raise HTTPException(status_code=404, detail="视频任务不存在，可能服务已重启或任务已过期。")
     return task
+
+
+@app.post("/api/canvas-video-task-query")
+async def query_canvas_video_task(payload: CanvasVideoTaskQueryRequest):
+    """Recover a succeeded upstream result without creating a second paid task."""
+    provider = get_api_provider(payload.provider_id)
+    task_id = str(payload.task_id or "").strip()
+    model = str(payload.model or "").strip()
+    if not is_maas_wan3_provider(provider, model):
+        raise HTTPException(400, "目前只支持重新获取阿里云 MaaS Wan 3.0 已生成的任务结果。")
+    raw = await fetch_dashscope_wan3_task(provider, task_id, model)
+    task_output = raw.get("output") if isinstance(raw.get("output"), dict) else {}
+    status = str(task_output.get("task_status") or raw.get("task_status") or "").strip().upper()
+    if status == "FAILED" or status == "CANCELED" or status == "UNKNOWN":
+        raise_dashscope_wan3_error(
+            502,
+            dashscope_wan3_error_detail(f"阿里云 Wan 3.0 任务状态为 {status}", raw),
+            task_id,
+        )
+    if status != "SUCCEEDED":
+        return {"status": "running", "task_id": task_id, "state": status or "PENDING"}
+    video_url = str(task_output.get("video_url") or raw.get("video_url") or "").strip()
+    if not video_url:
+        raise_dashscope_wan3_error(
+            502,
+            f"阿里云 Wan 3.0 任务已成功，但没有返回 video_url，task_id={task_id}。",
+            task_id,
+        )
+    try:
+        videos = await save_video_outputs([video_url])
+    except Exception as exc:
+        reason = str(getattr(exc, "detail", "") or "").strip()
+        if not reason:
+            reason = "请检查网络连接和视频下载代理设置。"
+        error = HTTPException(
+            502,
+            f"阿里云 Wan 3.0 任务已成功，但结果保存仍然失败，task_id={task_id}。{reason}",
+        )
+        error.upstream_task_id = task_id
+        error.recoverable = True
+        raise error from exc
+    return {
+        "status": "succeeded",
+        "videos": videos,
+        "task_id": task_id,
+        "model": model,
+        "provider_id": provider["id"],
+        "upstream_status": "succeeded",
+    }
 
 
 # --- Canvas LLM ---

@@ -40,9 +40,9 @@ class DashScopeWan3Tests(unittest.IsolatedAsyncioTestCase):
         values.update(overrides)
         return main.CanvasVideoRequest(**values)
 
-    async def run_canvas(self, handler, payload=None, provider=None):
+    async def run_canvas(self, handler, payload=None, provider=None, save=None):
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        save = AsyncMock(return_value=["/assets/output/wan3.mp4"])
+        save = save or AsyncMock(return_value=["/assets/output/wan3.mp4"])
         with patch.object(main, "get_api_provider", return_value=provider or self.provider()), \
                 patch.object(main, "provider_env_key_value", return_value=API_KEY), \
                 patch.object(main.httpx, "AsyncClient", return_value=client), \
@@ -322,6 +322,61 @@ class DashScopeWan3Tests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(API_KEY, combined)
         self.assertNotIn(RESULT_URL, combined)
         self.assertIn("已隐藏", raised.exception.detail)
+
+    async def test_save_failure_keeps_task_id_and_proxy_reason_for_recovery(self):
+        def handler(request):
+            if request.method == "POST":
+                return httpx.Response(200, json={"output": {"task_id": "task/one", "task_status": "PENDING"}})
+            return httpx.Response(200, json={"output": {
+                "task_id": "task/one", "task_status": "SUCCEEDED", "video_url": RESULT_URL,
+            }})
+
+        failure = main.HTTPException(502, "视频下载失败（已启用下载代理），请检查端口")
+        save = AsyncMock(side_effect=failure)
+        with self.assertRaises(main.HTTPException) as raised:
+            await self.run_canvas(handler, save=save)
+        save.assert_awaited_once_with([RESULT_URL])
+        self.assertIn("视频下载失败（已启用下载代理）", raised.exception.detail)
+        self.assertIn("无需重新生成", raised.exception.detail)
+        self.assertEqual(getattr(raised.exception, "upstream_task_id", ""), "task/one")
+        self.assertTrue(getattr(raised.exception, "recoverable", False))
+        self.assertNotIn(RESULT_URL, raised.exception.detail)
+        self.assertNotIn(API_KEY, raised.exception.detail)
+
+    async def test_recovery_queries_existing_task_and_never_submits_again(self):
+        calls = []
+        save = AsyncMock(return_value=["/assets/output/recovered.mp4"])
+
+        def handler(request):
+            calls.append((request.method, str(request.url), request.headers.get("Authorization")))
+            self.assertEqual(request.method, "GET")
+            return httpx.Response(200, json={"output": {
+                "task_id": "task/one", "task_status": "SUCCEEDED", "video_url": RESULT_URL,
+            }})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch.object(main, "get_api_provider", return_value=self.provider()), \
+                patch.object(main, "provider_env_key_value", return_value=API_KEY), \
+                patch.object(main.httpx, "AsyncClient", return_value=client), \
+                patch.object(main, "save_video_outputs", save):
+            result = await main.query_canvas_video_task(main.CanvasVideoTaskQueryRequest(
+                provider_id="custom-api-7", task_id="task/one", model="wan3.0-video",
+            ))
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["videos"], ["/assets/output/recovered.mp4"])
+        self.assertEqual(calls, [("GET", TASK_URL, f"Bearer {API_KEY}")])
+        save.assert_awaited_once_with([RESULT_URL])
+
+    async def test_recovery_rejects_unsupported_model_without_network(self):
+        constructor = AsyncMock()
+        with patch.object(main, "get_api_provider", return_value=self.provider()), \
+                patch.object(main.httpx, "AsyncClient", constructor):
+            with self.assertRaises(main.HTTPException) as raised:
+                await main.query_canvas_video_task(main.CanvasVideoTaskQueryRequest(
+                    provider_id="custom-api-7", task_id="task/one", model="veo3-fast",
+                ))
+        self.assertEqual(raised.exception.status_code, 400)
+        constructor.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -6673,14 +6673,15 @@ function renderPendingOutput(pending){
         const taskId = pending.recoverTaskId || '';
         const querying = Boolean(pending.querying);
         const msg = pending.error || tr('canvas.generationFailed');
-        const sub = taskId ? `任务 ID：${escapeHtml(taskId)}` : '没有任务 ID，无法查询';
+        const videoRecovery = pending.canvasTaskType === 'video' && pending.upstreamRecoverable;
+        const sub = taskId ? `${videoRecovery ? '已生成，等待取回' : '任务'} ID：${escapeHtml(taskId)}` : '没有任务 ID，无法查询';
         return `<div class="output-img-wrap loading-wrap recoverable" data-pending-id="${escapeAttr(pending.id)}"${pendingOutputStyle(pending)}>
             <span class="output-time-pill failed">失败</span>
             <div class="output-recover-state">
                 <i data-lucide="refresh-cw" class="${querying ? 'spinning' : ''}"></i>
                 <div class="output-recover-title">${querying ? '查询中' : '任务未丢失'}</div>
                 <div class="output-recover-sub" title="${escapeAttr(msg)}">${sub}</div>
-                <button class="output-recover-query" type="button" ${taskId && !querying ? '' : 'disabled'}>${querying ? '查询中...' : '查询结果'}</button>
+                <button class="output-recover-query" type="button" ${taskId && !querying ? '' : 'disabled'}>${querying ? '查询中...' : (videoRecovery ? '重新获取视频' : '查询结果')}</button>
             </div>
             <button class="output-del" title="${tr('common.delete')}">×</button>
         </div>`;
@@ -7055,7 +7056,8 @@ function bindOutputWrap(wrap, node){
             const pid = wrap.dataset.pendingId;
             if(pid){
                 const pending = pendingById(node, pid);
-                if(pending?.canvasTaskType === 'video') resumeCanvasVideoPending(pid);
+                if(pending?.canvasTaskType === 'video' && pending.failed) recoverCanvasVideoResult(pid);
+                else if(pending?.canvasTaskType === 'video') resumeCanvasVideoPending(pid);
                 else queryRecoverPendingOutput(pid);
             }
         };
@@ -11578,6 +11580,26 @@ async function runVideoNode(nodeId, opts={}){
             if(opts.cascade) throw err;
             return;
         }
+        const recoverableTaskId = err.taskData?.recoverable
+            ? (err.taskData.upstream_task_id || err.taskData.task_id || '')
+            : '';
+        if(recoverableTaskId && pending.canvasTaskId){
+            pending.failed = true;
+            pending.querying = false;
+            pending.error = err.message || tr('canvas.videoFailed');
+            pending.recoverTaskId = recoverableTaskId;
+            pending.providerId = err.taskData?.provider_id || pending.providerId || providerIdForPending(pending);
+            pending.upstreamRecoverable = true;
+            pending.canvasTaskStatus = 'failed';
+            addGenerationLog({run, outputs:[], runMs:meta.runMs || 0, error:pending.error});
+            node.runStatus = 'failed';
+            node.runError = pending.error;
+            refreshRunNodes(node, out);
+            scheduleSave();
+            if(opts.cascade) throw err;
+            alert(pending.error);
+            return;
+        }
         addGenerationLog({run, outputs:[], runMs:meta.runMs || 0, error:err.message || String(err)});
         if(out) out._pending = (out._pending || []).filter(p => p.id !== pendingId);
         if(isCascadeAbortError(err)){
@@ -13537,6 +13559,48 @@ async function queryRecoverPendingOutput(pendingId){
         }
     }
 }
+async function recoverCanvasVideoResult(pendingId){
+    const out = findOutputByPendingId(pendingId);
+    const pending = pendingById(out, pendingId);
+    if(!out || !pending || pending.querying) return;
+    const taskId = pending.recoverTaskId || extractUpstreamTaskId(pending.error || '');
+    if(!taskId){
+        showErrorModal('没有任务 ID，无法查询结果', tr('canvas.apiFailed'));
+        return;
+    }
+    pending.querying = true;
+    pending.error = pending.error || '';
+    refreshNodes([out.id]);
+    try {
+        const res = await fetch('/api/canvas-video-task-query', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+                provider_id:providerIdForPending(pending),
+                task_id:taskId,
+                model:pending.run?.node?.model || pending.run?.request?.model || ''
+            })
+        });
+        const data = await res.json().catch(() => ({}));
+        if(!res.ok) throw new Error(apiErrorMessage(data, tr('canvas.videoFailed')));
+        if(data.status === 'succeeded'){
+            completeCanvasVideoTask(pending.canvasTaskId || taskId, data);
+            return;
+        }
+        pending.error = `阿里云任务仍在处理中（${data.state || 'PENDING'}），请稍后再次获取。`;
+        setStatus(pending.error);
+    } catch(err) {
+        pending.error = err.message || tr('canvas.videoFailed');
+        showErrorModal(pending.error, tr('canvas.apiFailed'));
+    } finally {
+        const latest = pendingById(out, pendingId);
+        if(latest){
+            latest.querying = false;
+            refreshNodes([out.id]);
+            scheduleSave();
+        }
+    }
+}
 function sleep(ms){ return new Promise(resolve => setTimeout(resolve, ms)); }
 async function pollCanvasImageTask(taskId, options={}){
     if(!taskId) return 'failed';
@@ -13794,8 +13858,28 @@ function failCanvasVideoTask(taskId, message, taskData){
     if(!found) return;
     const {out, pending} = found;
     const {run, runMs} = canvasVideoRunMeta(pending, taskData);
-    out._pending = (out._pending || []).filter(p => p.id !== pending.id);
     const gen = nodes.find(n => n.id === run?.node?.id);
+    const recoverTaskId = taskData?.upstream_task_id || taskData?.task_id || extractUpstreamTaskId(message);
+    if(recoverTaskId && taskData?.recoverable){
+        pending.failed = true;
+        pending.querying = false;
+        pending.error = message || tr('canvas.videoFailed');
+        pending.recoverTaskId = recoverTaskId;
+        pending.providerId = taskData?.provider_id || pending.providerId || providerIdForPending(pending);
+        pending.upstreamRecoverable = Boolean(taskData?.recoverable);
+        pending.canvasTaskStatus = 'failed';
+        if(gen){
+            gen.runStatus = 'failed';
+            gen.runError = pending.error;
+            if(pending?.cascadeTargetId) gen._cascadeFailed = true;
+            gen.running = false;
+        }
+        addGenerationLog({run, outputs:[], runMs, error:pending.error});
+        refreshRunNodes(gen, out);
+        scheduleSave();
+        return;
+    }
+    out._pending = (out._pending || []).filter(p => p.id !== pending.id);
     if(gen){
         gen.runStatus = 'failed';
         gen.runError = message || tr('canvas.videoFailed');
