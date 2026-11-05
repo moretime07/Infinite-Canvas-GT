@@ -18,7 +18,8 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import HTTPException
-from tencent_vod_catalog import CATALOG, IMAGE_MODELS, VIDEO_MODELS
+from tencent_vod_catalog import (CATALOG, IMAGE_MODELS, VIDEO_MODELS, WAN_VIDEO_MODELS,
+                                 WAND_VIDEO_MODELS, VIDEO_MODEL_ALIASES, canonical_model_id)
 
 
 PROTOCOL = "tencent-vod"
@@ -46,9 +47,14 @@ def _verification_records():
 def model_metadata(config, sub_app_id):
     with _verification_lock:
         records = _verification_records().get(_verification_scope(config, sub_app_id), {})
-    return {key: {**value, "verification": "verified" if key in records else "unverified",
+    return {key: {**value, "video_model_aliases": VIDEO_MODEL_ALIASES,
+                  "verification": "verified" if key in records else "unverified",
                   "verified_at": records.get(key), "source": "vod_documentation"}
             for key, value in CATALOG.items()}
+
+
+def model_aliases():
+    return dict(VIDEO_MODEL_ALIASES)
 
 
 def record_success(config, body, kind):
@@ -73,9 +79,13 @@ def record_success(config, body, kind):
 def model_spec(model, kind):
     if model in {"wand-vega-image-1.0-lite", "WAND-Vega-Image-1.0-Lite"}:
         model = MODEL_ID
+    requested_model = str(model or "").strip()
+    model = canonical_model_id(requested_model, kind)
     spec = CATALOG.get(model)
     if not spec or spec["kind"] != kind:
-        raise HTTPException(400, "该模型尚未适配腾讯云 VOD 的此类节点，请在 API 设置中重新载入并选择对应模型。")
+        options = IMAGE_MODELS if kind == "image" else VIDEO_MODELS
+        raise HTTPException(400, f"模型“{requested_model or '(empty)'}”尚未适配腾讯云 VOD 的此类节点。"
+                                f"可选目录模型：{', '.join(options)}")
     return spec
 
 
@@ -179,7 +189,9 @@ async def discover(config, sub_app_id=0):
             "message": "腾讯云签名及点播应用连接验证通过。已载入官方文档模型目录（不是账号授权清单）；未验证的模型需实际生成成功后才标记为已验证。",
             "tencent_sub_app_id": int(sub_app_id), "apps": apps,
             "total": len(CATALOG), "model_count": len(CATALOG), "all": list(CATALOG), "image_models": list(IMAGE_MODELS),
-            "video_models": list(VIDEO_MODELS), "chat_models": [], "model_metadata": model_metadata(config, sub_app_id)}
+            "video_models": list(VIDEO_MODELS), "chat_models": [], "model_metadata": model_metadata(config, sub_app_id),
+            "wand_video_models": list(WAND_VIDEO_MODELS), "wan_video_models": list(WAN_VIDEO_MODELS),
+            "video_model_aliases": model_aliases()}
 
 
 def image_request(prompt, size, model, references, sub_app_id, resolve_reference):
@@ -286,15 +298,17 @@ def video_request(payload, sub_app_id, resolve_reference):
         if spec["aspect_ratios"] and ratio not in spec["aspect_ratios"]:
             raise HTTPException(400, f"{spec['label']} 比例可选：{', '.join(spec['aspect_ratios'])}")
         output["AspectRatio"] = ratio
+    elif ratio == "adaptive" and "adaptive" in spec["aspect_ratios"]:
+        output["AspectRatio"] = ratio
     if values.get("generate_audio") and not spec["audio_generation"]:
         raise HTTPException(400, f"{spec['label']} 的 VOD 文档未声明音频生成开关，请关闭该开关后重试。")
     if spec["audio_generation"]:
         output["AudioGeneration"] = "Enabled" if values.get("generate_audio") else "Disabled"
     output["LogoAdd"] = "Enabled" if values.get("watermark") else "Disabled"
-    if values.get("enable_upsample"):
+    if values.get("enable_upsample") and spec["model_name"] != "wand-vega-video":
         output["EnhanceSwitch"] = "Enabled"
-    if values.get("camerafixed") or values.get("return_last_frame"):
-        raise HTTPException(400, "腾讯 VOD 普通视频接口未配置固定镜头/返回尾帧参数，请关闭对应开关，或在提示词描述镜头。")
+    if values.get("camerafixed"):
+        raise HTTPException(400, "腾讯 VOD 普通视频接口未配置固定镜头参数，请关闭对应开关，或在提示词描述镜头。")
     body = {"SubAppId": int(sub_app_id), "ModelName": spec["model_name"], "ModelVersion": spec["model_version"],
             "Prompt": values.get("prompt", ""), "EnhancePrompt": "Enabled" if values.get("enhance_prompt") else "Disabled",
             "OutputConfig": output}
@@ -313,6 +327,32 @@ def video_request(payload, sub_app_id, resolve_reference):
         for url in values.get(key) or []:
             if url:
                 files.append({**video_file(url, category, resolve_reference), "Usage": "Reference"})
+    if spec["model_name"] == "Wan":
+        if values.get("enable_upsample") and output.get("Resolution") not in {"720P", "1080P"}:
+            raise HTTPException(400, f"{spec['label']} 开启画质增强时必须选择 720P 或 1080P；480P 不支持增强。")
+    if spec["model_name"] == "wand-vega-video":
+        limits = spec["reference_limits"]
+        counts = {key: sum(file["Category"].lower() == key for file in files) for key in ("image", "video", "audio")}
+        for category, label in (("image", "图片"), ("video", "视频"), ("audio", "音频")):
+            if counts[category] > limits[category]:
+                raise HTTPException(400, f"{spec['label']} 最多支持 {limits[category]} 个{label}参考，"
+                                        f"当前为 {counts[category]} 个；不会静默丢弃多余素材。")
+        if len(files) > limits["total"]:
+            raise HTTPException(400, f"{spec['label']} 最多支持 {limits['total']} 个参考素材，"
+                                    f"当前为 {len(files)} 个；不会静默丢弃多余素材。")
+        if counts["audio"] and not (counts["image"] or counts["video"]):
+            raise HTTPException(400, f"{spec['label']} 的音频参考必须搭配至少一张图片或一个视频。")
+        if values.get("enable_upsample") and not output.get("Resolution"):
+            raise HTTPException(400, f"{spec['label']} 开启画质增强时必须选择至少 720P 的目标分辨率。")
+        extensions = {}
+        if values.get("return_last_frame"):
+            extensions["AdditionalParameters"] = json.dumps({"return_last_frame": True}, separators=(",", ":"))
+        if values.get("enhance_prompt"):
+            extensions["WandVegaParameters"] = json.dumps({"EnhancePromptMode": "enable"}, separators=(",", ":"))
+        if extensions:
+            body["ExtInfo"] = json.dumps(extensions, separators=(",", ":"))
+    elif values.get("return_last_frame"):
+        raise HTTPException(400, "腾讯 VOD 普通视频接口未配置返回尾帧参数，请关闭对应开关。")
     first = sum(f["Usage"] == "FirstFrame" for f in files)
     last = sum(f["Usage"] == "LastFrame" for f in files)
     if first > 1 or last > 1 or (last and not first):

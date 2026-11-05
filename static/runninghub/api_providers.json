@@ -2576,7 +2576,7 @@
             "id": "401::rgthree_comparer",
             "nodeId": "401",
             "fieldName": "rgthree_comparer",
-            "fieldValue": "{\"images\": [{\"name\": \"A\", \"selected\": true, \"url\": \"/view?filename=rgthree.compare._temp_rxvcu_00001_ypzed_1781060445.jpg&type=temp&subfolder=&rand=0.5342300665338324&Rh-Comfy-Auth=eyJ1c2VySWQiOiIyNDI4YjA1NDA0MTZjMWUyZTQ1MTdmZGY0MDBmNjYyNiIsInNpZ25FeHBpcmUiOjE3ODE2NjUyMjAwNTksInRzIjoxNzgxMDYwNDIwMDU5LCJzaWduIjoiYzM2ZmU0Yzg3YTY2ZWU0OWIxN2IxOThlYjdjNGZjODAifQ==&Rh-Identify=2428b0540416c1e2e4517fdf400f6626\"}, {\"name\": \"B\", \"selected\": true, \"url\": \"/view?filename=rgthree.compare._temp_rxvcu_00002_nonpv_1781060447.jpg&type=temp&subfolder=&rand=0.4756489753521683&Rh-Comfy-Auth=eyJ1c2VySWQiOiIyNDI4YjA1NDA0MTZjMWUyZTQ1MTdmZGY0MDBmNjYyNiIsInNpZ25FeHBpcmUiOjE3ODE2NjUyMjAwNTksInRzIjoxNzgxMDYwNDIwMDU5LCJzaWduIjoiYzM2ZmU0Yzg3YTY2ZWU0OWIxN2IxOThlYjdjNGZjODAifQ==&Rh-Identify=2428b0540416c1e2e4517fdf400f6626\"}]}",
+            "fieldValue": "{\"images\": [{\"name\": \"A\", \"selected\": true, \"url\": \"/view?filename=rgthree.compare._temp_rxvcu_00001_ypzed_1781060445.jpg&type=temp&subfolder=&rand=0.5342300665338324&Rh-Comfy-Auth=PUBLIC_PLACEHOLDER&Rh-Identify=PUBLIC_PLACEHOLDER\"}, {\"name\": \"B\", \"selected\": true, \"url\": \"/view?filename=rgthree.compare._temp_rxvcu_00002_nonpv_1781060447.jpg&type=temp&subfolder=&rand=0.4756489753521683&Rh-Comfy-Auth=PUBLIC_PLACEHOLDER&Rh-Identify=PUBLIC_PLACEHOLDER\"}]}",
             "fieldType": "TEXT",
             "label": "rgthree_comparer",
             "enabled": false,
@@ -3050,12 +3050,12 @@
                   {
                     "name": "A",
                     "selected": true,
-                    "url": "/view?filename=rgthree.compare._temp_rxvcu_00001_ypzed_1781060445.jpg&type=temp&subfolder=&rand=0.5342300665338324&Rh-Comfy-Auth=eyJ1c2VySWQiOiIyNDI4YjA1NDA0MTZjMWUyZTQ1MTdmZGY0MDBmNjYyNiIsInNpZ25FeHBpcmUiOjE3ODE2NjUyMjAwNTksInRzIjoxNzgxMDYwNDIwMDU5LCJzaWduIjoiYzM2ZmU0Yzg3YTY2ZWU0OWIxN2IxOThlYjdjNGZjODAifQ==&Rh-Identify=2428b0540416c1e2e4517fdf400f6626"
+                    "url": "/view?filename=rgthree.compare._temp_rxvcu_00001_ypzed_1781060445.jpg&type=temp&subfolder=&rand=0.5342300665338324&Rh-Comfy-Auth=PUBLIC_PLACEHOLDER&Rh-Identify=PUBLIC_PLACEHOLDER"
                   },
                   {
                     "name": "B",
                     "selected": true,
-                    "url": "/view?filename=rgthree.compare._temp_rxvcu_00002_nonpv_1781060447.jpg&type=temp&subfolder=&rand=0.4756489753521683&Rh-Comfy-Auth=eyJ1c2VySWQiOiIyNDI4YjA1NDA0MTZjMWUyZTQ1MTdmZGY0MDBmNjYyNiIsInNpZ25FeHBpcmUiOjE3ODE2NjUyMjAwNTksInRzIjoxNzgxMDYwNDIwMDU5LCJzaWduIjoiYzM2ZmU0Yzg3YTY2ZWU0OWIxN2IxOThlYjdjNGZjODAifQ==&Rh-Identify=2428b0540416c1e2e4517fdf400f6626"
+                    "url": "/view?filename=rgthree.compare._temp_rxvcu_00002_nonpv_1781060447.jpg&type=temp&subfolder=&rand=0.4756489753521683&Rh-Comfy-Auth=PUBLIC_PLACEHOLDER&Rh-Identify=PUBLIC_PLACEHOLDER"
                   }
                 ]
               },

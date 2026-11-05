@@ -88,7 +88,7 @@ class VideoDeliveryTests(unittest.IsolatedAsyncioTestCase):
         async def save(url):
             if url == "fail":
                 raise main.HTTPException(502, "download failed")
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.03)
             finished.append(url)
             return url
 
@@ -104,10 +104,10 @@ class VideoDeliveryTests(unittest.IsolatedAsyncioTestCase):
         async def generate(payload):
             task_id = payload.prompt
             self.assertEqual(main.CANVAS_TASKS[task_id]["phase"], "upstream")
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.03)
             main.report_video_download(123 if task_id == ids[0] else 456)
             self.assertEqual(main.CANVAS_TASKS[task_id]["phase"], "downloading")
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
             return {"videos": ["/assets/output/test.mp4"]}
 
         try:

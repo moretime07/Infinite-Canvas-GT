@@ -35,6 +35,12 @@ class PublishSafetyTests(unittest.TestCase):
         for token in (b"sk-" + b"x" * 40, b"ghp_" + b"a" * 36, b"AKID" + b"z" * 32):
             self.assertTrue(any(pattern.search(token) for pattern in TOKEN_PATTERNS))
 
+    def test_detects_runninghub_signed_query_parameters_but_allows_placeholder(self):
+        signed = b"https://example.test/view?filename=out.png&Rh-Comfy-Auth=" + b"a" * 40
+        placeholder = b"https://example.test/view?filename=out.png&Rh-Comfy-Auth=PUBLIC_PLACEHOLDER"
+        self.assertTrue(any(pattern.search(signed) for pattern in TOKEN_PATTERNS))
+        self.assertFalse(any(pattern.search(placeholder) for pattern in TOKEN_PATTERNS))
+
 
 if __name__ == "__main__":
     unittest.main()

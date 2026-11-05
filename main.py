@@ -1468,6 +1468,23 @@ def normalize_provider(item):
         protocol = tencent_vod.PROTOCOL
         base_url = tencent_vod.endpoint(base_url)
         video_base_url = ""
+        image_models = model_list_from_values(item.get("image_models") or [])
+        video_models = []
+        had_vega_models = False
+        for model in model_list_from_values(item.get("video_models") or []):
+            canonical = tencent_vod.canonical_model_id(model, "video")
+            had_vega_models = had_vega_models or (
+                canonical in tencent_vod.WAND_VIDEO_MODELS
+                or "vega" in str(model).casefold()
+            )
+            if canonical and canonical not in video_models:
+                video_models.append(canonical)
+        if had_vega_models:
+            video_models = model_list_from_values([
+                *tencent_vod.WAND_VIDEO_MODELS,
+                *(model for model in video_models if model not in tencent_vod.WAND_VIDEO_MODELS),
+            ])
+        item = {**item, "image_models": image_models, "video_models": video_models}
     elif protocol == "wand" or is_wand_api_url(base_url):
         protocol = "wand"
         base_url = WAND_INTL_BASE
@@ -1545,6 +1562,7 @@ def public_provider(provider):
             "has_tencent_secret_key": bool(config["secret_key"]),
             "has_tencent_token": bool(config["token"]),
             "model_metadata": tencent_vod.model_metadata(config, provider.get("tencent_sub_app_id", 0)),
+            "video_model_aliases": tencent_vod.model_aliases(),
         })
     if provider.get("id") == "runninghub":
         wallet_key = runninghub_wallet_key_value()
@@ -14683,6 +14701,368 @@ def apply_wan_video_resolution(body: Dict[str, Any]) -> None:
         body["metadata"] = metadata
 
 
+WAN3_DASHSCOPE_MODELS = {"wan3.0-video", "wan3.0-video-prime"}
+WAN3_IMAGE_ROLES = {"first_frame", "last_frame", "reference_image"}
+WAN3_REFERENCE_LIMITS = {"reference_image": 10, "reference_video": 5, "reference_audio": 5}
+WAN3_ADAPTIVE_RATIOS = {"adaptive", "keep_ratio", "auto"}
+WAN3_EXPLICIT_RATIOS = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
+WAN3_VIDEO_EXTENSIONS = {".mp4", ".mov"}
+WAN3_AUDIO_EXTENSIONS = {".wav", ".mp3"}
+
+
+def is_maas_wan3_provider(provider: dict, model: str) -> bool:
+    """Match only Alibaba Cloud MaaS Wan 3.0 native video tasks."""
+    host = str((urllib.parse.urlparse(str((provider or {}).get("base_url") or "")).hostname or "")).lower()
+    if host != "maas.aliyuncs.com" and not host.endswith(".maas.aliyuncs.com"):
+        return False
+    return str(model or "").strip().lower().rsplit("/", 1)[-1] in WAN3_DASHSCOPE_MODELS
+
+
+def dashscope_wan3_api_root(provider: dict) -> str:
+    configured = str((provider or {}).get("base_url") or "").strip().rstrip("/")
+    parsed = urllib.parse.urlparse(configured)
+    host = str(parsed.hostname or "").lower()
+    if parsed.scheme != "https" or (host != "maas.aliyuncs.com" and not host.endswith(".maas.aliyuncs.com")):
+        raise HTTPException(400, "Wan 3.0 阿里云接口需要使用 https://{WorkspaceId}.{Region}.maas.aliyuncs.com 地址。")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def dashscope_wan3_headers(api_key: str, json_body=True) -> dict:
+    headers = {"Accept": "application/json", "Authorization": bearer_auth_value(api_key)}
+    if json_body:
+        headers["Content-Type"] = "application/json"
+        headers["X-DashScope-Async"] = "enable"
+    return headers
+
+
+def dashscope_wan3_error(raw) -> tuple[str, str]:
+    if not isinstance(raw, dict):
+        return "", ""
+    output = raw.get("output") if isinstance(raw.get("output"), dict) else {}
+    code = output.get("code") or raw.get("code") or ""
+    message = output.get("message") or raw.get("message") or raw.get("detail") or ""
+    clean_message = re.sub(r"(?i)bearer\s+[^\s\"']+", "Bearer [已隐藏]", str(message or ""))
+    clean_message = re.sub(r"(?i)sk-[A-Za-z0-9_-]+", "sk-[已隐藏]", clean_message)
+    clean_message = re.sub(r"https?://[^\s\"']+", "[已隐藏链接]", clean_message)
+    return str(code or "").strip()[:120], clean_message.strip()[:800]
+
+
+def dashscope_wan3_error_detail(prefix: str, raw, status_code="") -> str:
+    code, message = dashscope_wan3_error(raw)
+    status = f" HTTP {status_code}" if status_code != "" else ""
+    parts = [f"{prefix}{status}"]
+    if code:
+        parts.append(f"错误码 {code}")
+    if message:
+        parts.append(message)
+    normalized = f"{code} {message}".casefold()
+    if "datainspectionfailed" in normalized or "green net check rejected" in normalized:
+        if "image (output)" in normalized or "video (output)" in normalized or "output" in normalized:
+            parts.append("阿里云内容安全审核未通过：生成结果被拦截。请降低人物、裸露/性暗示、暴力、版权角色或品牌元素等风险后重试")
+        elif "image (input)" in normalized or "video (input)" in normalized or "input" in normalized:
+            parts.append("阿里云内容安全审核未通过：输入素材被拦截，请更换参考图、参考视频或提示词后重试")
+        else:
+            parts.append("阿里云内容安全审核未通过，请调整提示词或输入素材后重试")
+        parts.append("此错误与 API Key、网络和计费无关；同一个提示词重复提交通常仍会失败")
+    return "：".join(parts)
+
+
+def raise_dashscope_wan3_error(status_code: int, detail: str, task_id="") -> None:
+    error = HTTPException(status_code=status_code, detail=detail)
+    if task_id:
+        error.upstream_task_id = str(task_id)
+    raise error
+
+
+def dashscope_wan3_reference_extension(value: str) -> str:
+    text = str(value or "").strip()
+    parsed = urllib.parse.urlsplit(text)
+    return os.path.splitext(urllib.parse.unquote(parsed.path or ""))[1].lower()
+
+
+def dashscope_wan3_local_media(value: str, role: str) -> dict:
+    path = output_file_from_url(value)
+    if not path:
+        raise HTTPException(404, "本地参考素材不存在或已被删除。")
+    extension = os.path.splitext(path)[1].lower()
+    allowed_extensions = WAN3_VIDEO_EXTENSIONS if role == "reference_video" else WAN3_AUDIO_EXTENSIONS
+    if extension not in allowed_extensions:
+        formats = "、".join(sorted(allowed_extensions))
+        label = "视频" if role == "reference_video" else "音频"
+        raise HTTPException(400, f"Wan 3.0 参考{label}仅支持 {formats} 格式。")
+    content_type = content_type_for_path(path)
+    allowed_prefix = "video/" if role == "reference_video" else "audio/"
+    if not content_type.startswith(allowed_prefix):
+        raise HTTPException(400, "参考素材类型与文件内容不一致，请重新上传。")
+    max_bytes = (100 if role == "reference_video" else 15) * 1024 * 1024
+    if os.path.getsize(path) > max_bytes:
+        limit = "100MB" if role == "reference_video" else "15MB"
+        raise HTTPException(400, f"Wan 3.0 单个参考{'视频' if role == 'reference_video' else '音频'}不能超过 {limit}。")
+    duration = probe_local_video_duration_seconds(value) or probe_local_audio_duration_seconds(value)
+    return {"path": path, "duration": duration}
+
+
+async def dashscope_wan3_reference_url(value: str, role: str) -> tuple[str, Optional[float]]:
+    text = str(value or "").strip()
+    if not text:
+        raise HTTPException(400, "参考素材地址不能为空。")
+    if text.startswith(("http://", "https://", "oss://")):
+        extension = dashscope_wan3_reference_extension(text)
+        allowed_extensions = WAN3_VIDEO_EXTENSIONS if role == "reference_video" else WAN3_AUDIO_EXTENSIONS
+        if extension and extension not in allowed_extensions:
+            formats = "、".join(sorted(allowed_extensions))
+            label = "视频" if role == "reference_video" else "音频"
+            raise HTTPException(400, f"Wan 3.0 参考{label}仅支持 {formats} 格式。")
+        return text, None
+    local_media = dashscope_wan3_local_media(text, role)
+    public_url = local_asset_public_url(text)
+    if public_url:
+        return public_url, local_media["duration"]
+    allowed_prefix = "video/" if role == "reference_video" else "audio/"
+    uploaded = await upload_local_video_to_cloud(text, "auto", (allowed_prefix,))
+    url = str((uploaded or {}).get("url") or "").strip()
+    if not url.startswith(("https://", "http://")):
+        label = "视频" if role == "reference_video" else "音频"
+        raise HTTPException(502, f"Wan 3.0 参考{label}上传后没有返回可访问的网络地址。")
+    return url, local_media["duration"]
+
+
+async def build_dashscope_wan3_request(payload: CanvasVideoRequest) -> dict:
+    """Validate UI fields against Wan 3.0's strict native media combinations."""
+    if str(payload.size or "").strip():
+        raise HTTPException(400, "Wan 3.0 原生接口不支持 size 像素尺寸，请改用分辨率档位和视频比例。")
+    if payload.enable_upsample:
+        raise HTTPException(400, "Wan 3.0 原生接口不支持当前 enable_upsample 开关，请在画布关闭后重试。")
+    if payload.camerafixed:
+        raise HTTPException(400, "Wan 3.0 原生接口不支持 camerafixed 参数，请关闭固定镜头后重试。")
+    if payload.return_last_frame:
+        raise HTTPException(400, "Wan 3.0 原生接口不支持 return_last_frame 参数，请关闭返回尾帧后重试。")
+    if payload.trusted_asset:
+        raise HTTPException(400, "Wan 3.0 原生接口不支持 trusted_asset 参数，请关闭后重试。")
+    duration = int(payload.duration)
+    if duration != -1 and not 2 <= duration <= 30:
+        raise HTTPException(400, "Wan 3.0 视频时长需为 2～30 秒，或使用 -1 智能时长。")
+
+    resolution = str(payload.resolution or "").strip().upper()
+    if resolution == "AUTO":
+        resolution = ""
+    if resolution not in {"", "480P", "720P", "1080P"}:
+        raise HTTPException(400, "Wan 3.0 分辨率只能选择 480P、720P、1080P，或留空使用上游默认值。")
+
+    ratio = str(payload.aspect_ratio or "").strip().lower()
+    if ratio in WAN3_ADAPTIVE_RATIOS:
+        ratio = "adaptive"
+    elif not ratio:
+        ratio = "adaptive"
+    elif ratio not in WAN3_EXPLICIT_RATIOS:
+        raise HTTPException(400, "Wan 3.0 视频比例不支持当前选项，请选择 21:9、16:9、4:3、1:1、3:4、9:16 或 adaptive。")
+
+    frame_media = []
+    reference_media = []
+    frame_roles = set()
+    seen_image_urls = set()
+    for ref in payload.images:
+        source_url = str(getattr(ref, "url", "") or "").strip()
+        if not source_url:
+            continue
+        if source_url in seen_image_urls:
+            continue
+        seen_image_urls.add(source_url)
+        role = str(getattr(ref, "role", "") or "").strip().lower() or "reference_image"
+        if role not in WAN3_IMAGE_ROLES:
+            raise HTTPException(400, "Wan 3.0 图片角色只能使用 first_frame、last_frame 或 reference_image。")
+        ref_data = ref.model_dump() if hasattr(ref, "model_dump") else {"url": ref.url, "role": role}
+        media_url = reference_to_data_url(ref_data, max_size=1536)
+        item = {"type": role, "url": media_url}
+        if role in {"first_frame", "last_frame"}:
+            if role in frame_roles:
+                raise HTTPException(400, f"Wan 3.0 的 {role} 最多只能传入 1 张。")
+            frame_roles.add(role)
+            frame_media.append(item)
+        else:
+            reference_media.append(item)
+
+    reference_videos = []
+    reference_video_durations = []
+    reference_audio_durations = []
+    seen_reference_urls = set()
+    for value in payload.videos:
+        text = str(value or "").strip()
+        if not text or text in seen_reference_urls:
+            continue
+        seen_reference_urls.add(text)
+        url, media_duration = await dashscope_wan3_reference_url(text, "reference_video")
+        reference_videos.append({"type": "reference_video", "url": url})
+        if media_duration:
+            reference_video_durations.append(media_duration)
+
+    reference_audios = []
+    for value in payload.audios:
+        text = str(value or "").strip()
+        if not text or text in seen_reference_urls:
+            continue
+        seen_reference_urls.add(text)
+        url, media_duration = await dashscope_wan3_reference_url(text, "reference_audio")
+        reference_audios.append({"type": "reference_audio", "url": url})
+        if media_duration:
+            reference_audio_durations.append(media_duration)
+
+    counts = {
+        "reference_image": len(reference_media),
+        "reference_video": len(reference_videos),
+        "reference_audio": len(reference_audios),
+    }
+    for role, count in counts.items():
+        if count > WAN3_REFERENCE_LIMITS[role]:
+            labels = {"reference_image": "10 张参考图", "reference_video": "5 段参考视频", "reference_audio": "5 段参考音频"}
+            raise HTTPException(400, f"Wan 3.0 最多支持{labels[role]}。")
+
+    if frame_media and (reference_media or reference_videos or reference_audios):
+        raise HTTPException(400, "Wan 3.0 首帧/尾帧模式不能与参考图、参考视频或参考音频混用，请只保留其中一种模式。")
+
+    for duration_value, label in ((reference_video_durations, "视频"), (reference_audio_durations, "音频")):
+        if any(not 1 <= value <= 15 for value in duration_value):
+            raise HTTPException(400, f"Wan 3.0 单段参考{label}时长需在 1～15 秒之间。")
+        if sum(duration_value) > 15:
+            raise HTTPException(400, f"Wan 3.0 参考{label}总时长不能超过 15 秒。")
+    if duration != -1 and reference_videos and sum(reference_video_durations) + duration > 30:
+        raise HTTPException(400, "Wan 3.0 输入参考视频总时长与输出视频时长之和不能超过 30 秒。")
+
+    reference_media = reference_media + reference_videos + reference_audios
+
+    media = frame_media or reference_media
+    input_payload = {"prompt": payload.prompt}
+    if media:
+        input_payload["media"] = media
+    parameters = {
+        "duration": duration,
+        "ratio": ratio,
+        "watermark": bool(payload.watermark),
+        "prompt_extend": bool(payload.enhance_prompt),
+        "audio": bool(payload.generate_audio),
+    }
+    if resolution:
+        parameters["resolution"] = resolution
+    if payload.seed is not None:
+        if int(payload.seed) != -1 and not 0 <= int(payload.seed) <= 2147483647:
+            raise HTTPException(400, "Wan 3.0 的 seed 需为 -1，或在 0～2147483647 之间。")
+        parameters["seed"] = int(payload.seed)
+    return {"model": str(payload.model or "").strip(), "input": input_payload, "parameters": parameters}
+
+
+async def generate_dashscope_wan3_video(payload: CanvasVideoRequest, provider: dict):
+    """Run Wan 3.0 through DashScope's native MaaS asynchronous task API."""
+    api_key = provider_env_key_value(provider["id"])
+    provider_name = provider.get("name") or provider["id"]
+    if not api_key:
+        raise HTTPException(400, f"未配置 {provider_name} 的 API Key，请在 API 设置中填写。")
+    body = await build_dashscope_wan3_request(payload)
+    root = dashscope_wan3_api_root(provider)
+    submit_url = f"{root}/api/v1/services/aigc/video-generation/video-synthesis"
+    headers = dashscope_wan3_headers(api_key)
+    poll_headers = dashscope_wan3_headers(api_key, json_body=False)
+    timeout = float(VIDEO_POLL_TIMEOUT or 1800)
+    poll_delay = max(2.0, float(IMAGE_POLL_INTERVAL or 2))
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        mark_video_timing_stage("submit")
+        try:
+            response = await client.post(submit_url, headers=headers, json=body)
+        except httpx.HTTPError as exc:
+            log_net_error("视频(阿里云 Wan 3.0) 提交网络/TLS错误", exc)
+            raise HTTPException(
+                502,
+                "请求阿里云 Wan 3.0 提交任务失败，无法确认任务是否已经创建。请先查询阿里云任务记录，避免重复提交和重复计费。",
+            ) from exc
+        try:
+            raw = response.json() if response.content else {}
+        except Exception:
+            raw = None
+        if response.status_code >= 400:
+            detail = dashscope_wan3_error_detail("阿里云 Wan 3.0 提交任务失败", raw, response.status_code)
+            if response.status_code in {401, 403}:
+                detail += "。请确认 API Key 与工作空间、地域一致"
+            raise_dashscope_wan3_error(response.status_code, detail)
+        if not isinstance(raw, dict):
+            raise_dashscope_wan3_error(502, f"阿里云 Wan 3.0 提交接口返回了非 JSON 响应（HTTP {response.status_code}）")
+
+        output = raw.get("output") if isinstance(raw.get("output"), dict) else {}
+        task_id = str(output.get("task_id") or raw.get("task_id") or "").strip()
+        if not task_id:
+            detail = dashscope_wan3_error_detail("阿里云 Wan 3.0 提交成功但未返回 task_id", raw, response.status_code)
+            raise_dashscope_wan3_error(502, detail)
+
+        task_url = f"{root}/api/v1/tasks/{urllib.parse.quote(task_id, safe='')}"
+        deadline = time.monotonic() + timeout
+        mark_video_timing_stage("generate")
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise_dashscope_wan3_error(
+                    504,
+                    f"阿里云 Wan 3.0 视频任务等待超时，task_id={task_id}。可稍后凭该任务 ID 查询记录，避免重复提交。",
+                    task_id,
+                )
+            try:
+                task_response = await client.get(task_url, headers=poll_headers)
+            except httpx.HTTPError as exc:
+                log_net_error("视频(阿里云 Wan 3.0) 轮询网络/TLS错误", exc)
+                if time.monotonic() >= deadline:
+                    raise_dashscope_wan3_error(
+                        504,
+                        f"阿里云 Wan 3.0 轮询超时，task_id={task_id}。请稍后凭任务 ID 查询，避免重复提交。",
+                        task_id,
+                    )
+                await asyncio.sleep(min(poll_delay, max(0.05, deadline - time.monotonic())))
+                continue
+            if task_response.status_code == 429 or task_response.status_code >= 500:
+                await asyncio.sleep(min(poll_delay, max(0.05, deadline - time.monotonic())))
+                continue
+            try:
+                task_raw = task_response.json() if task_response.content else {}
+            except Exception:
+                task_raw = None
+            if task_response.status_code >= 400:
+                detail = dashscope_wan3_error_detail("阿里云 Wan 3.0 查询任务失败", task_raw, task_response.status_code)
+                raise_dashscope_wan3_error(task_response.status_code, detail, task_id)
+            if not isinstance(task_raw, dict):
+                raise_dashscope_wan3_error(
+                    502,
+                    f"阿里云 Wan 3.0 查询接口返回了非 JSON 响应（HTTP {task_response.status_code}），task_id={task_id}。",
+                    task_id,
+                )
+
+            task_output = task_raw.get("output") if isinstance(task_raw.get("output"), dict) else {}
+            status = str(task_output.get("task_status") or task_raw.get("task_status") or "").strip().upper()
+            if status == "SUCCEEDED":
+                video_url = str(task_output.get("video_url") or task_raw.get("video_url") or "").strip()
+                if not video_url:
+                    raise_dashscope_wan3_error(
+                        502,
+                        f"阿里云 Wan 3.0 任务已成功，但没有返回 video_url，task_id={task_id}。",
+                        task_id,
+                    )
+                try:
+                    videos = await save_video_outputs([video_url])
+                except Exception as exc:
+                    raise_dashscope_wan3_error(
+                        502,
+                        f"阿里云 Wan 3.0 任务已成功，但结果保存失败，task_id={task_id}。",
+                        task_id,
+                    )
+                return {
+                    "videos": videos,
+                    "task_id": task_id,
+                    "model": body["model"],
+                    "provider_id": provider["id"],
+                    "status": "succeeded",
+                }
+            if status in {"FAILED", "CANCELED", "UNKNOWN"}:
+                detail = dashscope_wan3_error_detail(f"阿里云 Wan 3.0 任务状态为 {status}", task_raw)
+                raise_dashscope_wan3_error(502, detail, task_id)
+            await asyncio.sleep(min(poll_delay, max(0.05, deadline - time.monotonic())))
+
+
 @app.post("/api/canvas-video")
 async def canvas_video(payload: CanvasVideoRequest):
     provider = get_api_provider(payload.provider_id)
@@ -14707,6 +15087,9 @@ async def canvas_video(payload: CanvasVideoRequest):
         except httpx.HTTPError as exc:
             log_net_error(f"视频(RunningHub) 网络/TLS错误 model={payload.model}", exc)
             raise HTTPException(status_code=502, detail=f"请求 RunningHub 视频接口失败：{exc}") from exc
+    if is_maas_wan3_provider(provider, payload.model):
+        mark_video_timing_stage("upstream")
+        return await generate_dashscope_wan3_video(payload, provider)
     base_url = video_api_root(provider)
     if not base_url:
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider['id']} 未配置 Base URL")

@@ -16,6 +16,7 @@ TOKEN_PATTERNS = [
     re.compile(rb"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})\b"),
     re.compile(rb"\bsk-(?:or-v1-|proj-)?[A-Za-z0-9_-]{24,}\b"),
     re.compile(rb"\bAKID[A-Za-z0-9]{28,}\b"),
+    re.compile(rb"(?i)[?&]Rh-(?:Comfy-Auth|Identify)=(?!PUBLIC_PLACEHOLDER\b)[^&\\\"'\s]+"),
     re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
 ]
 

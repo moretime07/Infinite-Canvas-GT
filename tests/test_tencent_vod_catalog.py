@@ -44,7 +44,119 @@ class TencentVodCatalogTests(unittest.TestCase):
                 body = self.video(model, duration=spec["durations"][0] if spec["durations"] else 5)
                 self.assertEqual(body["ModelName"], spec["model_name"])
                 self.assertEqual(body["ModelVersion"], spec["model_version"])
-                self.assertNotIn("ExtInfo", body)
+
+    def test_wand_vega_catalog_maps_all_versions_and_capabilities(self):
+        expected = {
+            "vod-wand-vega-video-1.0-pro": ("1.0-pro", 15, {"image": 9, "video": 3, "audio": 3, "total": 12}),
+            "vod-wand-vega-video-1.0-pro-fast": ("1.0-pro-fast", 15, {"image": 9, "video": 3, "audio": 3, "total": 12}),
+            "vod-wand-vega-video-1.0-pro-mini": ("1.0-pro-mini", 15, {"image": 9, "video": 3, "audio": 3, "total": 12}),
+            "vod-wand-vega-video-1.5-pro": ("1.5-pro", 30, {"image": 30, "video": 10, "audio": 10, "total": 50}),
+        }
+        for model, (version, max_duration, limits) in expected.items():
+            with self.subTest(model=model):
+                spec = vod.CATALOG[model]
+                self.assertEqual(spec["model_name"], "wand-vega-video")
+                self.assertEqual(spec["model_version"], version)
+                self.assertEqual(max(spec["durations"]), max_duration)
+                self.assertEqual(spec["reference_limits"], limits)
+                self.assertIn("SD2", spec["benchmark"])
+                self.assertIn("80%", spec["pricing_note"])
+                body = self.video(model, duration=max_duration, resolution="720p")
+                self.assertEqual(body["ModelName"], "wand-vega-video")
+                self.assertEqual(body["ModelVersion"], version)
+
+    def test_wand_vega_duration_and_resolution_are_validated(self):
+        with self.assertRaises(HTTPException):
+            self.video("vod-wand-vega-video-1.0-pro", duration=16, resolution="720p")
+        self.assertEqual(self.video("vod-wand-vega-video-1.5-pro", duration=30, resolution="720p")["OutputConfig"]["Duration"], 30)
+        for model in ("vod-wand-vega-video-1.0-pro", "vod-wand-vega-video-1.0-pro-fast",
+                      "vod-wand-vega-video-1.0-pro-mini", "vod-wand-vega-video-1.5-pro"):
+            with self.subTest(model=model), self.assertRaises(HTTPException):
+                self.video(model, duration=4, resolution="480p")
+
+    def test_saved_wand_vega_aliases_resolve_to_catalog_models(self):
+        cases = {
+            "WAND-Vega-Video-1.0-Lite": "vod-wand-vega-video-1.0-pro-mini",
+            "wand-vega-video-1.0-lite": "vod-wand-vega-video-1.0-pro-mini",
+            "WAND-Vega-Video-1.5-Lite": "vod-wand-vega-video-1.5-pro",
+            "wand-vega-video-1.5-lite": "vod-wand-vega-video-1.5-pro",
+        }
+        for legacy, canonical in cases.items():
+            with self.subTest(model=legacy):
+                self.assertEqual(vod.canonical_model_id(legacy, "video"), canonical)
+                body = self.video(legacy, duration=4, resolution="720p")
+                self.assertEqual(body["ModelName"], "wand-vega-video")
+                self.assertEqual(body["ModelVersion"], vod.CATALOG[canonical]["model_version"])
+
+    def test_wan_catalog_maps_aliases_duration_and_enhancement(self):
+        self.assertEqual(vod.WAN_VIDEO_MODELS, ["vod-wan-video-3.0"])
+        # Case-only aliases collapse to one key in case-insensitive JSON clients.
+        for alias in ("Wan3.0", "WAN3.0", "wan-3.0", "wan3.0-video"):
+            with self.subTest(alias=alias):
+                self.assertEqual(vod.canonical_model_id(alias, "video"), "vod-wan-video-3.0")
+        spec = vod.CATALOG["vod-wan-video-3.0"]
+        self.assertEqual((spec["model_name"], spec["model_version"]), ("Wan", "3.0"))
+        self.assertEqual(spec["resolutions"], ["480P", "720P", "1080P"])
+        self.assertEqual(spec["durations"], list(range(2, 31)))
+        self.assertIsNone(spec["reference_limits"])
+        for duration in (2, 30):
+            body = self.video("Wan3.0", duration=duration, resolution="720p")
+            self.assertEqual((body["ModelName"], body["ModelVersion"]), ("Wan", "3.0"))
+            self.assertEqual(body["OutputConfig"]["Duration"], duration)
+        for duration in (1, 31):
+            with self.subTest(duration=duration), self.assertRaises(HTTPException):
+                self.video("Wan3.0", duration=duration, resolution="720p")
+        for resolution in ("480p", "720p", "1080p"):
+            with self.subTest(resolution=resolution):
+                body = self.video("Wan3.0", duration=5, resolution=resolution)
+                self.assertEqual(body["OutputConfig"]["Resolution"], resolution.upper())
+        for resolution in ("2K", "4K"):
+            with self.subTest(resolution=resolution), self.assertRaises(HTTPException):
+                self.video("Wan3.0", duration=5, resolution=resolution)
+        enhanced = self.video("Wan3.0", duration=5, resolution="1080P", enable_upsample=True)
+        self.assertEqual(enhanced["OutputConfig"]["EnhanceSwitch"], "Enabled")
+        with self.assertRaises(HTTPException):
+            self.video("Wan3.0", duration=5, resolution="480P", enable_upsample=True)
+        with self.assertRaises(HTTPException):
+            self.video("Wan3.0", duration=5, resolution="720P", generate_audio=True)
+        self.assertNotIn("ExtInfo", self.video("Wan3.0", enhance_prompt=True))
+
+    def test_vod_normalization_keeps_wan_with_all_vega_models(self):
+        provider = main.normalize_provider({"id": "legacy-vod", "protocol": vod.PROTOCOL,
+                                            "base_url": vod.DEFAULT_BASE,
+                                            "video_models": ["WAND-Vega-Video-1.0-Lite", "Wan3.0"]})
+        self.assertEqual(provider["video_models"], [*vod.WAND_VIDEO_MODELS, "vod-wan-video-3.0"])
+        self.assertEqual(provider["video_models"].count("vod-wan-video-3.0"), 1)
+
+    def test_wand_vega_reference_limits_and_audio_dependency_are_explicit(self):
+        image = {"url": "https://example.com/reference.png", "role": "reference_image"}
+        video = "https://example.com/reference.mp4"
+        audio = "https://example.com/reference.mp3"
+        with self.assertRaises(HTTPException):
+            self.video("vod-wand-vega-video-1.0-pro", duration=4, images=[image] * 10)
+        with self.assertRaises(HTTPException):
+            self.video("vod-wand-vega-video-1.0-pro", duration=4, videos=[video] * 4)
+        with self.assertRaises(HTTPException):
+            self.video("vod-wand-vega-video-1.0-pro", duration=4, audios=[audio] * 4)
+        with self.assertRaises(HTTPException):
+            self.video("vod-wand-vega-video-1.0-pro", duration=4, audios=[audio])
+        with self.assertRaises(HTTPException):
+            self.video("vod-wand-vega-video-1.0-pro", duration=4, images=[image] * 9,
+                       videos=[video] * 2, audios=[audio] * 2)
+        body = self.video("vod-wand-vega-video-1.5-pro", duration=30, images=[image] * 30,
+                          videos=[video] * 10, audios=[audio] * 10, multimodal=True)
+        self.assertEqual(len(body["FileInfos"]), 50)
+
+    def test_wand_vega_extensions_use_documented_ext_info_shape(self):
+        body = self.video("vod-wand-vega-video-1.0-pro", duration=8, resolution="1080p",
+                          enhance_prompt=True, return_last_frame=True)
+        extensions = json.loads(body["ExtInfo"])
+        self.assertEqual(json.loads(extensions["AdditionalParameters"]), {"return_last_frame": True})
+        self.assertEqual(json.loads(extensions["WandVegaParameters"]), {"EnhancePromptMode": "enable"})
+        self.assertNotIn("EnhanceSwitch", body["OutputConfig"])
+        self.assertEqual(self.video("vod-wand-vega-video-1.0-pro", duration=8, aspect_ratio="adaptive")["OutputConfig"]["AspectRatio"], "adaptive")
+        with self.assertRaises(HTTPException):
+            self.video(return_last_frame=True)
 
     def test_image_resolution_and_ratio_map_without_wand_parameters(self):
         gg = self.image("vod-gg-image-3.1", "2048x1152")

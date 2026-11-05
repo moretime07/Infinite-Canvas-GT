@@ -3602,6 +3602,9 @@ async function probeTencentVod(pickModels){
         lastFetchedAll = data.all || [];
         lastFetchedSuggestion = {image:new Set(data.image_models || []), chat:new Set(data.chat_models || []), video:new Set(data.video_models || [])};
         item.model_metadata = data.model_metadata || {};
+        item.video_model_aliases = data.video_model_aliases || item.video_model_aliases || {};
+        const canonicalVideoModels = (data.video_models || []).slice();
+        item.video_models = [...new Set([...canonicalVideoModels, ...(item.video_models || [])])];
         const openBtn = document.getElementById('openPickerBtn');
         if(openBtn){ openBtn.disabled = false; openBtn.style.opacity = '1'; }
         showVerifyResult(`<span style="color:#15803d">✓ ${escapeHtml(data.message)}</span>`);

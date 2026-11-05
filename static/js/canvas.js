@@ -616,6 +616,7 @@ function stopUnresolvedDefaultCanvasRun(node, providerField, options={}){
     return true;
 }
 function resolveCanvasNodeRequest(node, options){
+    if(node?.type === 'video') migrateTencentVodVideoNode(node);
     const providerId = String(node?.[options.providerField] || '').trim();
     const providers = apiProviders.length ? apiProviders : defaultApiProviders();
     const provider = providers.find(item => String(item?.id || '') === providerId);
@@ -641,6 +642,7 @@ function preflightCanvasNodeRequest(node, options, runOptions, showError){
     }
 }
 function prepareCanvasNodeForRender(node){
+    if(node?.type === 'video') migrateTencentVodVideoNode(node);
     return syncDefaultCanvasNodeProvider(node);
 }
 function followDefaultOption(node, capability, excludeIds=[]){
@@ -685,6 +687,20 @@ function isOminiLinkProvider(provider){
             return false;
         }
     });
+}
+function isMaasWan3ProviderModel(provider, model){
+    try {
+        const host = new URL(String(provider?.base_url || '')).hostname.toLowerCase();
+        const leaf = String(model || '').trim().toLowerCase().split('/').pop();
+        return (host === 'maas.aliyuncs.com' || host.endsWith('.maas.aliyuncs.com'))
+            && ['wan3.0-video', 'wan3.0-video-prime'].includes(leaf);
+    } catch(_) {
+        return false;
+    }
+}
+function isMaasWan3VideoNode(node){
+    const provider = apiProviders.find(item => String(item?.id || '') === String(node?.apiProvider || ''));
+    return isMaasWan3ProviderModel(provider, node?.model);
 }
 function omniFlashSafePublicHttpsUri(value){
     try {
@@ -822,11 +838,34 @@ function videoModelOptions(selectedModel, providerId){
         return `<option value="" disabled selected>${tr('canvas.noModelsHint') || '暂无模型，请到 API 设置添加'}</option>`;
     }
     const selected = selectedModel || models[0];
-    return uniqueModels([selected, ...models]).filter(Boolean).map(model => `<option value="${escapeHtml(model)}" ${model === selected ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+    const provider = apiProviders.find(item => item.id === providerId);
+    return uniqueModels([selected, ...models]).filter(Boolean).map(model => {
+        const available = models.includes(model);
+        const baseLabel = provider?.protocol === 'tencent-vod' ? provider.model_metadata?.[model]?.label : '';
+        const label = `${baseLabel || model}${available ? '' : ' (Unavailable)'}`;
+        return `<option value="${escapeHtml(model)}" ${model === selected ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+    }).join('');
 }
 function tencentVodVideoSpec(node){
     const provider = apiProviders.find(item => item.id === node.apiProvider);
-    return provider?.protocol === 'tencent-vod' ? provider.model_metadata?.[node.model] : null;
+    const metadata = provider?.protocol === 'tencent-vod' ? provider.model_metadata?.[node.model] : null;
+    return metadata ? {...metadata, video_model_aliases:provider.video_model_aliases || metadata.video_model_aliases || {}} : null;
+}
+function tencentVodCanonicalVideoModel(node){
+    const provider = apiProviders.find(item => item.id === node?.apiProvider);
+    if(provider?.protocol !== 'tencent-vod') return String(node?.model || '');
+    const model = String(node?.model || '').trim();
+    if(provider.model_metadata?.[model]) return model;
+    const normalize = value => String(value || '').trim().toLowerCase().replace(/[-_\s]+/g, '');
+    const aliases = provider.video_model_aliases || Object.values(provider.model_metadata || {})
+        .find(metadata => metadata?.video_model_aliases)?.video_model_aliases || {};
+    return Object.entries(aliases).find(([key]) => normalize(key) === normalize(model))?.[1] || model;
+}
+function migrateTencentVodVideoNode(node){
+    const model = tencentVodCanonicalVideoModel(node);
+    if(!model || model === node?.model) return false;
+    node.model = model;
+    return true;
 }
 function tencentVodVideoControls(wrap, node){
     const spec = tencentVodVideoSpec(node);
@@ -849,8 +888,19 @@ function tencentVodVideoControls(wrap, node){
         duration.title = `可用时长：${spec.durations.join('、')} 秒`;
     }
     const hint = document.createElement('div');
-    hint.className = 'text-[10px] text-gray-400';
-    hint.textContent = `${spec.verification === 'verified' ? '此应用生成已验证' : '官方目录 · 账号权限未验证'}${spec.durations?.length ? ' · 时长 ' + spec.durations.join('/') + ' 秒' : ''} · 参考能力依具体模型版本而定`;
+    hint.className = 'tencent-vod-video-hint';
+    const durationBounds = spec.durations?.length ? `${Math.min(...spec.durations)}–${Math.max(...spec.durations)} 秒` : '';
+    const limits = spec.reference_limits;
+    const references = limits ? `参考上限：图片 ${limits.image} / 视频 ${limits.video} / 音频 ${limits.audio}，总计 ${limits.total}` : '';
+    hint.textContent = [
+        spec.label,
+        spec.verification === 'verified' ? '此应用生成已验证' : '官方目录 · 账号权限未验证',
+        durationBounds,
+        spec.resolutions?.length ? spec.resolutions.join(' / ') : '',
+        references,
+        spec.benchmark,
+        spec.pricing_note
+    ].filter(Boolean).join(' · ');
     wrap.querySelector('.gen-settings')?.appendChild(hint);
 }
 function allImageModels(providerId){
@@ -9451,7 +9501,7 @@ function renderVideoBody(node){
             <div class="gen-settings-row">
                 <label class="field" style="flex:1">
                     <div class="setting-title">${tr('canvas.videoDuration')}</div>
-                    <input class="setting-input video-duration" type="number" min="1" max="60" step="1" value="${Number(node.duration || 5)}">
+                    <input class="setting-input video-duration" type="number" min="1" max="${isMaasWan3VideoNode(node) ? 30 : 60}" step="1" value="${Number(node.duration || 5)}">
                 </label>
                 <label class="field" style="flex:1">
                     <div class="setting-title">${tr('canvas.videoAspect')}</div>
@@ -9515,8 +9565,9 @@ function renderVideoBody(node){
         render();
     };
     modelSelect.onchange = e => { e.stopPropagation(); node.model = e.target.value; scheduleSave(); if(tencentVodVideoSpec(node)) render(); };
-    durationSelect.oninput = e => { e.stopPropagation(); node.duration = Math.max(1, Math.min(60, Number(e.target.value || 5))); scheduleSave(); };
-    durationSelect.onblur = e => { e.target.value = String(Math.max(1, Math.min(60, Number(node.duration || 5)))); };
+    const videoDurationLimit = isMaasWan3VideoNode(node) ? 30 : 60;
+    durationSelect.oninput = e => { e.stopPropagation(); node.duration = Math.max(1, Math.min(videoDurationLimit, Number(e.target.value || 5))); scheduleSave(); };
+    durationSelect.onblur = e => { e.target.value = String(Math.max(1, Math.min(videoDurationLimit, Number(node.duration || 5)))); };
     aspectSelect.onchange = e => { e.stopPropagation(); node.aspectRatio = e.target.value; scheduleSave(); };
     resolutionSelect.onchange = e => { e.stopPropagation(); node.resolution = e.target.value; scheduleSave(); };
     wrap.querySelectorAll('[data-video-toggle]').forEach(btn => {
@@ -11454,6 +11505,7 @@ async function runVideoNode(nodeId, opts={}){
         enable_upsample:Boolean(node.enableUpsample),
         watermark:Boolean(node.watermark),
         camerafixed:Boolean(node.cameraFixed),
+        return_last_frame:Boolean(node.returnLastFrame),
         generate_audio:Boolean(node.generateAudio),
         multimodal:Boolean(node.multimodal)
     };

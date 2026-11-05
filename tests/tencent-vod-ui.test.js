@@ -31,16 +31,47 @@ test('video UI uses selected provider metadata and preserves old workflow select
     const elements = Object.fromEntries(['.video-duration','.video-resolution','.video-aspect'].map(k => [k, {}]));
     let notice;
     elements['.gen-settings'] = {appendChild:x => {notice=x.textContent;}};
-    const spec = {resolutions:['768P','1080P'],aspect_ratios:['16:9','9:16'],durations:[6,10],verification:'unverified'};
+    const spec = {model_name:'wand-vega-video',label:'WAND Vega Video Pro 1.5',resolutions:['720P','1080P'],aspect_ratios:['16:9','9:16'],durations:[4,5,15,30],verification:'unverified',reference_limits:{image:30,video:10,audio:10,total:50},benchmark:'效果对标 SD2 / SD2.5',pricing_note:'720P 及以上约为 80%'};
     const context = vm.createContext({apiProviders:[{id:'vod',protocol:'tencent-vod',model_metadata:{test:spec}}],
         escapeHtml:String, document:{createElement:() => ({})}});
     vm.runInContext(fn(canvas, 'tencentVodVideoSpec') + fn(canvas, 'tencentVodVideoControls'), context);
     const node = {apiProvider:'vod',model:'test',resolution:'720p',duration:5,aspectRatio:'1:1'};
     context.tencentVodVideoControls({querySelector:key => elements[key]}, node);
-    assert.match(elements['.video-resolution'].innerHTML, /768P/);
-    assert.equal(elements['.video-resolution'].value, '720p');
-    assert.equal(elements['.video-duration'].min, 6);
+    assert.match(elements['.video-resolution'].innerHTML, /720P/);
+    assert.match(elements['.video-resolution'].innerHTML, /value="720P"/);
+    assert.equal(elements['.video-duration'].min, 4);
+    assert.equal(elements['.video-duration'].max, 30);
     assert.equal(node.duration, 5);
     assert.match(notice, /账号权限未验证/);
+    assert.match(notice, /WAND Vega Video Pro 1\.5/);
+    assert.match(notice, /图片 30 \/ 视频 10 \/ 音频 10，总计 50/);
+    assert.match(notice, /SD2 \/ SD2\.5/);
+    assert.match(notice, /80%/);
     assert.equal(context.tencentVodVideoSpec({...node,apiProvider:'other'}), null);
+});
+test('saved Vega Lite nodes migrate to canonical IDs before preflight', () => {
+    const provider = {id:'vod',protocol:'tencent-vod',video_models:['vod-wand-vega-video-1.0-pro-mini'],video_model_aliases:{'WAND-Vega-Video-1.0-Lite':'vod-wand-vega-video-1.0-pro-mini'}};
+    const context = vm.createContext({apiProviders:[provider]});
+    vm.runInContext(fn(canvas, 'tencentVodCanonicalVideoModel') + fn(canvas, 'migrateTencentVodVideoNode'), context);
+    const node = {type:'video',apiProvider:'vod',model:'WAND-Vega-Video-1.0-Lite'};
+    assert.equal(context.migrateTencentVodVideoNode(node), true);
+    assert.equal(node.model, 'vod-wand-vega-video-1.0-pro-mini');
+    assert.equal(context.migrateTencentVodVideoNode(node), false);
+});
+test('saved Wan 3.0 nodes migrate beside Vega and stay available', () => {
+    const provider = {id:'vod',protocol:'tencent-vod',
+        video_models:['vod-wand-vega-video-1.5-pro','vod-wan-video-3.0'],
+        video_model_aliases:{'Wan3.0':'vod-wan-video-3.0'},
+        model_metadata:{'vod-wand-vega-video-1.5-pro':{label:'WAND Vega Video Pro 1.5'},'vod-wan-video-3.0':{label:'Wan 3.0 Video'}}};
+    const context = vm.createContext({apiProviders:[provider],escapeHtml:String});
+    vm.runInContext(fn(canvas, 'uniqueModels') + fn(canvas, 'providerVideoModels') + fn(canvas, 'videoModelOptions')
+        + fn(canvas, 'tencentVodCanonicalVideoModel') + fn(canvas, 'migrateTencentVodVideoNode'), context);
+    const node = {type:'video',apiProvider:'vod',model:'Wan3.0'};
+    assert.equal(context.migrateTencentVodVideoNode(node), true);
+    assert.equal(node.model, 'vod-wan-video-3.0');
+    assert.equal(context.migrateTencentVodVideoNode(node), false);
+    const options = context.videoModelOptions(node.model, 'vod');
+    assert.match(options, /Wan 3\.0 Video/);
+    assert.doesNotMatch(options, /Unavailable/);
+    assert.match(options, /WAND Vega Video Pro 1\.5/);
 });
