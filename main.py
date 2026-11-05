@@ -40,6 +40,10 @@ import aiide_video
 import project_updater
 import video_download
 import download_proxy
+try:
+    import imageio_ffmpeg
+except ImportError:
+    imageio_ffmpeg = None
 from portable_runtime import listen_options
 from PIL import Image, ImageOps
 from io import BytesIO
@@ -335,6 +339,44 @@ CANVAS_TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
 LOCAL_IMAGE_IMPORT_MAX_BYTES = int(os.getenv("LOCAL_IMAGE_IMPORT_MAX_BYTES", str(50 * 1024 * 1024)))
 LOCAL_IMAGE_IMPORT_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 RUNNINGHUB_THUMBNAIL_EXTS = (".jpg",)
+
+
+def media_tool_path(name: str) -> Optional[str]:
+    """Resolve media tools without requiring them to be on the system PATH."""
+    name = str(name or "").strip().lower()
+    if name not in {"ffmpeg", "ffprobe"}:
+        raise ValueError(f"Unsupported media tool: {name}")
+
+    env_names = [f"{name.upper()}_PATH", f"{name.upper()}_BINARY"]
+    if name == "ffmpeg":
+        env_names.append("IMAGEIO_FFMPEG_EXE")
+    for env_name in env_names:
+        configured = str(os.environ.get(env_name) or "").strip().strip('"')
+        if not configured:
+            continue
+        if os.path.isfile(configured):
+            return os.path.abspath(configured)
+        resolved = shutil.which(configured)
+        if resolved:
+            return resolved
+
+    filename = f"{name}.exe" if os.name == "nt" else name
+    bundled = os.path.join(BASE_DIR, "bin", "ffmpeg", "bin", filename)
+    if os.path.isfile(bundled):
+        return os.path.abspath(bundled)
+
+    resolved = shutil.which(name)
+    if resolved:
+        return resolved
+
+    if name == "ffmpeg" and imageio_ffmpeg is not None:
+        try:
+            candidate = str(imageio_ffmpeg.get_ffmpeg_exe() or "").strip()
+        except Exception:
+            candidate = ""
+        if candidate and os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    return None
 
 QUEUE = []
 QUEUE_LOCK = Lock()
@@ -5082,9 +5124,9 @@ def is_video_preview_file(path: str) -> bool:
     return os.path.splitext(str(path or "").split("?", 1)[0])[1].lower() in {".mp4", ".webm", ".mov", ".m4v", ".avi", ".mkv"}
 
 def generate_video_preview_image(path: str, width: int) -> Image.Image:
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = media_tool_path("ffmpeg")
     if not ffmpeg:
-        raise RuntimeError("未找到 ffmpeg，无法生成视频预览图")
+        raise RuntimeError("未找到 FFmpeg，无法生成视频预览图；请运行“安装依赖.bat”后重启后台")
     fd, frame_path = tempfile.mkstemp(prefix="media_preview_frame_", suffix=".jpg")
     os.close(fd)
     try:
@@ -5344,7 +5386,7 @@ def canvas_video_matches_container(source_path: str, output_format: str) -> bool
     # Extensions alone are not enough: an upstream can name an error page .mp4.
     if Path(source_path).suffix.lower() != f".{output_format}":
         return False
-    ffprobe = shutil.which("ffprobe")
+    ffprobe = media_tool_path("ffprobe")
     if not ffprobe:
         return False
     try:
@@ -5363,9 +5405,12 @@ def export_canvas_output_video(source_path: str, destination_path: str, output_f
     if canvas_video_matches_container(source_path, output_format):
         shutil.copyfile(source_path, destination_path)
         return "copy"
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = media_tool_path("ffmpeg")
     if not ffmpeg:
-        raise HTTPException(status_code=500, detail="未找到 ffmpeg，无法转换视频")
+        raise HTTPException(
+            status_code=500,
+            detail="未找到 FFmpeg，无法转换视频。请运行“安装依赖.bat”安装基础依赖后重启后台；使用完整便携版时请先完整解压。",
+        )
     codec_args = {
         "mp4": ["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart"],
         "mov": ["-c:v", "libx264", "-c:a", "aac"],
@@ -6769,7 +6814,7 @@ def probe_local_audio_duration_seconds(value: str) -> Optional[float]:
     path = output_file_from_url(value)
     if not path or not os.path.isfile(path):
         return None
-    ffprobe = shutil.which("ffprobe")
+    ffprobe = media_tool_path("ffprobe")
     if not ffprobe:
         return None
     try:
@@ -6796,7 +6841,7 @@ def probe_local_video_duration_seconds(value: str) -> Optional[float]:
     path = output_file_from_url(value)
     if not path or not os.path.isfile(path):
         return None
-    ffprobe = shutil.which("ffprobe")
+    ffprobe = media_tool_path("ffprobe")
     if not ffprobe:
         return None
     try:
@@ -6866,7 +6911,7 @@ async def video_reference_to_frame_data_urls(value, max_frames=6, max_size=768):
         return []
     frame_dir = tempfile.mkdtemp(prefix="canvas_llm_frames_")
     try:
-        ffmpeg = shutil.which("ffmpeg")
+        ffmpeg = media_tool_path("ffmpeg")
         if not ffmpeg:
             return []
         pattern = os.path.join(frame_dir, "frame_%03d.jpg")

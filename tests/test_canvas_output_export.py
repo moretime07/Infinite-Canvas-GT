@@ -7,6 +7,7 @@ import unittest
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image
@@ -52,7 +53,7 @@ class CanvasOutputExportTests(unittest.TestCase):
                 os.remove(source_path)
 
     def test_export_uses_video_folder_and_unique_names(self):
-        ffmpeg = shutil.which("ffmpeg")
+        ffmpeg = main.media_tool_path("ffmpeg")
         self.assertTrue(ffmpeg, "ffmpeg is required for video export tests")
         source_name = f"output-auto-export-video-{uuid.uuid4().hex}.mp4"
         source_path = main.output_path_for(source_name, "output")
@@ -111,6 +112,28 @@ class CanvasOutputExportTests(unittest.TestCase):
             )
         self.assertEqual(headers.get("Authorization"), "Bearer test-openrouter-key")
         self.assertNotIn("Authorization", unrelated_headers)
+
+
+class MediaToolResolutionTests(unittest.TestCase):
+    def test_prefers_bundled_ffmpeg_before_path_and_imageio(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tool = Path(folder) / "bin" / "ffmpeg" / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+            tool.parent.mkdir(parents=True)
+            tool.write_bytes(b"")
+            with patch.object(main, "BASE_DIR", folder), patch.object(
+                main.shutil, "which", return_value=None
+            ), patch.object(main, "imageio_ffmpeg", None):
+                self.assertEqual(main.media_tool_path("ffmpeg"), str(tool))
+
+    def test_uses_imageio_ffmpeg_when_path_and_bundle_are_missing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tool = Path(folder) / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+            tool.write_bytes(b"")
+            fake_imageio = SimpleNamespace(get_ffmpeg_exe=lambda: str(tool))
+            with patch.object(main, "BASE_DIR", str(Path(folder) / "app")), patch.object(
+                main.shutil, "which", return_value=None
+            ), patch.object(main, "imageio_ffmpeg", fake_imageio), patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(main.media_tool_path("ffmpeg"), str(tool))
 
 
 class SaveRemoteVideoTests(unittest.IsolatedAsyncioTestCase):

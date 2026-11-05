@@ -179,14 +179,14 @@ class ExportFastPathTests(unittest.TestCase):
             copied = Path(folder) / "copied.mp4"
             converted = Path(folder) / "converted.mov"
             subprocess.run([
-                shutil.which("ffmpeg"), "-v", "error", "-f", "lavfi", "-i", "color=c=blue:s=320x180:r=24:d=0.25",
+                main.media_tool_path("ffmpeg"), "-v", "error", "-f", "lavfi", "-i", "color=c=blue:s=320x180:r=24:d=0.25",
                 "-f", "lavfi", "-i", "sine=frequency=440:duration=0.25", "-c:v", "libx264", "-c:a", "aac", str(source),
             ], check=True)
             self.assertEqual(main.export_canvas_output_video(str(source), str(copied), "mp4"), "copy")
             self.assertEqual(source.read_bytes(), copied.read_bytes())
             self.assertEqual(main.export_canvas_output_video(str(source), str(converted), "mov"), "transcode")
             result = subprocess.run([
-                shutil.which("ffprobe"), "-v", "error", "-show_streams", "-of", "json", str(converted),
+                main.media_tool_path("ffprobe"), "-v", "error", "-show_streams", "-of", "json", str(converted),
             ], check=True, capture_output=True, text=True)
             streams = json.loads(result.stdout)["streams"]
             video = next(s for s in streams if s["codec_type"] == "video")
