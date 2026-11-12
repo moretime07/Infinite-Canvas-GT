@@ -24,8 +24,22 @@ function Test-AppPython([string]$Executable) {
     } catch { return $false }
 }
 
+function Move-BrokenVenv([string]$VenvPath) {
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    for ($index = 1; $index -le 99; $index++) {
+        $suffix = if ($index -eq 1) { $stamp } else { "$stamp-$index" }
+        $backup = "$VenvPath.invalid-$suffix"
+        if (-not (Test-Path -LiteralPath $backup)) {
+            Write-Host "The existing .venv is unusable. Moving it to $(Split-Path -Leaf $backup) and rebuilding it."
+            Move-Item -LiteralPath $VenvPath -Destination $backup
+            return
+        }
+    }
+    throw 'Could not choose a backup name for the invalid .venv.'
+}
+
 function Find-AppPython {
-    $candidates = @()
+    $candidates = @(Join-Path $appRoot 'python\python.exe')
     $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
     if ($launcher) {
         foreach ($version in @('-3.11', '-3.12', '-3.13', '-3.10')) {
@@ -48,11 +62,13 @@ function Find-AppPython {
 
 Push-Location -LiteralPath $appRoot
 try {
-    if (Test-Path -LiteralPath (Join-Path $appRoot '.venv')) {
+    $venvPath = Join-Path $appRoot '.venv'
+    if (Test-Path -LiteralPath $venvPath) {
         if (-not (Test-AppPython $venvPython)) {
-            throw 'The existing .venv is not a working 64-bit Python 3.10-3.13 environment. Rename it to keep a backup, then rerun this installer.'
+            Move-BrokenVenv $venvPath
         }
-    } else {
+    }
+    if (-not (Test-Path -LiteralPath $venvPath)) {
         if ($PythonExecutable) {
             if (-not (Test-AppPython $PythonExecutable)) { throw 'The specified PythonExecutable is not a supported 64-bit Python.' }
             $selectedPython = $PythonExecutable
